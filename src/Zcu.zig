@@ -4679,6 +4679,10 @@ pub fn callconvSupported(zcu: *Zcu, cc: std.builtin.CallingConvention) union(enu
             .spirv_fragment, .spirv_vertex => target.os.tag == .vulkan or target.os.tag == .opengl,
             else => false,
         },
+        .stage2_mcs => switch (cc) {
+            .mcs51_sdcc, .mcs51_interrupt, .mcs251_sdcc, .mcs251_interrupt => true,
+            else => false,
+        },
     };
     if (!backend_ok) return .{ .bad_backend = backend };
     return .ok;

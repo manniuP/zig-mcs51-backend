@@ -37,6 +37,7 @@ fn devFeatureForBackend(backend: std.builtin.CompilerBackend) dev.Feature {
         .stage2_c => .c_backend,
         .stage2_llvm => .llvm_backend,
         .stage2_powerpc => unreachable,
+        .stage2_mcs => .mcs_backend,
         .stage2_riscv64 => .riscv64_backend,
         .stage2_sparc64 => .sparc64_backend,
         .stage2_spirv => .spirv_backend,
@@ -55,6 +56,7 @@ fn importBackend(comptime backend: std.builtin.CompilerBackend) type {
         .stage2_c => @import("codegen/c.zig"),
         .stage2_llvm => @import("codegen/llvm.zig"),
         .stage2_powerpc => unreachable,
+        .stage2_mcs => @import("codegen/mcs/CodeGen.zig"),
         .stage2_riscv64 => @import("codegen/riscv64/CodeGen.zig"),
         .stage2_sparc64 => @import("codegen/sparc64/CodeGen.zig"),
         .stage2_spirv => @import("codegen/spirv/CodeGen.zig"),
@@ -75,12 +77,15 @@ pub fn legalizeFeatures(pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) ?*co
         .stage2_x86_64,
         .stage2_aarch64,
         .stage2_x86,
+        .stage2_mcs,
         .stage2_riscv64,
         .stage2_sparc64,
         .stage2_spirv,
         => |backend| {
-            dev.check(devFeatureForBackend(backend));
-            return importBackend(backend).legalizeFeatures(target);
+            if (comptime dev.env.supports(devFeatureForBackend(backend))) {
+                dev.check(devFeatureForBackend(backend));
+                return importBackend(backend).legalizeFeatures(target);
+            } else unreachable;
         },
     }
 }
@@ -104,6 +109,7 @@ pub const AnyMir = union {
     x86_64: if (dev.env.supports(.x86_64_backend)) @import("codegen/x86_64/Mir.zig") else noreturn,
     wasm: if (dev.env.supports(.wasm_backend)) @import("codegen/wasm/Mir.zig") else noreturn,
     c: if (dev.env.supports(.c_backend)) @import("codegen/c.zig").Mir else noreturn,
+    mcs: if (dev.env.supports(.mcs_backend)) @import("codegen/mcs/Mir.zig") else noreturn,
 
     pub inline fn tag(comptime backend: std.builtin.CompilerBackend) []const u8 {
         return switch (backend) {
@@ -113,6 +119,7 @@ pub const AnyMir = union {
             .stage2_x86_64 => "x86_64",
             .stage2_wasm => "wasm",
             .stage2_c => "c",
+            .stage2_mcs => "mcs",
             else => unreachable,
         };
     }
@@ -128,7 +135,12 @@ pub const AnyMir = union {
             .stage2_x86_64,
             .stage2_wasm,
             .stage2_c,
-            => |backend_ct| @field(mir, tag(backend_ct)).deinit(gpa),
+            .stage2_mcs,
+            => |backend_ct| {
+                if (comptime dev.env.supports(devFeatureForBackend(backend_ct))) {
+                    @field(mir, tag(backend_ct)).deinit(gpa);
+                } else unreachable;
+            },
         }
     }
 };
@@ -157,11 +169,14 @@ pub fn generateFunction(
         .stage2_x86_64,
         .stage2_wasm,
         .stage2_c,
+        .stage2_mcs,
         => |backend| {
-            dev.check(devFeatureForBackend(backend));
-            const CodeGen = importBackend(backend);
-            const mir = try CodeGen.generate(lf, pt, src_loc, func_index, air, liveness);
-            return @unionInit(AnyMir, AnyMir.tag(backend), mir);
+            if (comptime dev.env.supports(devFeatureForBackend(backend))) {
+                dev.check(devFeatureForBackend(backend));
+                const CodeGen = importBackend(backend);
+                const mir = try CodeGen.generate(lf, pt, src_loc, func_index, air, liveness);
+                return @unionInit(AnyMir, AnyMir.tag(backend), mir);
+            } else unreachable;
         },
     }
 }
@@ -192,10 +207,13 @@ pub fn emitFunction(
         .stage2_riscv64,
         .stage2_sparc64,
         .stage2_x86_64,
+        .stage2_mcs,
         => |backend| {
-            dev.check(devFeatureForBackend(backend));
-            const mir = &@field(any_mir, AnyMir.tag(backend));
-            return mir.emit(lf, pt, src_loc, func_index, atom_index, w, debug_output);
+            if (comptime dev.env.supports(devFeatureForBackend(backend))) {
+                dev.check(devFeatureForBackend(backend));
+                const mir = &@field(any_mir, AnyMir.tag(backend));
+                return mir.emit(lf, pt, src_loc, func_index, atom_index, w, debug_output);
+            } else unreachable;
         },
     }
 }
@@ -216,9 +234,11 @@ pub fn generateLazyFunction(
         zcu.getTarget();
     switch (target_util.zigBackend(target, zcu.comp.config.use_llvm)) {
         else => unreachable,
-        inline .stage2_riscv64, .stage2_x86_64 => |backend| {
-            dev.check(devFeatureForBackend(backend));
-            return importBackend(backend).generateLazy(lf, pt, src_loc, lazy_sym, atom_index, w, debug_output);
+        inline .stage2_riscv64, .stage2_x86_64, .stage2_mcs => |backend| {
+            if (comptime dev.env.supports(devFeatureForBackend(backend))) {
+                dev.check(devFeatureForBackend(backend));
+                return importBackend(backend).generateLazy(lf, pt, src_loc, lazy_sym, atom_index, w, debug_output);
+            } else unreachable;
         },
     }
 }
@@ -766,6 +786,7 @@ fn lowerUavRef(
     const endian = target.cpu.arch.endian();
     switch (ptr_width_bytes) {
         2 => try w.writeInt(u16, @intCast(vaddr), endian),
+        3 => try w.writeInt(u24, @intCast(vaddr), endian),
         4 => try w.writeInt(u32, @intCast(vaddr), endian),
         8 => try w.writeInt(u64, vaddr, endian),
         else => unreachable,
@@ -842,6 +863,7 @@ fn lowerNavRef(
     const endian = target.cpu.arch.endian();
     switch (ptr_width_bytes) {
         2 => try w.writeInt(u16, @intCast(vaddr), endian),
+        3 => try w.writeInt(u24, @intCast(vaddr), endian),
         4 => try w.writeInt(u32, @intCast(vaddr), endian),
         8 => try w.writeInt(u64, vaddr, endian),
         else => unreachable,
@@ -1016,6 +1038,20 @@ const LowerResult = union(enum) {
     lea_uav: InternPool.Key.Ptr.BaseAddr.Uav,
 };
 
+/// Undefined-pointer sentinel: alternating 0xaa bit pattern truncated to the
+/// target's pointer width (16→0xAAAA, 24→0xAAAAAA, 32→0xAAAAAAAA, 64→0xAAAA…).
+///
+/// Width-safe: computing `(1 << (ptr_bits + 1)) / 3` overflows the 6-bit shift
+/// operand when `ptr_bits == 64` (65 does not fit in u6), which used to panic in
+/// safe modes and truncate to a bogus zero in ReleaseFast.
+fn undefPtrBits(target: *const std.Target) u64 {
+    const ptr_bits = target.ptrBitWidth();
+    return if (ptr_bits >= 64)
+        0xAAAAAAAAAAAAAAAA
+    else
+        (@as(u64, 1) << @intCast(ptr_bits + 1)) / 3;
+}
+
 pub fn lowerValue(pt: Zcu.PerThread, val: Value, target: *const std.Target) Allocator.Error!LowerResult {
     const zcu = pt.zcu;
     const ip = &zcu.intern_pool;
@@ -1043,7 +1079,7 @@ pub fn lowerValue(pt: Zcu.PerThread, val: Value, target: *const std.Target) Allo
                             return .{ .lea_nav = nav_index };
                         } else {
                             // Create the 0xaa bit pattern...
-                            const undef_ptr_bits: u64 = @intCast((@as(u66, 1) << @intCast(target.ptrBitWidth() + 1)) / 3);
+                            const undef_ptr_bits = undefPtrBits(target);
                             // ...but align the pointer
                             const alignment = zcu.navAlignment(nav_index);
                             return .{ .immediate = alignment.forward(undef_ptr_bits) };
@@ -1054,7 +1090,7 @@ pub fn lowerValue(pt: Zcu.PerThread, val: Value, target: *const std.Target) Allo
                         return .{ .lea_uav = uav };
                     } else {
                         // Create the 0xaa bit pattern...
-                        const undef_ptr_bits: u64 = @intCast((@as(u66, 1) << @intCast(target.ptrBitWidth() + 1)) / 3);
+                        const undef_ptr_bits = undefPtrBits(target);
                         // ...but align the pointer
                         const alignment = Type.fromInterned(uav.orig_ty).ptrAlignment(zcu);
                         return .{ .immediate = alignment.forward(undef_ptr_bits) };

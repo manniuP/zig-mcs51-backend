@@ -1204,7 +1204,9 @@ pub fn abiSize(ty: Type, zcu: *const Zcu) u64 {
 }
 
 pub fn ptrAbiAlignment(target: *const Target) Alignment {
-    return .fromNonzeroByteUnits(@divExact(target.ptrBitWidth(), 8));
+    // MCS-251 指针为 3 字节，字节宽度 3 不是 2 的幂，需向下取到 2 的幂（取 1）。
+    const byte_units: u16 = @intCast(@divExact(target.ptrBitWidth(), 8));
+    return .fromNonzeroByteUnits(if (std.math.isPowerOfTwo(byte_units)) byte_units else 1);
 }
 pub fn ptrAbiSize(target: *const Target) u64 {
     return @divExact(target.ptrBitWidth(), 8);

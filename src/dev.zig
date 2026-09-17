@@ -8,6 +8,9 @@ pub const Env = enum {
     /// zig2 features
     core,
 
+    /// 本 fork 专用：只编入 MCS 后端（省去 x86_64 等巨大后端的分析，自举更快）。
+    mcs,
+
     /// stage3 features
     full,
 
@@ -94,6 +97,7 @@ pub const Env = enum {
                 .riscv64_backend,
                 .sparc64_backend,
                 .spirv_backend,
+                .mcs_backend,
                 .lld_linker,
                 .coff_linker,
                 .coff2_linker,
@@ -104,6 +108,7 @@ pub const Env = enum {
                 .wasm_linker,
                 .spirv_linker,
                 .plan9_linker,
+                .asx_linker,
                 => true,
                 .cc_command,
                 .translate_c_command,
@@ -127,6 +132,26 @@ pub const Env = enum {
                 .network_listen,
                 .win32_resource,
                 => false,
+            },
+            .mcs => switch (feature) {
+                .build_obj_command,
+                // 让 mcs-only 产物也能当 `zig build` 的构建驱动（addSystemCommand 需要）。
+                .build_command,
+                .version_command,
+                .targets_command,
+                .env_command,
+                .help_command,
+                .ast_gen,
+                .sema,
+                .legalize,
+                .incremental,
+                .make_executable,
+                .make_writable,
+                .stdio_listen,
+                .mcs_backend,
+                .asx_linker,
+                => true,
+                else => false,
             },
             .c_source => switch (feature) {
                 .clang_command,
@@ -280,6 +305,7 @@ pub const Feature = enum {
     riscv64_backend,
     sparc64_backend,
     spirv_backend,
+    mcs_backend,
 
     lld_linker,
     coff_linker,
@@ -291,6 +317,7 @@ pub const Feature = enum {
     wasm_linker,
     spirv_linker,
     plan9_linker,
+    asx_linker,
 };
 
 /// Makes the code following the call to this function unreachable if `feature` is disabled.

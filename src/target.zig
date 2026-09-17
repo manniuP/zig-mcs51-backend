@@ -241,6 +241,8 @@ pub fn hasLlvmSupport(target: *const std.Target, ofmt: std.Target.ObjectFormat) 
         .hppa64,
         .kalimba,
         .kvx,
+        .mcs51,
+        .mcs251,
         .microblaze,
         .microblazeel,
         .or1k,
@@ -566,6 +568,11 @@ pub fn defaultAddressSpace(
         function,
     },
 ) AddressSpace {
+    // MCS-51 / MCS-251: 目前统一使用通用地址空间，简化 std 的编译；
+    // 后端自行决定代码/数据区的归属。
+    if (target.cpu.arch == .mcs51 or target.cpu.arch == .mcs251) {
+        return .generic;
+    }
     // The default address space for functions on AVR is .flash to produce
     // correct fixups into progmem.
     if (context == .function and target.cpu.arch == .avr) return .flash;
@@ -585,6 +592,7 @@ pub fn addrSpaceCastIsValid(
             const from_generic = target.supportsAddressSpace(to, null) and from == .generic;
             return to_generic or from_generic;
         },
+        .mcs51, .mcs251 => return true,
         else => return from == .generic and to == .generic,
     }
 }
@@ -892,6 +900,7 @@ pub fn zigBackend(target: *const std.Target, use_llvm: bool) std.builtin.Compile
         .aarch64, .aarch64_be => .stage2_aarch64,
         .arm, .armeb, .thumb, .thumbeb => .stage2_arm,
         .powerpc, .powerpcle, .powerpc64, .powerpc64le => .stage2_powerpc,
+        .mcs51, .mcs251 => .stage2_mcs,
         .riscv64 => .stage2_riscv64,
         .sparc64 => .stage2_sparc64,
         .spirv32, .spirv64 => .stage2_spirv,

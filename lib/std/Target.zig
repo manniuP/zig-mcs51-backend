@@ -741,6 +741,8 @@ pub const kvx = @import("Target/kvx.zig");
 pub const lanai = @import("Target/lanai.zig");
 pub const loongarch = @import("Target/loongarch.zig");
 pub const m68k = @import("Target/m68k.zig");
+pub const mcs51 = @import("Target/mcs51.zig");
+pub const mcs251 = @import("Target/mcs251.zig");
 pub const microblaze = @import("Target/generic.zig");
 pub const mips = @import("Target/mips.zig");
 pub const msp430 = @import("Target/msp430.zig");
@@ -1050,6 +1052,7 @@ pub const ObjectFormat = enum {
             .plan9 => .plan9,
             .uefi, .windows => .coff,
             else => switch (arch) {
+                .mcs51, .mcs251 => .hex,
                 .spirv32, .spirv64 => .spirv,
                 .wasm32, .wasm64 => .wasm,
                 else => .elf,
@@ -1093,6 +1096,8 @@ pub fn toElfMachine(target: *const Target) std.elf.EM {
         .xcore => .XCORE,
         .xtensa, .xtensaeb => .XTENSA,
 
+        .mcs51,
+        .mcs251,
         .nvptx,
         .nvptx64,
         .spirv32,
@@ -1137,6 +1142,8 @@ pub fn toCoffMachine(target: *const Target) std.coff.IMAGE.FILE.MACHINE {
         .kvx,
         .lanai,
         .m68k,
+        .mcs51,
+        .mcs251,
         .microblaze,
         .microblazeel,
         .mips64,
@@ -1345,6 +1352,8 @@ pub const Cpu = struct {
         loongarch32,
         loongarch64,
         m68k,
+        mcs51,
+        mcs251,
         microblaze,
         microblazeel,
         mips,
@@ -1420,6 +1429,8 @@ pub const Cpu = struct {
             lanai,
             loongarch,
             m68k,
+            mcs51,
+            mcs251,
             microblaze,
             mips,
             msp430,
@@ -1456,6 +1467,8 @@ pub const Cpu = struct {
                 .lanai => .lanai,
                 .loongarch32, .loongarch64 => .loongarch,
                 .m68k => .m68k,
+                .mcs51 => .mcs51,
+                .mcs251 => .mcs251,
                 .microblaze, .microblazeel => .microblaze,
                 .mips, .mipsel, .mips64, .mips64el => .mips,
                 .msp430 => .msp430,
@@ -1663,6 +1676,7 @@ pub const Cpu = struct {
                 .mipsel,
                 .mips64el,
                 .msp430,
+                .mcs51,
                 .powerpcle,
                 .powerpc64le,
                 .propeller,
@@ -1688,6 +1702,7 @@ pub const Cpu = struct {
                 .hppa64,
                 .lanai,
                 .m68k,
+                .mcs251,
                 .microblaze,
                 .mips,
                 .mips64,
@@ -1948,6 +1963,14 @@ pub const Cpu = struct {
                 .spirv_fragment,
                 .spirv_vertex,
                 => &.{ .spirv32, .spirv64 },
+
+                .mcs51_sdcc,
+                .mcs51_interrupt,
+                => &.{.mcs51},
+
+                .mcs251_sdcc,
+                .mcs251_interrupt,
+                => &.{.mcs251},
             };
         }
     };
@@ -2284,6 +2307,8 @@ pub fn supportsAddressSpace(
         .constant => is_gpu and (context == null or context == .constant),
         .param => is_nvptx,
         .input, .output, .uniform, .push_constant, .storage_buffer, .physical_storage_buffer => is_spirv,
+
+        .data, .idata, .pdata, .xdata, .code, .sfr, .sbit => arch == .mcs51 or arch == .mcs251,
     };
 }
 
@@ -2845,9 +2870,13 @@ pub fn ptrBitWidth_arch_abi(cpu_arch: Cpu.Arch, abi: Abi) u16 {
     }
     return switch (cpu_arch) {
         .avr,
+        .mcs51,
         .msp430,
         .x86_16,
         => 16,
+
+        .mcs251,
+        => 24,
 
         .arc,
         .arceb,
@@ -3376,7 +3405,10 @@ pub fn cTypeBitSize(target: *const Target, c_type: CType) u16 {
 pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
     // Overrides for unusual alignments
     switch (target.cpu.arch) {
-        .avr => return 1,
+        .avr,
+        .mcs51,
+        .mcs251,
+        => return 1,
         .x86 => switch (target.os.tag) {
             .windows, .uefi => switch (c_type) {
                 .longlong, .ulonglong, .double => return 8,
@@ -3414,6 +3446,8 @@ pub fn cTypeAlignment(target: *const Target, c_type: CType) u16 {
             .arceb,
             .csky,
             .kalimba,
+            .mcs51,
+            .mcs251,
             .microblaze,
             .microblazeel,
             .or1k,
@@ -3587,7 +3621,10 @@ pub fn cTypePreferredAlignment(target: *const Target, c_type: CType) u16 {
 
 pub fn cMaxIntAlignment(target: *const Target) u16 {
     return switch (target.cpu.arch) {
-        .avr => 1,
+        .avr,
+        .mcs51,
+        .mcs251,
+        => 1,
 
         .msp430, .x86_16 => 2,
 
@@ -3726,6 +3763,8 @@ pub fn cCallingConvention(target: *const Target) ?std.builtin.CallingConvention 
         .amdgcn => .{ .amdgcn_device = .{} },
         .nvptx, .nvptx64 => .nvptx_device,
         .spirv32, .spirv64 => .spirv_device,
+        .mcs51 => .{ .mcs51_sdcc = .{} },
+        .mcs251 => .{ .mcs251_sdcc = .{} },
     };
 }
 

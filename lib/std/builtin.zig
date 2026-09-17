@@ -292,6 +292,14 @@ pub const CallingConvention = union(enum(u8)) {
     m68k_rtd: CommonOptions,
     m68k_interrupt: CommonOptions,
 
+    // Calling conventions for the `mcs51` architecture.
+    mcs51_sdcc: CommonOptions,
+    mcs51_interrupt: CommonOptions,
+
+    // Calling conventions for the `mcs251` architecture.
+    mcs251_sdcc: CommonOptions,
+    mcs251_interrupt: CommonOptions,
+
     /// The standard `microblaze`/`microblazeel` calling convention.
     microblaze_std: CommonOptions,
     microblaze_interrupt: MicroblazeInterruptOptions,
@@ -529,6 +537,20 @@ pub const AddressSpace = enum(u5) {
 
     /// This address space only addresses the "lookup" ram
     lut,
+
+    // MCS-51 / MCS-251 address spaces.
+    /// On-chip direct/indirect data (page-zero on MCS-251).
+    data,
+    idata,
+    pdata,
+    /// External/flat data; on MCS-251 the 24-bit generic space.
+    xdata,
+    /// Read-only code space.
+    code,
+    /// Special function registers.
+    sfr,
+    /// Bit-addressable space.
+    sbit,
 };
 
 /// This data structure is used by the Zig language code generation and
@@ -1015,6 +1037,8 @@ pub const VaList = switch (builtin.cpu.arch) {
     .loongarch32,
     .loongarch64,
     .m68k,
+    .mcs51,
+    .mcs251,
     .microblaze,
     .microblazeel,
     .mips,
@@ -1206,6 +1230,9 @@ pub const CompilerBackend = enum(u64) {
     /// The reference implementation self-hosted compiler of Zig, using the
     /// powerpc backend.
     stage2_powerpc = 12,
+    /// The reference implementation self-hosted compiler of Zig, using the
+    /// mcs51 / mcs251 backend.
+    stage2_mcs = 13,
 
     _,
 };
