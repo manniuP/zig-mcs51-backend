@@ -1,0 +1,250 @@
+# devices/stc/model_matrix.toml —— 机器可读型号表（由各家族选型表摘录）
+#
+# 用途：`python tools/mcs_device.py --expand devices/stc/model_matrix.toml --out-dir devices/stc/gen`
+#       按模板生成每型号设备 TOML（同族寄存器/中断/xfr 复用 template）。
+#
+# 字段：
+#   family    归属 families.toml
+#   template  同族模板设备文件（相对本文件）
+#   model     型号
+#   flash     Flash 字节（code.size）
+#   idata     idata 字节（缺省沿用模板，通常 0x100）
+#   edata     edata 字节（仅 251 核）
+#   xdata     内部扩展 SRAM 字节
+#   eeprom    整数=专用 EEPROM 字节；"IAP"=与 Flash 共享
+#   tags      能力标签（usb/touch/led/lcd/…），供 HAL 生成
+#   source    出处
+#
+# 本文件只收录**已在手册选型表核对**的型号。一行一个型号。
+
+# ============================ AI8（1T 8051，外设组 ai）============================
+# 来源：Ai8-20260722.md 各子系列 4.x.1 特性及价格
+model = [
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H8K64U", flash=0x10000, idata=0x100, xdata=0x2000, eeprom="IAP",   tags=["usb","mdu16"], source="Ai8 4.7.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H8K32U", flash=0x08000, idata=0x100, xdata=0x2000, eeprom=0x8000,  tags=["usb","mdu16"], source="Ai8 4.7.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H2K32U", flash=0x08000, idata=0x100, xdata=0x0900, eeprom="IAP",   tags=["usb","mdu32c"], source="Ai8 4.6.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H2K24U", flash=0x06000, idata=0x100, xdata=0x0900, eeprom=0x2000,  tags=["usb","mdu32c"], source="Ai8 4.6.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H2K16U", flash=0x04000, idata=0x100, xdata=0x0900, eeprom=0x4000,  tags=["usb","mdu32c"], source="Ai8 4.6.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H2K17U", flash=0x04400, idata=0x100, xdata=0x0900, eeprom="IAP",   tags=["usb","mdu16"], source="Ai8 4.5.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H2K12U", flash=0x03000, idata=0x100, xdata=0x0900, eeprom="IAP",   tags=["usb","mdu16"], source="Ai8 4.5.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H2K08U", flash=0x02000, idata=0x100, xdata=0x0900, eeprom=0x1000,  tags=["usb","mdu16"], source="Ai8 4.5.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H1K28",  flash=0x07000, idata=0x100, xdata=0x0400, eeprom="IAP",   tags=["mdu16"], source="Ai8 4.4.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H1K24",  flash=0x06000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["mdu16"], source="Ai8 4.4.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H1K16",  flash=0x04000, idata=0x100, xdata=0x0400, eeprom=0x3000,  tags=["mdu16"], source="Ai8 4.4.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H1K17",  flash=0x04400, idata=0x100, xdata=0x0400, eeprom="IAP",   tags=["mdu16"], source="Ai8 4.3.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H1K08",  flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["mdu16"], source="Ai8 4.3.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8G1K17A", flash=0x04400, idata=0x100, xdata=0x0400, eeprom="IAP",   tags=["mdu16","pca"], source="Ai8 4.2.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8G1K08A", flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["mdu16","pca"], source="Ai8 4.2.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8G1K17",  flash=0x04400, idata=0x100, xdata=0x0400, eeprom="IAP",   tags=["mdu16"], source="Ai8 4.1.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8G1K08",  flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["mdu16"], source="Ai8 4.1.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H1K17T", flash=0x04400, idata=0x100, xdata=0x0400, eeprom="IAP",   tags=["mdu16","touch"], source="Ai8 4.8.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H1K08T", flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["mdu16","touch"], source="Ai8 4.8.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H4K64TL",   flash=0x10000, idata=0x100, xdata=0x1000, eeprom="IAP",  tags=["mdu16","touch","led"], source="Ai8 4.9.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H4K48TL",   flash=0x0C000, idata=0x100, xdata=0x1000, eeprom=0x4000, tags=["mdu16","touch","led"], source="Ai8 4.9.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H4K32TL",   flash=0x08000, idata=0x100, xdata=0x1000, eeprom=0x8000, tags=["mdu16","touch","led"], source="Ai8 4.9.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H4K64TLCD", flash=0x10000, idata=0x100, xdata=0x1000, eeprom="IAP",  tags=["mdu16","touch","lcd"], source="Ai8 4.10.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H4K48TLCD", flash=0x0C000, idata=0x100, xdata=0x1000, eeprom=0x4000, tags=["mdu16","touch","lcd"], source="Ai8 4.10.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H4K32TLCD", flash=0x08000, idata=0x100, xdata=0x1000, eeprom=0x8000, tags=["mdu16","touch","lcd"], source="Ai8 4.10.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H3K64S2", flash=0x10000, idata=0x100, xdata=0x0C00, eeprom="IAP",  tags=["mdu16","uart2"], source="Ai8 4.11.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H3K48S2", flash=0x0C000, idata=0x100, xdata=0x0C00, eeprom=0x4000, tags=["mdu16","uart2"], source="Ai8 4.11.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H3K32S2", flash=0x08000, idata=0x100, xdata=0x0C00, eeprom=0x8000, tags=["mdu16","uart2"], source="Ai8 4.11.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H3K64S4", flash=0x10000, idata=0x100, xdata=0x0C00, eeprom="IAP",  tags=["mdu16","uart4"], source="Ai8 4.12.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H3K60S4", flash=0x0F000, idata=0x100, xdata=0x0C00, eeprom=0x1000, tags=["mdu16","uart4"], source="Ai8 4.12.1" },
+  { family="ai8", template="ai8h8k64u.toml", model="Ai8H3K48S4", flash=0x0C000, idata=0x100, xdata=0x0C00, eeprom=0x4000, tags=["mdu16","uart4"], source="Ai8 4.12.1" },
+
+  # ==================== AI8051U（251 核，外设组 ai）====================
+  # 来源：AI8051U-20260710.md 4.1.1 特性及价格
+  { family="ai8051", template="ai8051u-34k64.toml", model="Ai8051U-34K64", flash=0x10000, edata=0x800, xdata=0x8000, eeprom="IAP",  tags=["usb","mdu32","tfpu","dpu32","qspi","i2s"], source="AI8051U 4.1.1" },
+  { family="ai8051", template="ai8051u-34k64.toml", model="Ai8051U-34K32", flash=0x08000, edata=0x800, xdata=0x8000, eeprom=0x8000, tags=["usb","mdu32","tfpu","dpu32","qspi","i2s"], source="AI8051U 4.1.1" },
+  { family="ai8051", template="ai8051u-34k64.toml", model="Ai8051U-34K16", flash=0x04000, edata=0x800, xdata=0x8000, eeprom=0xC000, tags=["usb","mdu32","tfpu","dpu32","qspi","i2s"], source="AI8051U 4.1.1" },
+
+  # ==================== STC8H（1T 8051，外设组 stc8）====================
+  # 来源：STC8H-20260714.md 4.1.1/4.2.1 已实取；其余子系列同 Ai8H 档，待逐一核对
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H1K08", flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000, tags=["mdu16"], source="STC8H 4.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H1K17", flash=0x04400, idata=0x100, xdata=0x0400, eeprom="IAP",  tags=["mdu16"], source="STC8H 4.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H1K16", flash=0x04000, idata=0x100, xdata=0x0400, eeprom=0x3000, tags=["mdu16"], source="STC8H 4.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H1K24", flash=0x06000, idata=0x100, xdata=0x0400, eeprom=0x1000, tags=["mdu16"], source="STC8H 4.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H1K28", flash=0x07000, idata=0x100, xdata=0x0400, eeprom="IAP",  tags=["mdu16"], source="STC8H 4.2.1" },
+  # 以下同 Ai8H 档（STC8H=Ai8H 同硅不同品牌，外设命名不同；存储档已由前 5 项验证），待逐一核对
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H2K12U",  flash=0x03000, idata=0x100, xdata=0x0900, eeprom="IAP",   tags=["usb"], source="STC8H 4.3.1（同 Ai8H 档，待核）" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H2K32U",  flash=0x08000, idata=0x100, xdata=0x0900, eeprom="IAP",   tags=["usb"], source="STC8H 4.4.1（同 Ai8H 档，待核）" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H8K64U",  flash=0x10000, idata=0x100, xdata=0x2000, eeprom="IAP",   tags=["usb"], source="STC8H 4.5.1（同 Ai8H 档，待核）" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H1K08T",  flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["touch"], source="STC8H 4.6.1（同 Ai8H 档，待核）" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H4K64TL",  flash=0x10000, idata=0x100, xdata=0x1000, eeprom="IAP",   tags=["touch","led"], source="STC8H 4.7.1（同 Ai8H 档，待核）" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H4K64TLCD",flash=0x10000, idata=0x100, xdata=0x1000, eeprom="IAP",   tags=["touch","lcd"], source="STC8H 4.8.1（同 Ai8H 档，待核）" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H3K64S2",  flash=0x10000, idata=0x100, xdata=0x0C00, eeprom="IAP",   tags=["uart2"], source="STC8H 4.9.1（同 Ai8H 档，待核）" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8H3K64S4",  flash=0x10000, idata=0x100, xdata=0x0C00, eeprom="IAP",   tags=["uart4"], source="STC8H 4.10.1（同 Ai8H 档，待核）" },
+
+  # ==================== STC8G（1T 8051，外设组 stc8；有 PCA/增强PWM）====================
+  # 来源：STC8G-20260716.md 3.x.1 特性及价格
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G1K08",   flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["mdu16","pca"], source="STC8G 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G1K17",   flash=0x04400, idata=0x100, xdata=0x0400, eeprom="IAP",   tags=["mdu16","pca"], source="STC8G 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G1K08A",  flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x1000,  tags=["mdu16","pca"], source="STC8G 3.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G1K17A",  flash=0x04400, idata=0x100, xdata=0x0400, eeprom="IAP",   tags=["mdu16","pca"], source="STC8G 3.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G2K32S2", flash=0x08000, idata=0x100, xdata=0x0800, eeprom=0x8000,  tags=["mdu16","pca","uart2"], source="STC8G 3.5.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G2K48S2", flash=0x0C000, idata=0x100, xdata=0x0800, eeprom=0x4000,  tags=["mdu16","pca","uart2"], source="STC8G 3.5.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G2K64S2", flash=0x10000, idata=0x100, xdata=0x0800, eeprom="IAP",   tags=["mdu16","pca","uart2"], source="STC8G 3.5.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G2K32S4", flash=0x08000, idata=0x100, xdata=0x0800, eeprom=0x8000,  tags=["mdu16","pca","uart4"], source="STC8G 3.4.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G2K48S4", flash=0x0C000, idata=0x100, xdata=0x0800, eeprom=0x4000,  tags=["mdu16","pca","uart4"], source="STC8G 3.4.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G2K60S4", flash=0x0F000, idata=0x100, xdata=0x0800, eeprom=0x1000,  tags=["mdu16","pca","uart4"], source="STC8G 3.4.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8G2K64S4", flash=0x10000, idata=0x100, xdata=0x0800, eeprom="IAP",   tags=["mdu16","pca","uart4"], source="STC8G 3.4.1" },
+
+  # ==================== STC8A8K64D4 系列（1T 8051，有 LCM 彩屏/DMA）====================
+  # 来源：STC8A8K64D4-20260717.md 3.1.1
+  { family="stc8", template="stc8h8k64u.toml", model="STC8A8K16D4", flash=0x04000, idata=0x100, xdata=0x2000, eeprom=0xC000, tags=["mdu16","lcm","dma","pca"], source="STC8A 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8A8K32D4", flash=0x08000, idata=0x100, xdata=0x2000, eeprom=0x8000, tags=["mdu16","lcm","dma","pca"], source="STC8A 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8A8K48D4", flash=0x0C000, idata=0x100, xdata=0x2000, eeprom=0x4000, tags=["mdu16","lcm","dma","pca"], source="STC8A 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8A8K60D4", flash=0x0F000, idata=0x100, xdata=0x2000, eeprom=0x1000, tags=["mdu16","lcm","dma","pca"], source="STC8A 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8A8K64D4", flash=0x10000, idata=0x100, xdata=0x2000, eeprom="IAP",  tags=["mdu16","lcm","dma","pca"], source="STC8A 3.1.1" },
+
+  # ==================== STC8C（1T 8051）====================
+  # 来源：STC8C-20260722.md 3.1.1（S4）/ 3.2.1（S2）
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K16S4", flash=0x04000, idata=0x100, xdata=0x0800, eeprom=0xC000, tags=["mdu16","uart4"], source="STC8C 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K32S4", flash=0x08000, idata=0x100, xdata=0x0800, eeprom=0x8000, tags=["mdu16","uart4"], source="STC8C 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K60S4", flash=0x0F000, idata=0x100, xdata=0x0800, eeprom=0x1000, tags=["mdu16","uart4"], source="STC8C 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K64S4", flash=0x10000, idata=0x100, xdata=0x0800, eeprom="IAP",  tags=["mdu16","uart4"], source="STC8C 3.1.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K16S2", flash=0x04000, idata=0x100, xdata=0x0800, eeprom=0xC000, tags=["mdu16","uart2"], source="STC8C 3.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K32S2", flash=0x08000, idata=0x100, xdata=0x0800, eeprom=0x8000, tags=["mdu16","uart2"], source="STC8C 3.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K48S2", flash=0x0C000, idata=0x100, xdata=0x0800, eeprom=0x4000, tags=["mdu16","uart2"], source="STC8C 3.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K60S2", flash=0x0F000, idata=0x100, xdata=0x0800, eeprom=0x1000, tags=["mdu16","uart2"], source="STC8C 3.2.1" },
+  { family="stc8", template="stc8h8k64u.toml", model="STC8C2K64S2", flash=0x10000, idata=0x100, xdata=0x0800, eeprom="IAP",  tags=["mdu16","uart2"], source="STC8C 3.2.1" },
+
+  # ==================== STC32G / STC32CL（251 核，外设组 stc8）====================
+  # 来源：STC32G-20260709.md 4.1.1（12K）、4.3.1（CL8K）
+  { family="stc32", template="stc32g12k128.toml", model="STC32G12K64",  flash=0x10000, edata=0x1000, xdata=0x2000, eeprom=0x10000, tags=["usb","mdu32","can","lin","lcm","dma"], source="STC32G 4.1.1" },
+  { family="stc32", template="stc32g12k128.toml", model="STC32G12K128", flash=0x20000, edata=0x1000, xdata=0x2000, eeprom="IAP",  tags=["usb","mdu32","can","lin","lcm","dma"], source="STC32G 4.1.1" },
+  { family="stc32", template="stc32g12k128.toml", model="STC32CL8K48",  flash=0x0C000, edata=0x0800, xdata=0x1800, eeprom=0x4000, tags=["usb","mdu32","can","lin","i2s","dma"], source="STC32G 4.3.1" },
+  { family="stc32", template="stc32g12k128.toml", model="STC32CL8K64",  flash=0x10000, edata=0x0800, xdata=0x1800, eeprom="IAP",  tags=["usb","mdu32","can","lin","i2s","dma"], source="STC32G 4.3.1" },
+  { family="stc32", template="stc32g12k128.toml", model="STC32G8K48",   flash=0x0C000, edata=0x0800, xdata=0x1800, eeprom=0x4000, tags=["mdu32","can","lin","i2s","lcm","dma"], source="STC32G 4.2.1" },
+  { family="stc32", template="stc32g12k128.toml", model="STC32G8K64",   flash=0x10000, edata=0x0800, xdata=0x1800, eeprom="IAP",  tags=["mdu32","can","lin","i2s","lcm","dma"], source="STC32G 4.2.1" },
+  { family="stc32", template="stc32g12k128.toml", model="STC32G144K246", flash=0x3D800, edata=0x4000, xdata=0x20000, eeprom="IAP", tags=["usb","dsp32","tfpu","canfd","qspi","i2s","lcm","dma","adc2","dac2","opa4"], source="STC32G 4.4.1.1" },
+
+  # ==================== STC15 / IAP15（1T 8051，外设组 stc15）====================
+  # 来源：STC15-20260722.md 各系列 3.x.3 选型一览表
+  # xdata = 手册“SRAM 字节” − 256（内部 256B）；F104W 系列 SRAM 128 → 无扩展
+  # --- F104W 系列（8-pin，SRAM 128，无串口/SPI/ADC）---
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F100W",    flash=0x00200, idata=0x000, xdata=0x0000, eeprom=0,     tags=["tiny"], source="STC15 3.1.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F101W",    flash=0x00400, idata=0x000, xdata=0x0000, eeprom=0x1000, tags=["tiny"], source="STC15 3.1.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F102W",    flash=0x00800, idata=0x000, xdata=0x0000, eeprom=0x0C00, tags=["tiny"], source="STC15 3.1.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F103W",    flash=0x00C00, idata=0x000, xdata=0x0000, eeprom=0x0800, tags=["tiny"], source="STC15 3.1.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F104W",    flash=0x01000, idata=0x000, xdata=0x0000, eeprom=0x0400, tags=["tiny"], source="STC15 3.1.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IAP15F105W",    flash=0x01400, idata=0x000, xdata=0x0000, eeprom="IAP", tags=["tiny"], source="STC15 3.1.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IRC15F107W",    flash=0x01C00, idata=0x000, xdata=0x0000, eeprom="IAP", tags=["tiny"], source="STC15 3.1.3" },
+  # --- W408AS 系列（SRAM 512）---
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W401AS",   flash=0x00400, idata=0x100, xdata=0x0100, eeprom=0x1400, tags=["pca","adc"], source="STC15 3.4.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W402AS",   flash=0x00800, idata=0x100, xdata=0x0100, eeprom=0x1400, tags=["pca","adc"], source="STC15 3.4.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W404AS",   flash=0x01000, idata=0x100, xdata=0x0100, eeprom=0x2400, tags=["pca","adc"], source="STC15 3.4.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W408AS",   flash=0x02000, idata=0x100, xdata=0x0100, eeprom=0x1400, tags=["pca","adc"], source="STC15 3.4.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IAP15W413AS",   flash=0x03400, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca","adc"], source="STC15 3.4.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IRC15W415AS",   flash=0x03E00, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca","adc"], source="STC15 3.4.3" },
+  # --- F2K60S2 系列（SRAM 2K，xdata 0x700）---
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K08S2",  flash=0x02000, idata=0x100, xdata=0x0700, eeprom=0xD400, tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K16S2",  flash=0x04000, idata=0x100, xdata=0x0700, eeprom=0xB400, tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K24AS",  flash=0x06000, idata=0x100, xdata=0x0700, eeprom=0x9400, tags=["pca","adc"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K32S2",  flash=0x08000, idata=0x100, xdata=0x0700, eeprom=0x7400, tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K40S2",  flash=0x0A000, idata=0x100, xdata=0x0700, eeprom=0x5400, tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K48S2",  flash=0x0C000, idata=0x100, xdata=0x0700, eeprom=0x3400, tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K48AS",  flash=0x0C000, idata=0x100, xdata=0x0700, eeprom=0x3400, tags=["pca","adc"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K56S2",  flash=0x0E000, idata=0x100, xdata=0x0700, eeprom=0x1400, tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15F2K60S2",  flash=0x0F000, idata=0x100, xdata=0x0700, eeprom=0x0400, tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IAP15F2K61S2",  flash=0x0F400, idata=0x100, xdata=0x0700, eeprom="IAP", tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IRC15F2K63S2",  flash=0x0FE00, idata=0x100, xdata=0x0700, eeprom="IAP", tags=["pca","adc","uart2"], source="STC15 3.5.3" },
+  # --- W4K32S4 系列（SRAM 4K，xdata 0xF00）---
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W1K08PWM", flash=0x02000, idata=0x100, xdata=0x0300, eeprom=0x4C00, tags=["pca","pwm8"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W1K16PWM", flash=0x04000, idata=0x100, xdata=0x0300, eeprom=0x2C00, tags=["pca","pwm8"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W4K16S4",  flash=0x04000, idata=0x100, xdata=0x0F00, eeprom=0xA800, tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W4K32S4",  flash=0x08000, idata=0x100, xdata=0x0F00, eeprom=0x6800, tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W4K40S4",  flash=0x0A000, idata=0x100, xdata=0x0F00, eeprom=0x4800, tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W4K48S4",  flash=0x0C000, idata=0x100, xdata=0x0F00, eeprom=0x2800, tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15W4K56S4",  flash=0x0E000, idata=0x100, xdata=0x0F00, eeprom=0x0800, tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IAP15W4K58S4",  flash=0x0E800, idata=0x100, xdata=0x0F00, eeprom="IAP", tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IAP15W4K61S4",  flash=0x0F400, idata=0x100, xdata=0x0F00, eeprom="IAP", tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+  { family="stc15", template="stc15w4k32s4.toml", model="IRC15W4K63S4",  flash=0x0FE00, idata=0x100, xdata=0x0F00, eeprom="IAP", tags=["pca","pwm8","uart4","adc"], source="STC15 3.7.3" },
+
+  # ==================== STC89 / STC90（经典 12T 8051，外设组 classic）====================
+  # 来源：STC89C52RC-RD+_20260722.md 3.2 选型一览表；xdata = 手册 SRAM − 256
+  { family="classic89", template="stc89c52rc.toml", model="STC89C51RC",    flash=0x01000, idata=0x100, xdata=0x0100, eeprom=0x2400, tags=[], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89LE51RC",   flash=0x01000, idata=0x100, xdata=0x0100, eeprom=0x2400, tags=["lv"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89C52RC",    flash=0x02000, idata=0x100, xdata=0x0100, eeprom=0x1400, tags=[], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89LE52RC",   flash=0x02000, idata=0x100, xdata=0x0100, eeprom=0x1400, tags=["lv"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89C53RC",    flash=0x03000, idata=0x100, xdata=0x0100, eeprom=0,      tags=[], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89LE53RC",   flash=0x03000, idata=0x100, xdata=0x0100, eeprom=0,      tags=["lv"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89C54RD+",   flash=0x04000, idata=0x100, xdata=0x0400, eeprom=0xB400, tags=["rd"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89LE54RD+",  flash=0x04000, idata=0x100, xdata=0x0400, eeprom=0xB400, tags=["rd","lv"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89C58RD+",   flash=0x08000, idata=0x100, xdata=0x0400, eeprom=0x7400, tags=["rd"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89LE58RD+",  flash=0x08000, idata=0x100, xdata=0x0400, eeprom=0x7400, tags=["rd","lv"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89C516RD+",  flash=0x0F400, idata=0x100, xdata=0x0400, eeprom=0,      tags=["rd"], source="STC89 3.2" },
+  { family="classic89", template="stc89c52rc.toml", model="STC89LE516RD+", flash=0x0F400, idata=0x100, xdata=0x0400, eeprom=0,      tags=["rd","lv"], source="STC89 3.2" },
+
+  # ==================== STC12C5A60S2（1T 8051，外设组 stc12；SRAM 1280）====================
+  # 来源：STC12C5A60S2-20260722.md 3.2 选型一览表（EEPROM 表内仅标“有”，按 IAP 处理）
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A08S2",   flash=0x02000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A16S2",   flash=0x04000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A20S2",   flash=0x05000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A32S2",   flash=0x08000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A40S2",   flash=0x0A000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A48S2",   flash=0x0C000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A52S2",   flash=0x0D000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A56S2",   flash=0x0E000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5A60S2",   flash=0x0F000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+  { family="stc12", template="stc12c5a60s2.toml", model="IAP12C5A62S2",   flash=0x0F800, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca","adc","uart2"], source="STC12C5A60S2 3.2" },
+
+  # ==================== STC15H（1T 8051，外设组 stc15）====================
+  # 来源：STC8G-20260716.md 3.6.1（用 STC8G2K64S4 晶圆生产的特殊型号）
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15H2K48S4", flash=0x0C000, idata=0x100, xdata=0x0800, eeprom=0x4000, tags=["pca","pwm8","uart4","adc"], source="STC8G 3.6.1" },
+  { family="stc15", template="stc15w4k32s4.toml", model="STC15H2K64S4", flash=0x10000, idata=0x100, xdata=0x0800, eeprom="IAP",  tags=["pca","pwm8","uart4","adc"], source="STC8G 3.6.1" },
+
+  # ==================== STC12C2052AD/4052AD（SRAM 256，外设组 stc12）====================
+  # 来源：STC12C2052AD-4052AD-20260722.md 3.3（LE 为同型低压版，存储一致）
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C1052",   flash=0x00400, idata=0x100, xdata=0, eeprom="IAP", tags=["pca"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C1052AD", flash=0x00400, idata=0x100, xdata=0, eeprom="IAP", tags=["pca","adc"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C2052",   flash=0x00800, idata=0x100, xdata=0, eeprom="IAP", tags=["pca"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C2052AD", flash=0x00800, idata=0x100, xdata=0, eeprom="IAP", tags=["pca","adc"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C3052",   flash=0x00C00, idata=0x100, xdata=0, eeprom="IAP", tags=["pca"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C3052AD", flash=0x00C00, idata=0x100, xdata=0, eeprom="IAP", tags=["pca","adc"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C4052",   flash=0x01000, idata=0x100, xdata=0, eeprom="IAP", tags=["pca"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C4052AD", flash=0x01000, idata=0x100, xdata=0, eeprom="IAP", tags=["pca","adc"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5052",   flash=0x01400, idata=0x100, xdata=0, eeprom="IAP", tags=["pca"], source="STC12C2052AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5052AD", flash=0x01400, idata=0x100, xdata=0, eeprom="IAP", tags=["pca","adc"], source="STC12C2052AD 3.3" },
+
+  # ==================== STC12C5410AD（SRAM 512，外设组 stc12）====================
+  # 来源：STC12C5410AD-20260722.md 3.3
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5401",   flash=0x00400, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5401AD", flash=0x00400, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4","adc"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5402",   flash=0x00800, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5402AD", flash=0x00800, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4","adc"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5404",   flash=0x01000, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5404AD", flash=0x01000, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4","adc"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5406",   flash=0x01800, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5406AD", flash=0x01800, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4","adc"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5408",   flash=0x02000, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5408AD", flash=0x02000, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4","adc"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5412",   flash=0x03000, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4"], source="STC12C5410AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5412AD", flash=0x03000, idata=0x100, xdata=0x0100, eeprom="IAP", tags=["pca4","adc"], source="STC12C5410AD 3.3" },
+
+  # ==================== STC12C5620AD（SRAM 768，外设组 stc12）====================
+  # 来源：STC12C5620AD-20260722.md 3.3（LE 为同型低压版）
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5604AD", flash=0x01000, idata=0x100, xdata=0x0200, eeprom=0x1000, tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5608AD", flash=0x02000, idata=0x100, xdata=0x0200, eeprom=0x1000, tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5612AD", flash=0x03000, idata=0x100, xdata=0x0200, eeprom="IAP", tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5616AD", flash=0x04000, idata=0x100, xdata=0x0200, eeprom=0x1000, tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5620AD", flash=0x05000, idata=0x100, xdata=0x0200, eeprom=0x1000, tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5624AD", flash=0x06000, idata=0x100, xdata=0x0200, eeprom=0x1000, tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5628AD", flash=0x07000, idata=0x100, xdata=0x0200, eeprom="IAP", tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12C5630AD", flash=0x07800, idata=0x100, xdata=0x0200, eeprom="IAP", tags=["pca4","adc"], source="STC12C5620AD 3.3" },
+
+  # ==================== STC12H（1T 8051，外设组 stc12；xdata 1K）====================
+  # 来源：STC12H-20260722.md 3.1.1
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12H1K08", flash=0x02000, idata=0x100, xdata=0x0400, eeprom=0x5000, tags=["pca4","adc","uart2"], source="STC12H 3.1.1" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12H1K16", flash=0x04000, idata=0x100, xdata=0x0400, eeprom=0x3000, tags=["pca4","adc","uart2"], source="STC12H 3.1.1" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12H1K24", flash=0x06000, idata=0x100, xdata=0x0400, eeprom=0x1000, tags=["pca4","adc","uart2"], source="STC12H 3.1.1" },
+  { family="stc12", template="stc12c5a60s2.toml", model="STC12H1K28", flash=0x07000, idata=0x100, xdata=0x0400, eeprom="IAP", tags=["pca4","adc","uart2"], source="STC12H 3.1.1" },
+
+  # ==================== AI32（251 核；AI 品牌版 STC32，共用手册/外设）====================
+  # 型号/存储沿用 STC32G 选型表（AI32 与 STC32 共用手册）；头 c251/AI32G.H
+  { family="ai32", template="stc32g12k128.toml", model="AI32G12K64",   flash=0x10000, edata=0x1000, xdata=0x2000, eeprom=0x10000, tags=["usb","mdu32","can","lin","lcm","dma"], source="STC32G 选型表（AI32 共用）" },
+  { family="ai32", template="stc32g12k128.toml", model="AI32G12K128",  flash=0x20000, edata=0x1000, xdata=0x2000, eeprom="IAP",  tags=["usb","mdu32","can","lin","lcm","dma"], source="STC32G 选型表（AI32 共用）" },
+  { family="ai32", template="stc32g12k128.toml", model="AI32G8K48",    flash=0x0C000, edata=0x0800, xdata=0x1800, eeprom=0x4000, tags=["mdu32","can","lin","i2s","lcm","dma"], source="STC32G 选型表（AI32 共用）" },
+  { family="ai32", template="stc32g12k128.toml", model="AI32G8K64",    flash=0x10000, edata=0x0800, xdata=0x1800, eeprom="IAP",  tags=["mdu32","can","lin","i2s","lcm","dma"], source="STC32G 选型表（AI32 共用）" },
+  { family="ai32", template="stc32g12k128.toml", model="AI32G144K246", flash=0x3D800, edata=0x4000, xdata=0x20000, eeprom="IAP", tags=["usb","dsp32","tfpu","canfd","qspi","i2s","lcm","dma","adc2","dac2","opa4"], source="STC32G 选型表（AI32 共用）" },
+]

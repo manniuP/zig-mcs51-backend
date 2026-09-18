@@ -1,0 +1,146 @@
+# devices/stc/ai8h8k64u.toml
+# STC AI8H8K64U —— AI8 家族（1T 8051 核）；8K SRAM / 64K Flash / USB。
+# 数据来源：Ai8-20260722.md（10.1/10.2 存储器、14.3 中断表、附录O 头文件）+ 11.7 系列。
+# 外设组 `ai`：与 AI32/AI8051（251 核）互通，换内核即可；与 STC8（`stc8` 组）**不**互通。
+# 注意：AI8H 的直接 SFR 映射与 STC8H 不同（如 0x84/0x85 = S4CON/S4BUF，非 DPXL/SPH；
+#       0x97 未定义 AUXR2），这正是「STC8 ≠ AI8」的体现。
+
+[device]
+id = "stc/ai8h8k64u"
+vendor = "STC"
+family = "ai8"
+model = "AI8H8K64U"
+package = "LQFP48 / LQFP64"
+doc = "Ai8-20260722.md"
+sfr_source = "../../tools/vendor/stc/keil/c51/AI8H.H"
+
+# ---------------------------------------------------------------------------
+# 代码空间：复位入口 0000H
+# ---------------------------------------------------------------------------
+[code]
+base = 0x0000
+size = 0x10000
+addr_width = 16
+movc = true
+reset_vector = 0x0000
+wait_states = 1
+
+# ---------------------------------------------------------------------------
+# 数据空间
+# ---------------------------------------------------------------------------
+[[memory]]
+kind = "data"
+base = 0x0000
+size = 0x0080
+addressing = "direct"
+bit_addressable = true
+
+[[memory]]
+kind = "idata"
+base = 0x0080
+size = 0x0080
+addressing = "indirect_r0"
+
+[[memory]]
+kind = "xdata"             # 片内扩展 RAM 8K（选型表 xdata=8K，手册 4.7.1 确认）
+base = 0x0000
+size = 0x2000
+addressing = "movx_dptr"
+enable = "AUXR.EXTRAM"
+note = "另有 1280B USB 数据 RAM（独立区，用户按需使用）"
+
+[[memory]]
+kind = "xdata_external"    # 片外 64K 总线（WR/RD/ALE）
+base = 0x0000
+size = 0x10000
+addressing = "movx_dptr"
+enable = "AUXR.EXTRAM"
+
+[[memory]]
+kind = "xfr"               # 扩展 SFR：16 位 MOVX 窗口 FA00H~FFFFH，与片外 RAM 重叠
+base = 0xFA00
+size = 0x0600
+mode = "movx_dptr_overlap"
+enable = "P_SW2.EAXFR"
+conflicts_with = "xdata_external"
+
+[[memory]]
+kind = "eeprom"
+base = 0x0000
+size = 0x10000
+page = 512
+in_flash = true
+iap = true
+
+[stack]
+space = "idata"
+top = 0x00FF
+
+[link]
+data_loc = 0x30             # 避开寄存器组与位寻址区（1T 8051 同样适用）
+idata_loc = 0x80
+
+[dptr]
+count = 2                  # DPS(0xE3) / DPL1(0xE4) / DPH1(0xE5)
+select = "DPS"
+
+# ---------------------------------------------------------------------------
+# 机制寄存器（摘自手册附录O；完整 SFR 表以手册为准）
+# ---------------------------------------------------------------------------
+[registers]
+SP = 0x81
+DPL = 0x82
+DPH = 0x83
+S4CON = 0x84               # AI8H 独有：不占用 DPXL/SPH
+S4BUF = 0x85
+PCON = 0x87
+TCON = 0x88
+TMOD = 0x89
+AUXR = 0x8E
+INTCLKO = 0x8F
+P_SW1 = 0xA2
+IE = 0xA8
+IE2 = 0xAF
+IP2 = 0xB5
+IP2H = 0xB6
+IPH = 0xB7
+IP = 0xB8
+P_SW2 = 0xBA
+IAP_DATA = 0xC2
+IAP_ADDRH = 0xC3
+IAP_ADDRL = 0xC4
+IAP_CMD = 0xC5
+IAP_TRIG = 0xC6
+IAP_CONTR = 0xC7
+T4T3M = 0xD1
+DPS = 0xE3
+DPL1 = 0xE4
+DPH1 = 0xE5
+AUXINTIF = 0xEF
+IAP_TPS = 0xF5
+RSTCFG = 0xFF
+
+[register_bits]
+"P_SW2.EAXFR" = 7
+"AUXR.EXTRAM" = 1
+
+# XFR 内寄存器（0xFA00~0xFFFF，需 EAXFR=1）；按时钟/GPIO/PWM 分组
+[xfr]
+CLKSEL = 0xFE00
+CLKDIV = 0xFE01
+HIRCCR = 0xFE02
+XOSCCR = 0xFE03
+IRC32KCR = 0xFE04
+IRCDB = 0xFE06
+HSCLKDIV = 0xFE0B
+
+# ---------------------------------------------------------------------------
+# 中断：向量 = num*8+3；编号可 >31（linear_gt31）
+# ---------------------------------------------------------------------------
+[interrupts]
+vector_base = 0x0000
+slot_bytes = 8
+formula = "num*8+3"
+max_number = 67            # 最大 Timer11（021BH）
+priority_levels = 4
+numbering = "linear_gt31"

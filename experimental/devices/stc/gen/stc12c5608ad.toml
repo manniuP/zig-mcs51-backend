@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC12C5620AD 3.3）
+
+[device]
+id = "stc/stc12c5608ad"
+family = "stc12"
+model = "STC12C5608AD"
+template = "../stc12c5a60s2.toml"
+doc = "STC12C5620AD 3.3"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC12C5630AD.H"
+
+[override]
+flash = 0x2000
+idata = 0x100
+xdata = 0x200
+eeprom = 0x1000

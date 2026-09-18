@@ -1,0 +1,140 @@
+# devices/stc/ai8051u-34k64.toml
+# STC AI8051U-34K64 —— 251 兼容核；4K/34K SRAM。数据来源：AI8051U-20260710 手册 +
+# tools/vendor/stc/AI8051U.keil.h（完整 SFR 表以该头为准，见 sfr_source）。
+
+[device]
+id = "stc/ai8051u-34k64"
+vendor = "STC"
+family = "ai8051"
+model = "AI8051U-34K64"
+package = "LQFP48"
+doc = "AI8051U-20260710.md"
+sfr_source = "../../tools/vendor/stc/keil/c251/AI8051U.H"
+
+# extends = "families.toml"（由加载器设置；此处不重复）
+
+# ---------------------------------------------------------------------------
+# 代码空间：复位入口与中断向量都在 FF:0000 起的 64K。
+# ---------------------------------------------------------------------------
+[code]
+base = 0xFF0000
+size = 0x10000
+addr_width = 24
+movc = true                # 常量表可放 code，用 MOVC/@DPX 读
+reset_vector = 0xFF0000
+wait_states = 1
+
+# ---------------------------------------------------------------------------
+# 数据空间（多个；alias_of 表示与同基址空间的物理别名，不算冲突）
+# ---------------------------------------------------------------------------
+[[memory]]
+kind = "data"              # 低 128 字节直接寻址
+base = 0x0000
+size = 0x0080
+addressing = "direct"
+bit_addressable = true
+
+[[memory]]
+kind = "idata"             # 高 128 字节 @r0
+base = 0x0080
+size = 0x0080
+addressing = "indirect_r0"
+
+[[memory]]
+kind = "edata"             # 251 独有：2K，直接/间接，栈所在
+base = 0x0000
+size = 0x0800
+addressing = "movx_dptr"
+alias_of = "data"
+
+[[memory]]
+kind = "xdata"             # 片内扩展 RAM：32K
+base = 0x010000
+size = 0x8000
+addressing = "movx_dpx"
+
+[[memory]]
+kind = "xdata_external"    # 片外扩展 RAM（需 EXTRAM）
+base = 0x7F0000
+size = 0x10000
+addressing = "movx_dpx"
+enable = "AUXR.EXTRAM"
+
+[[memory]]
+kind = "xfr"               # 扩展 SFR 窗口：独立 24 位段 7E:0000
+base = 0x7E0000
+size = 0x10000
+mode = "dpx_window"
+enable = "P_SW2.EAXFR"
+
+[[memory]]
+kind = "eeprom"            # 与 Flash 同块，IAP 访问
+base = 0xFF0000
+size = 0x10000
+page = 512
+in_flash = true
+iap = true
+
+[stack]
+space = "edata"
+top = 0x0100                # 复位后 SPX 初值（见 crt0）
+
+[link]                      # 链接期覆盖（否则按空间 base 推导）
+data_loc = 0x30             # 避开寄存器组 0-3 与位寻址区 0x20-0x2F
+idata_loc = 0x80
+
+[dptr]
+count = 2
+extended = "DPXL"          # 24 位数据指针高位
+
+# ---------------------------------------------------------------------------
+# 机制寄存器（链接/HAL/编译器需要的最小集；完整表见 sfr_source）
+# ---------------------------------------------------------------------------
+[registers]
+SP = 0x81
+SPH = 0x85
+DPL = 0x82
+DPH = 0x83
+DPXL = 0x84
+AUXR = 0x8E
+AUXR2 = 0x97
+P_SW2 = 0xBA
+IAP_DATA = 0xC2
+IAP_ADDRH = 0xC3
+IAP_ADDRL = 0xC4
+IAP_CMD = 0xC5
+IAP_TRIG = 0xC6
+IAP_CONTR = 0xC7
+WTST = 0xE9
+CKCON = 0xEA
+IAP_TPS = 0xF5
+IAP_ADDRE = 0xF6
+RSTCFG = 0xFF
+
+[register_bits]
+"P_SW2.EAXFR" = 7          # 1 = 允许访问 XFR（建议上电置 1）
+"AUXR.EXTRAM" = 1          # 0 = 可访问片内扩展 RAM；1 = 片外
+"AUXR2.RAMTINY" = 7
+"AUXR2.CPUMODE" = 6        # 硬件选项 CPU 指令模式需为 32-Bit
+"IAP_CONTR.SWBS" = 6
+
+# XFR 内的时钟寄存器（7E:FE00 起），HAL 生成时用
+[xfr]
+CLKSEL = 0x7EFE00
+CLKDIV = 0x7EFE01
+HIRCCR = 0x7EFE02
+XOSCCR = 0x7EFE03
+IRC32KCR = 0x7EFE04
+IRCDB = 0x7EFE06
+HSCLKDIV = 0x7EFE0B
+
+# ---------------------------------------------------------------------------
+# 中断：向量 = base + (num*8 + 3)
+# ---------------------------------------------------------------------------
+[interrupts]
+vector_base = 0xFF0000
+slot_bytes = 8
+formula = "num*8+3"
+max_number = 73            # 最大 DMA_PWMAR（FF:024BH）；手册 15.3
+priority_levels = 4
+numbering = "linear_gt31"  # 编号可 >31

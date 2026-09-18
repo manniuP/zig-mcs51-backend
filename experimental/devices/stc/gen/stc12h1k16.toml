@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC12H 3.1.1）
+
+[device]
+id = "stc/stc12h1k16"
+family = "stc12"
+model = "STC12H1K16"
+template = "../stc12c5a60s2.toml"
+doc = "STC12H 3.1.1"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC12H.H"
+
+[override]
+flash = 0x4000
+idata = 0x100
+xdata = 0x400
+eeprom = 0x3000

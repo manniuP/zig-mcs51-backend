@@ -1,0 +1,97 @@
+# devices/stc/stc32g12k128.toml
+# STC STC32G12K128 —— 251 兼容核；128K Flash / 12K SRAM（2K edata + 10K xdata）。
+# 定位：与 STC8/STC8051 外设互通，仅内核换成 251（换编译器即可）。
+# TODO：复位入口/向量基址（STC32 是否同 AI8051U 的 FF:0000）与 SRAM 划分待 STC32G 手册 11 核对。
+
+[device]
+id = "stc/stc32g12k128"
+vendor = "STC"
+family = "stc32"
+model = "STC32G12K128"
+package = "LQFP48"
+doc = "STC32G-20260709.md"
+sfr_source = "../../tools/vendor/stc/keil/c251/STC32G.H"
+
+[code]
+# TODO：STC32G 复位入口/代码基址待 STC32G 手册 11 核对（128K 无法全放在 FF:0000）。
+base = 0x000000
+size = 0x20000                 # 128K
+addr_width = 24
+movc = true
+reset_vector = 0x000000
+wait_states = 1
+
+[[memory]]
+kind = "data"
+base = 0x0000
+size = 0x0080
+addressing = "direct"
+bit_addressable = true
+
+[[memory]]
+kind = "idata"
+base = 0x0080
+size = 0x0080
+addressing = "indirect_r0"
+
+[[memory]]
+kind = "edata"                 # 251 直接/间接 on-chip（4K）
+base = 0x0000
+size = 0x1000
+addressing = "movx_dptr"
+alias_of = "data"
+
+[[memory]]
+kind = "xdata"                 # 片内扩展 xdata（8K）
+base = 0x010000
+size = 0x2000
+addressing = "movx_dpx"
+
+[[memory]]
+kind = "xfr"
+base = 0x7E0000
+size = 0x10000
+mode = "dpx_window"
+enable = "P_SW2.EAXFR"
+
+[[memory]]
+kind = "eeprom"
+base = 0x000000
+size = 0x20000
+page = 512
+in_flash = true
+iap = true
+
+[stack]
+space = "edata"
+top = 0x0100                   # TODO: 待核
+
+[link]
+data_loc = 0x30
+idata_loc = 0x80
+
+[dptr]
+count = 2
+extended = "DPXL"
+
+[registers]
+SP = 0x81
+SPH = 0x85
+DPL = 0x82
+DPH = 0x83
+DPXL = 0x84
+AUXR = 0x8E
+AUXR2 = 0x97
+P_SW2 = 0xBA
+
+[register_bits]
+"P_SW2.EAXFR" = 7
+"AUXR.EXTRAM" = 1
+
+[interrupts]
+vector_base = 0x000000         # TODO: 待核
+slot_bytes = 8
+formula = "num*8+3"
+max_number = 67
+priority_levels = 4
+numbering = "linear_gt31"

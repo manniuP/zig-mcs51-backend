@@ -1,0 +1,11 @@
+examples/**/*.asm
+!examples/**/crt0.asm
+examples/**/*.rel
+examples/**/*.ihx
+examples/**/*.lst
+examples/**/*.map
+examples/**/*.mem
+examples/**/*.rst
+examples/**/*.sym
+examples/**/*.asm.base
+examples/**/*.lk

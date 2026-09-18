@@ -1,0 +1,40 @@
+# devices/stc/headers.toml —— 家族/模板 → 厂商 Keil 头文件映射
+#
+# 头文件来自本机 Keil 安装目录（C51 = 8051，C251 = 251），已复制到
+# tools/vendor/stc/keil/{c51,c251}/。设备文件用 [device].sfr_source 引用。
+# 校验：python tools/mcs_sfr.py --input <头> --check <设备.toml> --emit check
+
+[headers]
+# ---- 251 核（C251）----
+ai8051u      = "c251/AI8051U.H"
+ai32         = "c251/AI32G.H"
+stc32g       = "c251/STC32G.H"
+stc32g144k246 = "c251/STC32G144K246.H"
+# stc16      = "c251/STC16F.H"   # STC16 已停产，不再新增
+
+# ---- 8051 核，AI 系列（C51）----
+ai8          = "c51/AI8H.H"
+ai8g         = "c51/AI8G.H"
+ai8a         = "c51/AI8A8K64D4.H"
+ai8c         = "c51/AI8C.H"
+ai12h        = "c51/AI12H.H"
+ai15h        = "c51/AI15H.H"
+
+# ---- 8051 核，STC 系列（C51）----
+stc8h        = "c51/STC8H.H"
+stc8g        = "c51/STC8G.H"
+stc8a        = "c51/STC8A8K64D4.H"
+stc8c        = "c51/STC8C.H"
+stc8f        = "c51/STC8F.H"
+stc15        = "c51/STC15.H"
+stc15f2k60s2 = "c51/STC15F2K60S2.H"
+stc15h       = "c51/STC15H.H"
+stc15f104e   = "c51/STC15F104E.H"
+stc12c5a60s2 = "c51/STC12C5A60S2.H"
+stc12c2052ad = "c51/STC12C2052AD.H"
+stc12c5410ad = "c51/STC12C5410AD.H"
+stc12c56xx   = "c51/STC12C5630AD.H"
+stc12h       = "c51/STC12H.H"
+stc89c5xrc   = "c51/STC89C5xRC.H"
+stc90c5xad   = "c51/STC90C5xAD.H"
+stc8051u     = "c251/STC8051U.H"

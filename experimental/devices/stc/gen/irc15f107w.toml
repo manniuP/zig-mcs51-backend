@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC15 3.1.3）
+
+[device]
+id = "stc/irc15f107w"
+family = "stc15"
+model = "IRC15F107W"
+template = "../stc15w4k32s4.toml"
+doc = "STC15 3.1.3"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC15.H"
+
+[override]
+flash = 0x1c00
+idata = 0x0
+xdata = 0x0
+eeprom = "IAP"

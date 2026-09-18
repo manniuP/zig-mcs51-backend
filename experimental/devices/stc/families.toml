@@ -1,0 +1,97 @@
+# devices/stc/families.toml —— STC 家族注册表（公共默认 + 外设互通组）
+#
+# 设备文件用：
+#     extends = "families.toml"
+#     family  = "<name>"
+# 继承 [families.<name>] 的公共项，再覆盖本机型号。
+#
+# 分类依据（用户口述，2026-09-16）：
+#   - STC89/STC90 是最经典 51。
+#   - STC12 = STC89 + 一些外设；STC15/IAP15 与 STC12 同一路线（再加外设）。
+#   - STC16 = STC15 的外设 + 251 核。
+#   - STC8 / STC32 / STC8051：**除内核外外设互通**（换编译器即可，代码不用改）。
+#   - AI8 / AI32 / AI8051：**除内核外外设互通**。
+#   - **STC8 与 AI8 的外设不互通**。
+
+# ---------------------------------------------------------------------------
+# 外设互通组：同组内寄存器命名/HAL 可复用，仅内核不同。
+# ---------------------------------------------------------------------------
+[peripheral_groups]
+classic  = { label = "STC89/90 经典外设", basis = "STC89 基础" }
+stc12    = { label = "STC12 外设",        basis = "STC89 + 少量外设" }
+stc15    = { label = "STC15/IAP15/STC16 外设", basis = "STC12 + 更多外设" }
+stc8     = { label = "STC8/STC32/STC8051 外设（8051 与 251 核互通）", basis = "STC8" }
+ai       = { label = "AI8/AI32/AI8051 外设（8051 与 251 核互通）", basis = "AI8" }
+# 注意：stc8 与 ai 两组外设**不互通**（STC8 ≠ AI8）。
+
+# ---------------------------------------------------------------------------
+# 内核档：决定端序、指针宽、栈指针、寻址与默认复位入口。
+# ---------------------------------------------------------------------------
+[core_profiles]
+classic8051 = { endian = "little", pointer_bits = 16, stack = "sp",  reset_default = 0x0000,   note = "12T 经典 8051" }
+fast8051    = { endian = "little", pointer_bits = 16, stack = "sp",  reset_default = 0x0000,   note = "1T 增强 8051" }
+mcs251      = { endian = "big",    pointer_bits = 24, stack = "spx", reset_default = 0xFF0000, note = "251 兼容核" }
+
+# ---------------------------------------------------------------------------
+# 家族条目
+# ---------------------------------------------------------------------------
+[families.classic89]
+label = "STC89 / STC90（经典 51）"
+core_profile = "classic8051"
+peripheral_group = "classic"
+lineage = ["classic8051"]
+
+[families.stc12]
+label = "STC12"
+core_profile = "fast8051"
+peripheral_group = "stc12"
+lineage = ["classic89"]
+
+[families.stc15]
+label = "STC15 / IAP15"
+core_profile = "fast8051"
+peripheral_group = "stc15"
+lineage = ["stc12"]
+
+[families.stc16]
+label = "STC16（STC15 外设 + 251 核）——已停产，不再新增"
+core_profile = "mcs251"
+peripheral_group = "stc15"
+lineage = ["stc15"]
+discontinued = true
+
+[families.stc8]
+label = "STC8（8051 核）"
+core_profile = "fast8051"
+peripheral_group = "stc8"
+lineage = ["stc15"]
+
+[families.stc32]
+label = "STC32（251 核，与 STC8 外设互通）"
+core_profile = "mcs251"
+peripheral_group = "stc8"
+lineage = ["stc8"]
+
+[families.stc8051]
+label = "STC8051（8051 核，与 STC8/STC32 外设互通）"
+core_profile = "fast8051"
+peripheral_group = "stc8"
+lineage = ["stc8"]
+
+[families.ai8]
+label = "AI8（8051 核，AI 外设）"
+core_profile = "fast8051"
+peripheral_group = "ai"
+lineage = []
+
+[families.ai32]
+label = "AI32（251 核；AI 品牌版 STC32，与 STC32 共用手册/外设）"
+core_profile = "mcs251"
+peripheral_group = "stc8"
+lineage = ["stc32"]
+
+[families.ai8051]
+label = "AI8051（251 核，与 AI8/AI32 外设互通）"
+core_profile = "mcs251"
+peripheral_group = "ai"
+lineage = ["ai8"]

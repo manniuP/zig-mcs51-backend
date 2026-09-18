@@ -72,3 +72,12 @@ sdas8051 -o out.rel out.asm      # MCS-51
 ## 许可
 
 沿用上游 Zig 的 MIT 许可，见 [`LICENSE`](LICENSE)。
+
+## 实验分支 `opt-tags`
+
+本分支额外提供「**数据放置标签 + GCC 对齐优化等级（`O0`–`O3`/`Ofast`/`Os`）**」的后端更新，
+并附带一个**自包含实验构建**（见 [`experimental/README.md`](experimental/README.md)）：
+
+- 更新说明、示例（**标签优化测试示例** `ai8051u_zig_opt`）、全部 `docs/`、构建层工具与设备表；
+- `experimental/build.ps1`：用系统 zig 构建本编译器 + 示例，后处理工具**直接跑 Python**（不冻成二进制）；
+- 实验性内容**不进入 `mcs251` 分支**。

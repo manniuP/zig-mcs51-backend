@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（AI8051U 4.1.1）
+
+[device]
+id = "stc/ai8051u-34k64"
+family = "ai8051"
+model = "Ai8051U-34K64"
+template = "../ai8051u-34k64.toml"
+doc = "AI8051U 4.1.1"
+sfr_source = "../../../tools/vendor/stc/keil/c251/AI8051U.H"
+
+[override]
+flash = 0x10000
+edata = 0x800
+xdata = 0x8000
+eeprom = "IAP"

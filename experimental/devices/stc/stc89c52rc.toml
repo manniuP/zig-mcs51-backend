@@ -1,0 +1,70 @@
+# devices/stc/stc89c52rc.toml
+# STC89C52RC —— 最经典的 12T 8051；8K Flash / 512B RAM（256 IRAM + 256 片内 XRAM）。
+# TODO：512B RAM 的第二块（内部 XRAM）确切基址/使能位待 STC89 手册 6 核对；
+#       SFR 表（含 IAP 0xC2-0xC7）待补 Keil 头。
+
+[device]
+id = "stc/stc89c52rc"
+vendor = "STC"
+family = "classic89"
+model = "STC89C52RC"
+package = "LQFP44 / PDIP40"
+doc = "STC89C52RC-RD+_20260722.md"
+sfr_source = "../../tools/vendor/stc/keil/c51/STC89C5xRC.H"
+
+[code]
+base = 0x0000
+size = 0x2000                  # 8K
+addr_width = 16
+movc = true
+reset_vector = 0x0000
+
+[[memory]]
+kind = "data"
+base = 0x0000
+size = 0x0080
+addressing = "direct"
+bit_addressable = true
+
+[[memory]]
+kind = "idata"
+base = 0x0080
+size = 0x0080
+addressing = "indirect_r0"
+
+[[memory]]
+kind = "xdata"                 # 片内附加 256B（STC89C52RC 共 512B RAM）；基址待核
+base = 0x0000
+size = 0x0100
+addressing = "movx_dptr"
+
+[[memory]]
+kind = "eeprom"                # STC89 系列的 IAP/EEPROM 在 Flash 内
+base = 0x0000
+size = 0x2000
+page = 512
+in_flash = true
+iap = true
+
+[stack]
+space = "idata"
+top = 0x00FF
+
+[dptr]
+count = 1
+
+[registers]
+ISP_DATA = 0xE2
+ISP_ADDRH = 0xE3
+ISP_ADDRL = 0xE4
+ISP_CMD = 0xE5
+ISP_TRIG = 0xE6
+ISP_CONTR = 0xE7
+
+[interrupts]
+vector_base = 0x0000
+slot_bytes = 8
+formula = "num*8+3"
+max_number = 5                 # INT0/T0/INT1/T1/UART/T2（52 有 T2）
+priority_levels = 2
+numbering = "linear"

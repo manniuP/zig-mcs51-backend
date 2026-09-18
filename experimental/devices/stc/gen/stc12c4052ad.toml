@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC12C2052AD 3.3）
+
+[device]
+id = "stc/stc12c4052ad"
+family = "stc12"
+model = "STC12C4052AD"
+template = "../stc12c5a60s2.toml"
+doc = "STC12C2052AD 3.3"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC12C2052AD.H"
+
+[override]
+flash = 0x1000
+idata = 0x100
+xdata = 0x0
+eeprom = "IAP"

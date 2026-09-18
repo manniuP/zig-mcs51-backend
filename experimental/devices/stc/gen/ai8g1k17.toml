@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（Ai8 4.1.1）
+
+[device]
+id = "stc/ai8g1k17"
+family = "ai8"
+model = "Ai8G1K17"
+template = "../ai8h8k64u.toml"
+doc = "Ai8 4.1.1"
+sfr_source = "../../../tools/vendor/stc/keil/c51/AI8G.H"
+
+[override]
+flash = 0x4400
+idata = 0x100
+xdata = 0x400
+eeprom = "IAP"

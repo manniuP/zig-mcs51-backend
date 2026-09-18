@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC15 3.7.3）
+
+[device]
+id = "stc/iap15w4k61s4"
+family = "stc15"
+model = "IAP15W4K61S4"
+template = "../stc15w4k32s4.toml"
+doc = "STC15 3.7.3"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC15.H"
+
+[override]
+flash = 0xf400
+idata = 0x100
+xdata = 0xf00
+eeprom = "IAP"

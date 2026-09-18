@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC15 3.4.3）
+
+[device]
+id = "stc/stc15w402as"
+family = "stc15"
+model = "STC15W402AS"
+template = "../stc15w4k32s4.toml"
+doc = "STC15 3.4.3"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC15.H"
+
+[override]
+flash = 0x800
+idata = 0x100
+xdata = 0x100
+eeprom = 0x1400

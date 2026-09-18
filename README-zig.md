@@ -5,6 +5,11 @@ A general-purpose programming language and toolchain for maintaining
 
 https://ziglang.org/
 
+> **Note (this fork · `opt-tags` experimental branch)** — Adds an MCS-51/MCS-251 self-hosted
+> backend. The `opt-tags` branch additionally adds data-placement + GCC-aligned optimization-level
+> tags (`O0`–`O3`/`Ofast`/`Os`), with a self-contained experimental build (examples + docs, Python
+> run directly). See [`README.md`](README.md) and [`experimental/README.md`](experimental/README.md).
+
 ## Documentation
 
 If you are looking at this README file in a source tree, please refer to the

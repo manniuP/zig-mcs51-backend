@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC89 3.2）
+
+[device]
+id = "stc/stc89c54rd"
+family = "classic89"
+model = "STC89C54RD+"
+template = "../stc89c52rc.toml"
+doc = "STC89 3.2"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC89C5xRC.H"
+
+[override]
+flash = 0x4000
+idata = 0x100
+xdata = 0x400
+eeprom = 0xb400

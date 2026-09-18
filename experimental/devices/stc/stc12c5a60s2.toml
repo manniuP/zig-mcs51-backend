@@ -1,0 +1,63 @@
+# devices/stc/stc12c5a60s2.toml
+# STC12C5A60S2 —— 1T 增强 8051；60K Flash / 1280B RAM（256 + 1024 片内 XRAM）。
+# 定位：STC89 + 一些外设（ADC/PCA/双 DPTR/SFR 引脚映射）。与 STC15 同路线、在其之前。
+# TODO：SFR 表与中断表待补 Keil 头/手册 7、9。
+
+[device]
+id = "stc/stc12c5a60s2"
+vendor = "STC"
+family = "stc12"
+model = "STC12C5A60S2"
+package = "LQFP44 / PDIP40"
+doc = "STC12C5A60S2-20260722.md"
+sfr_source = "../../tools/vendor/stc/keil/c51/STC12C5A60S2.H"
+
+[code]
+base = 0x0000
+size = 0xF000                  # 60K
+addr_width = 16
+movc = true
+reset_vector = 0x0000
+
+[[memory]]
+kind = "data"
+base = 0x0000
+size = 0x0080
+addressing = "direct"
+bit_addressable = true
+
+[[memory]]
+kind = "idata"
+base = 0x0080
+size = 0x0080
+addressing = "indirect_r0"
+
+[[memory]]
+kind = "xdata"                 # 片内扩展 1024B
+base = 0x0000
+size = 0x0400
+addressing = "movx_dptr"
+enable = "AUXR.EXTRAM"
+
+[[memory]]
+kind = "eeprom"
+base = 0x0000
+size = 0xF000
+page = 512
+in_flash = true
+iap = true
+
+[stack]
+space = "idata"
+top = 0x00FF
+
+[dptr]
+count = 2                      # DPTR0 / DPTR1
+
+[interrupts]
+vector_base = 0x0000
+slot_bytes = 8
+formula = "num*8+3"
+max_number = 10                # TODO: 待手册确认（含 ADC/PCA 等）
+priority_levels = 2
+numbering = "linear"

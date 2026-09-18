@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC32G 选型表（AI32 共用））
+
+[device]
+id = "stc/ai32g8k64"
+family = "ai32"
+model = "AI32G8K64"
+template = "../stc32g12k128.toml"
+doc = "STC32G 选型表（AI32 共用）"
+sfr_source = "../../../tools/vendor/stc/keil/c251/AI32G.H"
+
+[override]
+flash = 0x10000
+edata = 0x800
+xdata = 0x1800
+eeprom = "IAP"

@@ -1,0 +1,16 @@
+# 由 tools/mcs_device.py --expand 生成，请勿手改。
+# 源：model_matrix.toml（STC8G 3.6.1）
+
+[device]
+id = "stc/stc15h2k48s4"
+family = "stc15"
+model = "STC15H2K48S4"
+template = "../stc15w4k32s4.toml"
+doc = "STC8G 3.6.1"
+sfr_source = "../../../tools/vendor/stc/keil/c51/STC15H.H"
+
+[override]
+flash = 0xc000
+idata = 0x100
+xdata = 0x800
+eeprom = 0x4000
