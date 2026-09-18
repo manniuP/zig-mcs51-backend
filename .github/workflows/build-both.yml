@@ -1,0 +1,89 @@
+name: Build both branches
+
+# Build the MCS backend for BOTH branches in one workflow run:
+#   - mcs251-backend : compiler only
+#   - opt-tags       : compiler + self-contained experimental build (experimental/build.ps1)
+#
+# Trigger: manual (workflow_dispatch, choose the ref to run from) or push to either branch.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - mcs251-backend
+      - opt-tags
+    paths:
+      - '.github/workflows/build-both.yml'
+      - 'experimental/**'
+      - 'src/codegen/mcs/**'
+      - 'src/link/Asx.zig'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-both-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.ref }})
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        ref: [mcs251-backend, opt-tags]
+
+    steps:
+      - name: Check out ${{ matrix.ref }}
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.ref }}
+          submodules: false
+
+      - name: Set up Zig 0.16.0 (host compiler)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build the MCS backend
+        shell: pwsh
+        run: zig build -Doptimize=ReleaseFast -Dno-lib -Dmcs-only --zig-lib-dir lib
+
+      - name: Upload compiler
+        uses: actions/upload-artifact@v7
+        with:
+          name: zig-${{ matrix.ref }}
+          path: zig-out/bin/zig.exe
+          retention-days: 30
+
+      # --- experimental build (opt-tags only) ---
+      - name: Download prebuilt Windows SDCC
+        if: matrix.ref == 'opt-tags'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force -Path sdcc-dl | Out-Null
+          gh release download v4.6.0-mcs251-20260804 `
+            --repo gevico/sdcc-c251 --pattern "*.zip" --dir sdcc-dl
+          New-Item -ItemType Directory -Force -Path sdcc | Out-Null
+          Expand-Archive -Path (Get-ChildItem sdcc-dl\*.zip).FullName -DestinationPath sdcc -Force
+          Get-ChildItem -Recurse -Filter sdcc.exe sdcc | Select-Object -First 3 FullName
+
+      - name: Experimental build (opt-tags)
+        if: matrix.ref == 'opt-tags'
+        shell: pwsh
+        run: |
+          $sdcc = (Get-ChildItem -Recurse -Filter sdcc.exe sdcc | Select-Object -First 1).FullName
+          Write-Host "SDCC: $sdcc"
+          ./experimental/build.ps1 -SkipCompiler -Sdcc $sdcc
+
+      - name: Upload experimental image (opt-tags)
+        if: matrix.ref == 'opt-tags'
+        uses: actions/upload-artifact@v7
+        with:
+          name: opt-tags-opt.ihx
+          path: experimental/examples/ai8051u_zig_opt/opt.ihx
+          retention-days: 30
