@@ -78,6 +78,17 @@ pub fn deinit(asx: *Asx) void {
     asx.assembly.deinit(gpa);
 }
 
+/// 数据符号放置 → ASxxxx 区名（`edata` 为 251 的 16 位 `@dptr` 区；`exdata` 为片外 xdata 区）。
+fn areaFor(p: device.Place) []const u8 {
+    return switch (p) {
+        .data => "\t.area DSEG    (DATA)\n",
+        .idata => "\t.area ISEG    (DATA)\n",
+        .edata => "\t.area EDATA   (XDATA)\n",
+        .xdata => "\t.area XSEG    (XDATA)\n",
+        .exdata => "\t.area EXDATA  (XDATA)\n",
+    };
+}
+
 /// AIR/MIR 已由 codegen 生成；这里把函数文本渲染并追加到 `assembly`。
 pub fn updateFunc(
     asx: *Asx,
@@ -93,18 +104,19 @@ pub fn updateFunc(
     const name = try mcs.mangleNavSymbol(gpa, ip, nav);
     defer gpa.free(name);
 
-    // `.cold` 函数归入独立的 `COLD` 代码区（便于整体压缩/后置），其余进 `CSEG`。
-    const is_cold = if (ip.getNav(nav).resolved) |r| blk: {
-        const s = r.@"linksection".toSlice(ip) orelse break :blk false;
-        break :blk std.mem.eql(u8, s, ".cold");
-    } else false;
+    // O 等级（GCC 对齐）：`Os` 函数归入独立 `COLD` 区；其余进 `CSEG`。
+    // 标签同时以注释 `; @tag func <name> <region><level>` 传给中间层。
+    const raw: ?[]const u8 = if (ip.getNav(nav).resolved) |r| r.@"linksection".toSlice(ip) else null;
+    const sec = if (raw) |s| device.parseSection(s) else device.Section{};
+    const lvl_name = if (sec.level) |l| device.levelName(l) else "O3";
+    const is_cold = if (sec.level) |l| l == .os else false;
 
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const w = &aw.writer;
 
-    // 函数头：代码区、全局符号与标签。
-    // 使用 SDCC/ASxxxx 约定的代码区名 `CSEG`。
+    // 函数头：标签提示 + 代码区、全局符号与标签。
+    w.print("; @tag func {s} {s}{s}\n", .{ name, if (is_cold) "cold" else "cseg", lvl_name }) catch return error.OutOfMemory;
     w.writeAll(if (is_cold) "\t.area COLD    (CODE)\n" else "\t.area CSEG    (CODE)\n") catch return error.OutOfMemory;
     w.print("\t.globl {s}\n", .{name}) catch return error.OutOfMemory;
     w.print("{s}:\n", .{name}) catch return error.OutOfMemory;
@@ -148,18 +160,17 @@ pub fn updateNav(
     // derefSymbolRead/Write 保持一致（同一 `device.decide`）。
     const ls = resolved.@"linksection".toSlice(ip);
     const dev = device.get(asx.base.comp.environ_map);
-    const area_line: []const u8 = if (ls) |s| blk: {
-        if (std.mem.eql(u8, s, ".cold")) break :blk "\t.area COLDX   (XDATA)\n";
-        break :blk switch (device.decide(dev, s, size)) {
-            .data => "\t.area DSEG    (DATA)\n",
-            .idata => "\t.area ISEG    (DATA)\n",
-            .xdata => "\t.area XSEG    (XDATA)\n",
-        };
-    } else switch (device.decide(dev, null, size)) {
-        .data => "\t.area DSEG    (DATA)\n",
-        .idata => "\t.area ISEG    (DATA)\n",
-        .xdata => "\t.area XSEG    (XDATA)\n",
+    // 放置/O 等级标签以注释传给中间层（`tools/mcs_ir.py` 消费后删）。
+    const section = if (ls) |s| device.parseSection(s) else device.Section{};
+    const lvl_name = if (section.level) |l| device.levelName(l) else "O3";
+    const place_name = if (section.place) |p| @tagName(p) else "auto";
+    const area_line: []const u8 = blk: {
+        if (ls) |s| {
+            if (std.mem.eql(u8, s, ".cold")) break :blk "\t.area COLDX   (XDATA)\n";
+        }
+        break :blk areaFor(device.decide(dev, ls, size));
     };
+    w.print("; @tag sym {s} {s}{s}\n", .{ name, place_name, lvl_name }) catch return error.OutOfMemory;
     w.writeAll(area_line) catch return error.OutOfMemory;
     w.print("\t.globl {s}\n", .{name}) catch return error.OutOfMemory;
     w.print("{s}:\n", .{name}) catch return error.OutOfMemory;

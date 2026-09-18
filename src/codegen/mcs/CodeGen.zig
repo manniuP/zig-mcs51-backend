@@ -3081,7 +3081,9 @@ const Gen = struct {
                         switch (device.decide(device.get(gen.zcu.comp.environ_map), ls, sym_size)) {
                             .data => space = .data,
                             .idata => space = .idata,
+                            .edata => space = .edata,
                             .xdata => space = .xdata,
+                            .exdata => space = .xdata, // 外部 xdata：同一 24 位 `@dpx` 寻址
                         }
                         const is_fn = if (n.resolved) |r|
                             Type.fromInterned(r.type).zigTypeTag(gen.zcu) == .@"fn"
@@ -4486,6 +4488,18 @@ fn isRegisterA(r: encode.Register) bool {
     };
 }
 
+/// 按函数 `linksection` 等级（GCC 对齐）选优化档：`Os`→体积（true）、`O0`–`O3`/`Ofast`→
+/// 速度（false）、未标注→跟随全局 `-OReleaseSmall`。标签由 `link/Asx.zig` 以提示注释传给中间层。
+fn aggressiveSizeFor(zcu: *Zcu, owner_nav: InternPool.Nav.Index) bool {
+    const ip = &zcu.intern_pool;
+    if (ip.getNav(owner_nav).resolved) |r| {
+        if (r.@"linksection".toSlice(ip)) |s| {
+            if (device.parseSection(s).level) |lv| return lv == .os;
+        }
+    }
+    return zcu.optimizeMode() == .ReleaseSmall;
+}
+
 /// AIR -> MIR。
 pub fn generate(
     bin_file: *link.File,
@@ -4520,7 +4534,7 @@ pub fn generate(
         .arch = zcu.getTarget().cpu.arch,
         .ret_class = abi.classify(ret_ty, zcu),
         .vals = vals,
-        .aggressive_size = zcu.optimizeMode() == .ReleaseSmall,
+        .aggressive_size = aggressiveSizeFor(zcu, func.owner_nav),
     };
     errdefer {
         gen.mir.deinit(gpa);
