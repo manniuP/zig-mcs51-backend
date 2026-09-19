@@ -115,9 +115,15 @@ pub fn updateFunc(
     defer aw.deinit();
     const w = &aw.writer;
 
+    // 调试符号（调试档 `-ODebug`）：函数入口 `G$<名>$0$0`、出口 `XG$<名>$0$0`，
+    // 用 `==.` 绑定当前地址；链接时 `sdld -y` 会写成 `.cdb` 的 `L:` 记录。
+    const cdb_on = zcu.optimizeMode() == .Debug;
+    const dbg_name = if (name.len > 0 and name[0] == '_') name[1..] else name;
+
     // 函数头：标签提示 + 代码区、全局符号与标签。
     w.print("; @tag func {s} {s}{s}\n", .{ name, if (is_cold) "cold" else "cseg", lvl_name }) catch return error.OutOfMemory;
     w.writeAll(if (is_cold) "\t.area COLD    (CODE)\n" else "\t.area CSEG    (CODE)\n") catch return error.OutOfMemory;
+    if (cdb_on) w.print("\tG${s}$0$0 ==.\n", .{dbg_name}) catch return error.OutOfMemory;
     w.print("\t.globl {s}\n", .{name}) catch return error.OutOfMemory;
     w.print("{s}:\n", .{name}) catch return error.OutOfMemory;
 
@@ -125,6 +131,8 @@ pub fn updateFunc(
         error.WriteFailed => return error.OutOfMemory,
         else => |e| return e,
     };
+
+    if (cdb_on) w.print("\tXG${s}$0$0 ==.\n", .{dbg_name}) catch return error.OutOfMemory;
 
     try asx.assembly.appendSlice(gpa, aw.written());
 }

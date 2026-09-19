@@ -215,6 +215,11 @@ const Gen = struct {
     slice_origin: std.AutoHashMapUnmanaged(i32, SliceOrigin) = .empty,
     /// 激进尺寸（`-OReleaseSmall`）开关。
     aggressive_size: bool = false,
+    /// 调试符号（调试档 `-ODebug`）：源文件基名、声明起始行、行标记序号。
+    cdb: bool = false,
+    cdb_file: []const u8 = &.{},
+    cdb_base_line: u32 = 0,
+    cdb_seq: u32 = 0,
     fused_cmp: std.AutoHashMapUnmanaged(Air.Inst.Index, FusedCmp) = .empty,
     fused_br: std.AutoHashMapUnmanaged(Air.Inst.Index, FusedBr) = .empty,
 
@@ -1384,6 +1389,21 @@ const Gen = struct {
         try gen.mir.addRaw(gen.gpa, owned);
     }
 
+    /// 调试符号（调试档）：在当前地址定义 `C$<文件>$<行>$0_0$<序号> ==.`。
+    /// 链接时加 `-y`（`sdcc --debug` 会自动写入 `.lk`），`sdld` 便把它写成 `.cdb`
+    /// 里的 `L:` 记录，供外部调试器（`tools/mcs_dbg.py`）做源码断点。
+    fn emitCdbLine(gen: *Gen, inst: Air.Inst.Index) codegen.CodeGenError!void {
+        if (!gen.cdb) return;
+        const ds = gen.air.instructions.items(.data)[@intFromEnum(inst)].dbg_stmt;
+        const line = gen.cdb_base_line + ds.line + 1;
+        const text = std.fmt.allocPrint(gen.gpa, "\tC${s}${d}$0_0${d} ==.", .{
+            gen.cdb_file, line, gen.cdb_seq,
+        }) catch return error.OutOfMemory;
+        gen.cdb_seq += 1;
+        try gen.mir.addOwned(gen.gpa, text);
+        try gen.mir.addRaw(gen.gpa, text);
+    }
+
     fn emitBody(gen: *Gen, body: []const Air.Inst.Index) codegen.CodeGenError!void {
         try gen.planFusion(body);
         for (body) |inst| {
@@ -1459,7 +1479,8 @@ const Gen = struct {
         switch (tag) {
             .arg => try gen.emitArg(inst),
 
-            .dbg_stmt,
+            .dbg_stmt => try gen.emitCdbLine(inst),
+
             .dbg_empty_stmt,
             .dbg_inline_block,
             .dbg_var_ptr,
@@ -4524,6 +4545,13 @@ pub fn generate(
     defer gpa.free(vals);
     @memset(vals, .none);
 
+    // 调试符号：仅在调试档（`-ODebug`）输出；Release 档不带，避免影响体积基线。
+    const cdb_on = zcu.optimizeMode() == .Debug;
+    const cdb_file: []const u8 = if (cdb_on)
+        std.fs.path.basename(zcu.navFileScope(func.owner_nav).sub_file_path)
+    else
+        "";
+
     var gen: Gen = .{
         .gpa = gpa,
         .pt = pt,
@@ -4535,6 +4563,9 @@ pub fn generate(
         .ret_class = abi.classify(ret_ty, zcu),
         .vals = vals,
         .aggressive_size = aggressiveSizeFor(zcu, func.owner_nav),
+        .cdb = cdb_on,
+        .cdb_file = cdb_file,
+        .cdb_base_line = zcu.navSrcLine(func.owner_nav),
     };
     errdefer {
         gen.mir.deinit(gpa);
