@@ -213,8 +213,9 @@ const Gen = struct {
     switch_info: std.AutoHashMapUnmanaged(Air.Inst.Index, SwitchInfo) = .empty,
     extra_slots: std.AutoHashMapUnmanaged(u64, i32) = .empty,
     slice_origin: std.AutoHashMapUnmanaged(i32, SliceOrigin) = .empty,
-    /// 激进尺寸（`-OReleaseSmall`）开关。
-    aggressive_size: bool = false,
+    /// 优化等级（来自 `linksection` 标签 / 全局 `-O*`；默认 O3）。用于选体积/速度策略：
+    /// O0/O1 少优化、O2/O3/Ofast 启用比较融合、Os 额外走体积优先。
+    opt_level: device.Level = .o3,
     /// 调试符号（调试档 `-ODebug`）：源文件基名、声明起始行、行标记序号。
     cdb: bool = false,
     cdb_file: []const u8 = &.{},
@@ -1422,9 +1423,20 @@ const Gen = struct {
             }
             if (gen.fused_cmp.get(inst)) |fc| {
                 try gen.emitFusedCondToA(inst, tag);
-                try gen.addInst(if (fc.jump_if_true) .jnz else .jz, &.{
-                    .{ .code = .{ .local_label = fc.target } },
-                });
+                if (gen.opt_level == .os) {
+                    // Os：目标在冷区/近处，直接短跳（沿用旧行为，体积最小）。
+                    try gen.addInst(if (fc.jump_if_true) .jnz else .jz, &.{
+                        .{ .code = .{ .local_label = fc.target } },
+                    });
+                } else {
+                    // O2/O3/Ofast：目标可能很远，短条件反向跳过 + 远跳（范围安全）。
+                    const skip = gen.newLabel();
+                    try gen.addInst(if (fc.jump_if_true) .jz else .jnz, &.{
+                        .{ .code = .{ .local_label = skip } },
+                    });
+                    try gen.jmpFar(fc.target);
+                    try gen.mir.addLabel(gen.gpa, skip);
+                }
                 continue;
             }
             switch (tag) {
@@ -1558,8 +1570,16 @@ const Gen = struct {
     /// 激进尺寸：规划「比较紧跟 `cond_br`」的融合，让比较直接出分支而不物化 bool。
     /// 仅在 `-OReleaseSmall` 生效；要求比较是 `body` 里紧接着 `cond_br` 的前一条指令，
     /// 且只被这一个 `cond_br` 用作条件（否则跳过物化会让其它用途读到旧值）。
+    /// O2 及以上启用「比较紧跟 `cond_br`」的融合（少一次 bool 物化）；O0/O1 保留物化。
+    fn fusionEnabled(gen: *const Gen) bool {
+        return switch (gen.opt_level) {
+            .o0, .o1 => false,
+            else => true,
+        };
+    }
+
     fn planFusion(gen: *Gen, body: []const Air.Inst.Index) codegen.CodeGenError!void {
-        if (!gen.aggressive_size) return;
+        if (!gen.fusionEnabled()) return;
         const tags = gen.air.instructions.items(.tag);
         var i: usize = 0;
         while (i < body.len) : (i += 1) {
@@ -3099,7 +3119,7 @@ const Gen = struct {
                             const t = Type.fromInterned(r.type);
                             if (t.hasRuntimeBits(gen.zcu)) sym_size = @intCast(t.abiSize(gen.zcu));
                         }
-                        switch (device.decide(device.get(gen.zcu.comp.environ_map), ls, sym_size)) {
+                        switch (device.decide(device.get(gen.zcu.comp.environ_map), gen.arch, ls, sym_size)) {
                             .data => space = .data,
                             .idata => space = .idata,
                             .edata => space = .edata,
@@ -4511,14 +4531,20 @@ fn isRegisterA(r: encode.Register) bool {
 
 /// 按函数 `linksection` 等级（GCC 对齐）选优化档：`Os`→体积（true）、`O0`–`O3`/`Ofast`→
 /// 速度（false）、未标注→跟随全局 `-OReleaseSmall`。标签由 `link/Asx.zig` 以提示注释传给中间层。
-fn aggressiveSizeFor(zcu: *Zcu, owner_nav: InternPool.Nav.Index) bool {
+/// 函数优化等级：显式 `linksection` 标签（`.O0`…`.Os`）优先；否则按全局 `-O*`：
+/// `-OReleaseSmall`→Os、`-OReleaseFast`→Ofast、其余→O3。
+fn optLevelFor(zcu: *Zcu, owner_nav: InternPool.Nav.Index) device.Level {
     const ip = &zcu.intern_pool;
     if (ip.getNav(owner_nav).resolved) |r| {
         if (r.@"linksection".toSlice(ip)) |s| {
-            if (device.parseSection(s).level) |lv| return lv == .os;
+            if (device.parseSection(s).level) |lv| return lv;
         }
     }
-    return zcu.optimizeMode() == .ReleaseSmall;
+    return switch (zcu.optimizeMode()) {
+        .ReleaseSmall => .os,
+        .ReleaseFast => .ofast,
+        else => .o3,
+    };
 }
 
 /// AIR -> MIR。
@@ -4562,7 +4588,7 @@ pub fn generate(
         .arch = zcu.getTarget().cpu.arch,
         .ret_class = abi.classify(ret_ty, zcu),
         .vals = vals,
-        .aggressive_size = aggressiveSizeFor(zcu, func.owner_nav),
+        .opt_level = optLevelFor(zcu, func.owner_nav),
         .cdb = cdb_on,
         .cdb_file = cdb_file,
         .cdb_base_line = zcu.navSrcLine(func.owner_nav),

@@ -176,7 +176,8 @@ pub fn updateNav(
         if (ls) |s| {
             if (std.mem.eql(u8, s, ".cold")) break :blk "\t.area COLDX   (XDATA)\n";
         }
-        break :blk areaFor(device.decide(dev, ls, size));
+        const arch = asx.base.comp.root_mod.resolved_target.result.cpu.arch;
+        break :blk areaFor(device.decide(dev, arch, ls, size));
     };
     w.print("; @tag sym {s} {s}{s}\n", .{ name, place_name, lvl_name }) catch return error.OutOfMemory;
     w.writeAll(area_line) catch return error.OutOfMemory;

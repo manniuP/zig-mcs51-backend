@@ -150,10 +150,13 @@ fn load(environ_map: *const std.process.Environ.Map) Device {
 
 /// 决定一个全局数据符号的放置空间。`linksection` 为 `.data`/`.hot`/`.idata` 时优先；
 /// 其余（含 `.cold`，其分区在 `Asx` 里另作 COLDX）走自动放置。
-pub fn decide(dev: *const Device, sec: ?[]const u8, size: u32) Place {
+pub fn decide(dev: *const Device, arch: std.Target.Cpu.Arch, sec: ?[]const u8, size: u32) Place {
     if (sec) |s| {
         if (parseSection(s).place) |p| return p;
     }
+    // 8 位 MCS-51：C 侧 `--model-large` 的 extern 全局落在 xdata；Zig 侧定义（`export var`）
+    // 必须同为 xdata，否则 C/Zig 各按不同存储访问、互操作失败。故 8 位不自动放 data。
+    if (arch == .mcs51) return .xdata;
     if (dev.loaded) {
         if (size <= 2 and dev.data_size > 0) return .data;
         return dev.default_data;
