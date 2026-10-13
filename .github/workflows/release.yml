@@ -1,0 +1,115 @@
+name: Release
+
+# 推送 v* tag 时：构建 Windows / Linux 两版 MCS 后端编译器，并发布到 Releases。
+#
+# 用法：
+#   git tag v0.16.0-mcs.1 && git push ssh://git@github.com/manniuP/zig-mcs51-backend.git v0.16.0-mcs.1
+#
+# 产物（自包含：可执行文件 + lib/）：
+#   zig-mcs51-backend-windows-x86_64.zip
+#   zig-mcs51-backend-linux-x86_64.tar.gz
+#
+# 运行时请设置 ZIG_LIB_DIR 指向包内的 lib 目录：
+#   Windows: $env:ZIG_LIB_DIR="<解压目录>\lib"
+#   Linux  : export ZIG_LIB_DIR="<解压目录>/lib"
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: windows (x86_64)
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - name: Set up Zig 0.16.0 (host compiler)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build the MCS backend
+        shell: pwsh
+        run: zig build -Doptimize=ReleaseFast -Dno-lib -Dmcs-only --zig-lib-dir lib
+
+      - name: Verify the compiler runs
+        shell: pwsh
+        run: zig-out/bin/zig.exe version
+
+      - name: Package (exe + lib)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path pkg | Out-Null
+          Copy-Item zig-out/bin/zig.exe pkg/
+          Copy-Item zig-out/bin/zig.pdb pkg/ -ErrorAction SilentlyContinue
+          Copy-Item lib pkg/lib -Recurse
+          Compress-Archive -Path pkg/* -DestinationPath zig-mcs51-backend-windows-x86_64.zip
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: win-pkg
+          path: zig-mcs51-backend-windows-x86_64.zip
+          if-no-files-found: error
+
+  linux:
+    name: linux (x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - name: Set up Zig 0.16.0 (host compiler)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build the MCS backend
+        run: zig build -Doptimize=ReleaseFast -Dno-lib -Dmcs-only --zig-lib-dir lib
+
+      - name: Verify the compiler runs
+        run: zig-out/bin/zig version
+
+      - name: Package (zig + lib)
+        run: |
+          mkdir -p pkg
+          cp zig-out/bin/zig pkg/
+          cp -r lib pkg/lib
+          tar -czf zig-mcs51-backend-linux-x86_64.tar.gz -C pkg .
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-pkg
+          path: zig-mcs51-backend-linux-x86_64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: [windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
