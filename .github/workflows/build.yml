@@ -77,3 +77,33 @@ jobs:
           name: opt-tags-opt.ihx
           path: experimental/examples/ai8051u_zig_opt/opt.ihx
           retention-days: 30
+
+  # Linux 宿主：只负责在 Linux 上编出 MCS 后端编译器（不需要跨编 Windows 程序）
+  build-linux:
+    name: build (linux host)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out sources
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+
+      - name: Set up Zig 0.16.0 (host compiler)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build the MCS backend (linux)
+        run: zig build -Doptimize=ReleaseFast -Dno-lib -Dmcs-only --zig-lib-dir lib
+
+      - name: Verify the compiler runs
+        run: zig-out/bin/zig version
+
+      - name: Upload compiler
+        uses: actions/upload-artifact@v7
+        with:
+          name: zig-mcs251-backend-linux
+          path: zig-out/bin/zig
+          retention-days: 30
