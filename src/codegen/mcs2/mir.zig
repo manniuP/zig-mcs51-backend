@@ -54,6 +54,28 @@ pub const abi = struct {
     pub const max_arg_bytes = arg_regs.len;
 };
 
+/// 比较条件码（8 位无符号语义）。
+pub const Cc = enum {
+    lt,
+    le,
+    gt,
+    ge,
+    eq,
+    ne,
+
+    /// 取反：cond_br 的 else 分支用。
+    pub fn invert(self: Cc) Cc {
+        return switch (self) {
+            .lt => .ge,
+            .le => .gt,
+            .gt => .le,
+            .ge => .lt,
+            .eq => .ne,
+            .ne => .eq,
+        };
+    }
+};
+
 pub const Op = union(enum) {
     /// 把 8 位立即数写入目标位置。
     imm: struct { dst: Byte, value: u8 },
@@ -82,9 +104,14 @@ pub const Op = union(enum) {
     br: u32,
     /// dst <- src（8 位搬运；直址到直址合法）。
     mov: struct { dst: Byte, src: Byte },
+    /// 比较 + 条件跳转（融合形态）：cc 成立则跳到 target。
+    /// 51 发射为 clr c / mov a / subb / jcc，或 xrl / jz(jnz)。
+    cmp_br: struct { lhs: Byte, rhs: Byte, cc: Cc, target: u32 },
     /// 位置值非零则跳转（发射为 `mov a,src` + `jnz rel` 两步；
     /// 8051 的 JZ/JNZ 只测 A，不测 direct）。
     br_ifnz: struct { cond: Byte, target: u32 },
+    /// 位置值为零则跳转（`mov a,src` + `jz rel`）；cond_br 的 else 分支用。
+    br_ifz: struct { cond: Byte, target: u32 },
     /// 函数返回（51: `ret`；返回值由调用方先放好，见 `abi`）。
     ret,
     /// 停机；当前切片不建立调用栈。

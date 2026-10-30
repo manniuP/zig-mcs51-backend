@@ -41,7 +41,8 @@ def find_ucsim() -> Path:
 
 def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
     print("+", " ".join(str(c) for c in cmd))
-    return subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
+    return subprocess.run(cmd, check=True, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", **kwargs)
 
 
 def main() -> int:
@@ -71,7 +72,8 @@ def main() -> int:
     #    0x8003=0x01（可穿线模式：br_ifnz→L1→sjmp L2 被穿线后路径不变）。
     cmds = "set opt selfjump_stop 0\nstep 400\ndump xram 0x8000 0x8004\nquit\n"
     sim = subprocess.run([str(ucsim), "-t", "8052", str(ihx)],
-                         input=cmds, capture_output=True, text=True, check=False)
+                         input=cmds, capture_output=True, text=True, check=False,
+                         encoding="utf-8", errors="replace")
     out = sim.stdout + sim.stderr
     print(out)
 

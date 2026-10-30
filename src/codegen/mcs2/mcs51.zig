@@ -112,6 +112,13 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = byteOf(x.src, f.vreg_base) } },
             .mov => |x| .{ .mov = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
             .br_ifnz => |x| .{ .br_ifnz = .{ .cond = byteOf(x.cond, f.vreg_base), .target = x.target } },
+            .br_ifz => |x| .{ .br_ifz = .{ .cond = byteOf(x.cond, f.vreg_base), .target = x.target } },
+            .cmp_br => |x| .{ .cmp_br = .{
+                .lhs = byteOf(x.lhs, f.vreg_base),
+                .rhs = byteOf(x.rhs, f.vreg_base),
+                .cc = x.cc,
+                .target = x.target,
+            } },
             .push => |x| .{ .push = .{ .src = byteOf(x.src, f.vreg_base) } },
             .pop => |x| .{ .pop = .{ .dst = byteOf(x.dst, f.vreg_base) } },
             .load_xdata => |x| .{ .load_xdata = .{ .dst = byteOf(x.dst, f.vreg_base), .addr = x.addr } },
@@ -227,6 +234,39 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     .{c},
                 ), .jump = null } });
                 try items.append(gpa, .{ .line = .{ .text = "jnz", .jump = x.target } });
+            },
+            .br_ifz => |x| {
+                const c = try byteText(gpa, x.cond);
+                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                    gpa,
+                    "    mov a,{s}",
+                    .{c},
+                ), .jump = null } });
+                try items.append(gpa, .{ .line = .{ .text = "jz", .jump = x.target } });
+            },
+            .cmp_br => |x| {
+                const l = try byteText(gpa, x.lhs);
+                const r = try byteText(gpa, x.rhs);
+                switch (x.cc) {
+                    .lt, .ge => {
+                        try items.append(gpa, .{ .line = .{ .text = "    clr c", .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    subb a,{s}", .{r}), .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = if (x.cc == .lt) "jc" else "jnc", .jump = x.target } });
+                    },
+                    .le, .gt => {
+                        // b ? a 的借位即 a>b 的否定，交换操作数更省。
+                        try items.append(gpa, .{ .line = .{ .text = "    clr c", .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{r}), .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    subb a,{s}", .{l}), .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = if (x.cc == .gt) "jc" else "jnc", .jump = x.target } });
+                    },
+                    .eq, .ne => {
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    xrl a,{s}", .{r}), .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = if (x.cc == .eq) "jz" else "jnz", .jump = x.target } });
+                    },
+                }
             },
             .ret => try items.append(gpa, .{ .line = .{ .text = "    ret", .jump = null } }),
             .halt => {

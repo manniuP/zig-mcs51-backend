@@ -51,9 +51,13 @@ pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
 /// 单次编译会话内的全局 vreg 基线：同模块多函数的 DSEG 槽不撞名。
 /// M1 简单累加（255 上限）；正式方案是 OVR 段覆盖或活跃期回收。
 var session_vreg_base: u8 = 0;
+var session_temp_base: u32 = 0x8000_0000;
+/// 跨函数的标签域步长：每个函数预留 air 长度 ×2 的编号。
+var session_label_base: u32 = 0;
 
-/// 诊断开关（默认 false）：ISR 跳过 push/pop 保存恢复——定位 ucsim 中断行为用。
-var no_isr_save: bool = true;
+/// 诊断开关（默认 false）：ISR 跳过 push/pop 保存恢复——仅定位 ucsim 中断行为时临时置 true。
+/// 真机必须保存现场（主代码用 A/DPTR 时，ISR 不保存会踩坏返回值）。
+var no_isr_save: bool = false;
 
 /// 一个 8 位值的位置（M1：全部经 direct 寻址可达）。
 const Loc = mcsmir.Byte;
@@ -75,6 +79,9 @@ const Lower = struct {
     parms: std.ArrayListUnmanaged([]const u8) = .empty,
     is_isr: bool = false,
     ret_byte: ?u8, // u8 返回的 ABI 地址；void 时为 null
+    saw_ret: bool = false,
+    /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
+    label_base: u32 = 0,
 
     /// 固定地址解引用：interned ptr（base=.int）→ 字节地址；非固定地址 → null。
     fn constPtrAddr(self: *Lower, ref: Air.Inst.Ref) ?u64 {
@@ -131,6 +138,284 @@ const Lower = struct {
         const loc = self.vals[@backingInt(idx)] orelse
             return self.fail("操作数 v{d} 尚无位置（内部错误）", .{@backingInt(idx)});
         return loc;
+    }
+
+
+    // ==== M2：控制流 ====
+
+    fn blockHead(self: *Lower, inst: Air.Inst.Index) u32 {
+        return self.label_base + @as(u32, @backingInt(inst)) * 2;
+    }
+
+    fn blockEnd(self: *Lower, inst: Air.Inst.Index) u32 {
+        return self.label_base + @as(u32, @backingInt(inst)) * 2 + 1;
+    }
+
+    fn tempLabel(_: *Lower) u32 {
+        const l = session_temp_base;
+        session_temp_base += 1;
+        return l;
+    }
+
+    fn ccOf(tag: Air.Inst.Tag) ?mcsmir.Cc {
+        return switch (tag) {
+            .cmp_lt, .cmp_lt_optimized => .lt,
+            .cmp_lte, .cmp_lte_optimized => .le,
+            .cmp_gt, .cmp_gt_optimized => .gt,
+            .cmp_gte, .cmp_gte_optimized => .ge,
+            .cmp_eq, .cmp_eq_optimized => .eq,
+            .cmp_neq, .cmp_neq_optimized => .ne,
+            else => null,
+        };
+    }
+
+    /// cond_br：优先把“比较 → 分支”融合成 cmp_br（M2 第一刀）；
+    /// 否则按字节测零（br_ifz）。条件为编译期常量时直接发单边。
+    fn emitCondBr(self: *Lower, inst: Air.Inst.Index) codegen.Error!void {
+        const air = self.air;
+        const cb = air.unwrapCondBr(inst);
+        const else_lbl = self.tempLabel();
+        const end_lbl = self.blockEnd(inst);
+
+        // 编译期常量条件
+        if (cb.condition.toInterned()) |ip_index| {
+            const key = self.zcu.intern_pool.indexToKey(ip_index);
+            if (key == .int) {
+                const v = switch (key.int.storage) {
+                    .u64 => |x| x,
+                    else => 0,
+                };
+                if (v != 0) {
+                    _ = try self.emitBody(cb.then_body);
+                } else {
+                    _ = try self.emitBody(cb.else_body);
+                }
+                return;
+            }
+        }
+
+        var fused = false;
+        if (cb.condition.toIndex()) |cond_idx| {
+            const tg = air.instructions.items(.tag)[@backingInt(cond_idx)];
+            if (ccOf(tg)) |cc| {
+                const bin = air.instructions.items(.data)[@backingInt(cond_idx)].bin_op;
+                const lhs = try self.refLoc(bin.lhs);
+                const rhs = try self.refLoc(bin.rhs);
+                // 条件不成立 → else：取反。
+                try self.ops.append(self.gpa, .{ .cmp_br = .{
+                    .lhs = lhs,
+                    .rhs = rhs,
+                    .cc = cc.invert(),
+                    .target = else_lbl,
+                } });
+                fused = true;
+            }
+        }
+        if (!fused) {
+            const c = try self.refLoc(cb.condition);
+            try self.ops.append(self.gpa, .{ .br_ifz = .{ .cond = c, .target = else_lbl } });
+        }
+
+        const then_term = try self.emitBody(cb.then_body);
+        if (!then_term) try self.ops.append(self.gpa, .{ .br = end_lbl });
+        try self.ops.append(self.gpa, .{ .label = else_lbl });
+        _ = try self.emitBody(cb.else_body);
+        try self.ops.append(self.gpa, .{ .label = end_lbl });
+    }
+
+    fn emitBody(self: *Lower, body: []const Air.Inst.Index) codegen.Error!bool {
+    for (body, 0..) |inst, idx| {
+        const tag = self.air.instructions.items(.tag)[@backingInt(inst)];
+        const data = self.air.instructions.items(.data)[@backingInt(inst)];
+        switch (tag) {
+            .dbg_stmt, .dbg_empty_stmt, .dbg_inline_block, .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => {},
+
+            .arg => {
+                const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                if (!self.typeIsU8(ty)) {
+                    return self.zcu.codegenFail(
+                        self.nav,
+                        "mcs2: 参数类型 {s} 尚未实现（M1 只支持 u8）",
+                        .{@tagName(ty.zigTypeTag(self.zcu))},
+                    );
+                }
+                if (self.arg_cursor >= mcsmir.abi.max_arg_bytes) {
+                    return self.zcu.codegenFail(
+                        self.nav,
+                        "mcs2: 参数超过 {d} 字节寄存器 ABI（M1）",
+                        .{mcsmir.abi.max_arg_bytes},
+                    );
+                }
+                // ADR-001 边界 ABI：arg0 → DPL；arg1+ → 静态 `_名_PARM_n`（SDCC 同款）。
+                if (self.arg_cursor == 0) {
+                    self.vals[@backingInt(inst)] = .{ .dir = mcsmir.abi.arg_regs[0] };
+                } else {
+                    const psym = try std.fmt.allocPrint(
+                        self.gpa,
+                        "_{s}_PARM_{d}",
+                        .{ self.short_name, self.arg_cursor + 1 },
+                    );
+                    try self.parms.append(self.gpa, psym);
+                    self.vals[@backingInt(inst)] = .{ .sym = psym };
+                }
+                self.arg_cursor += 1;
+            },
+
+            .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap => {
+                const bin = data.bin_op;
+                const lhs = try self.refLoc(bin.lhs);
+                const rhs = try self.refLoc(bin.rhs);
+                // 「ret 前看一眼」：下一非调试指令若是 ret 且操作数是本指令，
+                // 结果直接写 DPL（扩展访问优化的最小版：省一次 vreg 往返）。
+                var consumed_by_ret = false;
+                if (self.ret_byte != null and idx + 1 < body.len) {
+                    const nxt = body[idx + 1];
+                    const nxt_tag = self.air.instructions.items(.tag)[@backingInt(nxt)];
+                    if (nxt_tag == .ret or nxt_tag == .ret_safe) {
+                        const nxt_data = self.air.instructions.items(.data)[@backingInt(nxt)];
+                        if (nxt_data.un_op.toIndex()) |ret_operand| {
+                            if (@backingInt(ret_operand) == @backingInt(inst)) {
+                                consumed_by_ret = true;
+                            }
+                        }
+                    }
+                }
+                const dst: Loc = if (consumed_by_ret)
+                    .{ .dir = self.ret_byte.? }
+                else
+                    mcsmir.v(try self.allocVreg());
+                const is_add = switch (tag) {
+                    .add, .add_safe, .add_wrap => true,
+                    else => false,
+                };
+                try self.ops.append(self.gpa, if (is_add)
+                    .{ .add = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }
+                else
+                    .{ .sub = .{ .dst = dst, .lhs = lhs, .rhs = rhs } });
+                self.vals[@backingInt(inst)] = dst;
+            },
+
+            .alloc => {
+                // M1：每个局部槽一个 vreg（DSEG 直址）；活跃期优化留给后续 pass。
+                const r = try self.allocVreg();
+                self.vals[@backingInt(inst)] = mcsmir.v(r);
+            },
+
+            .store, .store_safe => {
+                // bin_op：lhs = 目标，rhs = 值。
+                // 目标为固定地址指针（@ptrFromInt）：≤0xFF → SFR/直址；>0xFF → xdata。
+                const bin = data.bin_op;
+                if (self.constPtrAddr(bin.lhs)) |addr| {
+                    const value = try self.refLoc(bin.rhs);
+                    if (addr <= 0xFF) {
+                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(addr), .src = value } });
+                    } else if (addr <= 0xFFFF) {
+                        try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = @intCast(addr), .src = value } });
+                    } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
+                    continue;
+                }
+                const dest = try self.refLoc(bin.lhs);
+                const value = try self.refLoc(bin.rhs);
+                try self.ops.append(self.gpa, .{ .mov = .{ .dst = dest, .src = value } });
+                // store 本身无结果值
+            },
+
+            .load => {
+                // ty_op：operand = 指针。固定地址 → load_dir（≤0xFF）/ load_xdata（>0xFF）；
+                // 本地槽 → 直读。
+                const ty_op = data.ty_op;
+                if (self.constPtrAddr(ty_op.operand)) |addr| {
+                    const r = try self.allocVreg();
+                    if (addr <= 0xFF) {
+                        try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
+                    } else if (addr <= 0xFFFF) {
+                        try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
+                    } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
+                    self.vals[@backingInt(inst)] = mcsmir.v(r);
+                    continue;
+                }
+                const src = try self.refLoc(ty_op.operand);
+                const r = try self.allocVreg();
+                try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(r), .src = src } });
+                self.vals[@backingInt(inst)] = mcsmir.v(r);
+            },
+
+            .ret, .ret_safe => {
+                if (self.is_isr) {
+                    // ISR 尾声：恢复现场（逆序）+ reti。诊断开关同序言。
+                    const no_save = no_isr_save;
+                    if (!no_save) {
+                        try self.ops.appendSlice(self.gpa, &.{
+                            .{ .pop = .{ .dst = .{ .dir = 0x83 } } }, // DPH
+                            .{ .pop = .{ .dst = .{ .dir = 0x82 } } }, // DPL
+                            .{ .pop = .{ .dst = .{ .dir = 0xD0 } } }, // PSW
+                            .{ .pop = .{ .dst = .{ .dir = 0xE0 } } }, // ACC
+                        });
+                    }
+                    try self.ops.append(self.gpa, .{ .reti = {} });
+                    self.saw_ret = true;
+                    continue;
+                }
+                if (self.ret_byte) |rb| {
+                    const operand = data.un_op;
+                    if (operand.toIndex() == null and operand.toInterned() == null) {
+                        return self.zcu.codegenFail(self.nav, "mcs2: ret 操作数无效", .{});
+                    }
+                    const loc = try self.refLoc(operand);
+                    const already = switch (loc) {
+                        .dir => |a| a == rb,
+                        else => false,
+                    };
+                    if (!already) {
+                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = rb, .src = loc } });
+                    }
+                }
+                try self.ops.append(self.gpa, .{ .ret = {} });
+                self.saw_ret = true;
+                return true;
+            },
+
+
+            .br => {
+                // break / 跳块：目标 = 该块定义指令的“出口”标签。
+                try self.ops.append(self.gpa, .{ .br = self.blockEnd(data.br.block_inst) });
+                return true;
+            },
+            .repeat => {
+                // 回边：跳回 loop 头。
+                try self.ops.append(self.gpa, .{ .br = self.blockHead(data.repeat.loop_inst) });
+                return true;
+            },
+            .cond_br => {
+                try self.emitCondBr(inst);
+                return true;
+            },
+            .loop => {
+                const blk = self.air.unwrapBlock(inst);
+                try self.ops.append(self.gpa, .{ .label = self.blockHead(inst) });
+                _ = try self.emitBody(blk.body);
+                try self.ops.append(self.gpa, .{ .label = self.blockEnd(inst) });
+            },
+            .block => {
+                const blk = self.air.unwrapBlock(inst);
+                _ = try self.emitBody(blk.body);
+                try self.ops.append(self.gpa, .{ .label = self.blockEnd(inst) });
+            },
+            .cmp_lt, .cmp_lt_optimized, .cmp_lte, .cmp_lte_optimized,
+            .cmp_gt, .cmp_gt_optimized, .cmp_gte, .cmp_gte_optimized,
+            .cmp_eq, .cmp_eq_optimized, .cmp_neq, .cmp_neq_optimized => {
+                // M2 第一刀：比较指令本身不发码——它只作为 cond_br 的条件，
+                // 由 emitCondBr 融合成 cmp_br。若结果被当值使用，refLoc 会报错。
+            },
+
+            else => return self.zcu.codegenFail(
+                self.nav,
+                "mcs2: AIR 指令 `{s}` 尚未实现（M1 范围：arg/add_wrap/sub_wrap/ret）",
+                .{@tagName(tag)},
+            ),
+        }
+    }
+    return false;
     }
 
 };
@@ -199,6 +484,8 @@ pub fn generate(
     defer gpa.free(sym_name);
     const short_name = try gpa.dupe(u8, ip.getNav(func.owner_nav).name.toSlice(ip));
     defer gpa.free(short_name);
+    const label_base = session_label_base;
+    session_label_base += @as(u32, @intCast(air.instructions.len)) * 2 + 2;
     var lw = Lower{
         .zcu = zcu,
         .gpa = gpa,
@@ -207,6 +494,7 @@ pub fn generate(
         .sym_name = sym_name,
         .short_name = short_name,
         .ret_byte = lower_ret_byte,
+        .label_base = label_base,
     };
     defer lw.ops.deinit(gpa);
     defer lw.parms.deinit(gpa);
@@ -227,162 +515,9 @@ pub fn generate(
         });
     }
 
-    var saw_ret = false;
-    for (body, 0..) |inst, idx| {
-        const tag = air.instructions.items(.tag)[@backingInt(inst)];
-        const data = air.instructions.items(.data)[@backingInt(inst)];
-        switch (tag) {
-            .dbg_stmt, .dbg_empty_stmt, .dbg_inline_block, .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => {},
+    _ = try lw.emitBody(body);
 
-            .arg => {
-                const ty = air.typeOfIndex(inst, ip);
-                if (!lw.typeIsU8(ty)) {
-                    return zcu.codegenFail(
-                        func.owner_nav,
-                        "mcs2: 参数类型 {s} 尚未实现（M1 只支持 u8）",
-                        .{@tagName(ty.zigTypeTag(zcu))},
-                    );
-                }
-                if (lw.arg_cursor >= mcsmir.abi.max_arg_bytes) {
-                    return zcu.codegenFail(
-                        func.owner_nav,
-                        "mcs2: 参数超过 {d} 字节寄存器 ABI（M1）",
-                        .{mcsmir.abi.max_arg_bytes},
-                    );
-                }
-                // ADR-001 边界 ABI：arg0 → DPL；arg1+ → 静态 `_名_PARM_n`（SDCC 同款）。
-                if (lw.arg_cursor == 0) {
-                    lw.vals[@backingInt(inst)] = .{ .dir = mcsmir.abi.arg_regs[0] };
-                } else {
-                    const psym = try std.fmt.allocPrint(
-                        gpa,
-                        "_{s}_PARM_{d}",
-                        .{ lw.short_name, lw.arg_cursor + 1 },
-                    );
-                    try lw.parms.append(gpa, psym);
-                    lw.vals[@backingInt(inst)] = .{ .sym = psym };
-                }
-                lw.arg_cursor += 1;
-            },
-
-            .add_wrap, .sub_wrap => {
-                const bin = data.bin_op;
-                const lhs = try lw.refLoc(bin.lhs);
-                const rhs = try lw.refLoc(bin.rhs);
-                // 「ret 前看一眼」：下一非调试指令若是 ret 且操作数是本指令，
-                // 结果直接写 DPL（扩展访问优化的最小版：省一次 vreg 往返）。
-                var consumed_by_ret = false;
-                if (lower_ret_byte != null and idx + 1 < body.len) {
-                    const nxt = body[idx + 1];
-                    const nxt_tag = air.instructions.items(.tag)[@backingInt(nxt)];
-                    if (nxt_tag == .ret or nxt_tag == .ret_safe) {
-                        const nxt_data = air.instructions.items(.data)[@backingInt(nxt)];
-                        if (nxt_data.un_op.toIndex()) |ret_operand| {
-                            if (@backingInt(ret_operand) == @backingInt(inst)) {
-                                consumed_by_ret = true;
-                            }
-                        }
-                    }
-                }
-                const dst: Loc = if (consumed_by_ret)
-                    .{ .dir = lower_ret_byte.? }
-                else
-                    mcsmir.v(try lw.allocVreg());
-                try lw.ops.append(gpa, if (tag == .add_wrap)
-                    .{ .add = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }
-                else
-                    .{ .sub = .{ .dst = dst, .lhs = lhs, .rhs = rhs } });
-                lw.vals[@backingInt(inst)] = dst;
-            },
-
-            .alloc => {
-                // M1：每个局部槽一个 vreg（DSEG 直址）；活跃期优化留给后续 pass。
-                const r = try lw.allocVreg();
-                lw.vals[@backingInt(inst)] = mcsmir.v(r);
-            },
-
-            .store, .store_safe => {
-                // bin_op：lhs = 目标，rhs = 值。
-                // 目标为固定地址指针（@ptrFromInt）：≤0xFF → SFR/直址；>0xFF → xdata。
-                const bin = data.bin_op;
-                if (lw.constPtrAddr(bin.lhs)) |addr| {
-                    const value = try lw.refLoc(bin.rhs);
-                    if (addr <= 0xFF) {
-                        try lw.ops.append(gpa, .{ .store_dir = .{ .addr = @intCast(addr), .src = value } });
-                    } else if (addr <= 0xFFFF) {
-                        try lw.ops.append(gpa, .{ .store_xdata = .{ .addr = @intCast(addr), .src = value } });
-                    } else return lw.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
-                    continue;
-                }
-                const dest = try lw.refLoc(bin.lhs);
-                const value = try lw.refLoc(bin.rhs);
-                try lw.ops.append(gpa, .{ .mov = .{ .dst = dest, .src = value } });
-                // store 本身无结果值
-            },
-
-            .load => {
-                // ty_op：operand = 指针。固定地址 → load_dir（≤0xFF）/ load_xdata（>0xFF）；
-                // 本地槽 → 直读。
-                const ty_op = data.ty_op;
-                if (lw.constPtrAddr(ty_op.operand)) |addr| {
-                    const r = try lw.allocVreg();
-                    if (addr <= 0xFF) {
-                        try lw.ops.append(gpa, .{ .load_dir = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                    } else if (addr <= 0xFFFF) {
-                        try lw.ops.append(gpa, .{ .load_xdata = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                    } else return lw.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
-                    lw.vals[@backingInt(inst)] = mcsmir.v(r);
-                    continue;
-                }
-                const src = try lw.refLoc(ty_op.operand);
-                const r = try lw.allocVreg();
-                try lw.ops.append(gpa, .{ .mov = .{ .dst = mcsmir.v(r), .src = src } });
-                lw.vals[@backingInt(inst)] = mcsmir.v(r);
-            },
-
-            .ret, .ret_safe => {
-                if (is_isr) {
-                    // ISR 尾声：恢复现场（逆序）+ reti。诊断开关同序言。
-                    const no_save = no_isr_save;
-                    if (!no_save) {
-                        try lw.ops.appendSlice(gpa, &.{
-                            .{ .pop = .{ .dst = .{ .dir = 0x83 } } }, // DPH
-                            .{ .pop = .{ .dst = .{ .dir = 0x82 } } }, // DPL
-                            .{ .pop = .{ .dst = .{ .dir = 0xD0 } } }, // PSW
-                            .{ .pop = .{ .dst = .{ .dir = 0xE0 } } }, // ACC
-                        });
-                    }
-                    try lw.ops.append(gpa, .{ .reti = {} });
-                    saw_ret = true;
-                    continue;
-                }
-                if (lower_ret_byte) |rb| {
-                    const operand = data.un_op;
-                    if (operand.toIndex() == null and operand.toInterned() == null) {
-                        return zcu.codegenFail(func.owner_nav, "mcs2: ret 操作数无效", .{});
-                    }
-                    const loc = try lw.refLoc(operand);
-                    const already = switch (loc) {
-                        .dir => |a| a == rb,
-                        else => false,
-                    };
-                    if (!already) {
-                        try lw.ops.append(gpa, .{ .store_dir = .{ .addr = rb, .src = loc } });
-                    }
-                }
-                try lw.ops.append(gpa, .{ .ret = {} });
-                saw_ret = true;
-            },
-
-            else => return zcu.codegenFail(
-                func.owner_nav,
-                "mcs2: AIR 指令 `{s}` 尚未实现（M1 范围：arg/add_wrap/sub_wrap/ret）",
-                .{@tagName(tag)},
-            ),
-        }
-    }
-
-    if (!saw_ret) {
+    if (!lw.saw_ret) {
         return zcu.codegenFail(func.owner_nav, "mcs2: 函数体缺少 ret", .{});
     }
 
