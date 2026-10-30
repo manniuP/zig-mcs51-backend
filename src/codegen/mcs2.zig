@@ -171,6 +171,169 @@ const Lower = struct {
 
     /// cond_br：优先把“比较 → 分支”融合成 cmp_br（M2 第一刀）；
     /// 否则按字节测零（br_ifz）。条件为编译期常量时直接发单边。
+
+    // ==== 部分求值（切片 A）====
+    //
+    // 条件：无参数、无 SFR/xdata 读、无栈操作、步数有界、能走到 ret。
+    // 做法：在 MIR 上直接解释执行，把最终写回（dir/xdata）物化成常量存储。
+    // 这样「确定的操作」在编译期就算完，hex 里只剩结果。
+
+    const FoldWrite = struct { addr: u16, val: u8, is_dir: bool };
+
+    fn foldGet(b: mcsmir.Byte, regs: *const [256]u8, dirs: *const [256]u8) ?u8 {
+        return switch (b) {
+            .vreg => |r| regs[r],
+            .dir => |d| dirs[d],
+            .sym => null,
+        };
+    }
+
+    fn foldSet(b: mcsmir.Byte, val: u8, regs: *[256]u8, dirs: *[256]u8) bool {
+        switch (b) {
+            .vreg => |r| regs[r] = val,
+            .dir => |d| dirs[d] = val,
+            .sym => return false,
+        }
+        return true;
+    }
+
+    fn foldCc(cc: mcsmir.Cc, l: u8, r: u8) bool {
+        return switch (cc) {
+            .lt => l < r,
+            .le => l <= r,
+            .gt => l > r,
+            .ge => l >= r,
+            .eq => l == r,
+            .ne => l != r,
+        };
+    }
+
+    fn foldPure(self: *Lower) codegen.Error!bool {
+        const ops = self.ops.items;
+        if (ops.len == 0) return false;
+        for (ops) |op| switch (op) {
+            .load_dir, .load_xdata, .push, .pop, .reti, .halt => return false,
+            .store_dir => |x| if (x.src == .sym) return false,
+            .store_xdata => |x| if (x.src == .sym) return false,
+            else => {},
+        };
+
+        var regs: [256]u8 = undefined;
+        var dirs: [256]u8 = undefined;
+        var wrote_dir: [256]bool = undefined;
+        @memset(&regs, 0);
+        @memset(&dirs, 0);
+        @memset(&wrote_dir, false);
+        var xw: std.ArrayListUnmanaged(FoldWrite) = .empty;
+        defer xw.deinit(self.gpa);
+
+        var pc: usize = 0;
+        var steps: usize = 0;
+        var folded = false;
+
+        while (pc < ops.len) {
+            if (steps >= 200_000) return false;
+            steps += 1;
+            switch (ops[pc]) {
+                .imm => |x| {
+                    if (!foldSet(x.dst, x.value, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .mov => |x| {
+                    const v = foldGet(x.src, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, v, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .add => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, a +% b, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .sub => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, a -% b, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .dec => |r| {
+                    regs[r] -%= 1;
+                    pc += 1;
+                },
+                .store_dir => |x| {
+                    const v = foldGet(x.src, &regs, &dirs) orelse return false;
+                    dirs[x.addr] = v;
+                    wrote_dir[x.addr] = true;
+                    pc += 1;
+                },
+                .store_xdata => |x| {
+                    const v = foldGet(x.src, &regs, &dirs) orelse return false;
+                    // 后写覆盖前写
+                    var replaced = false;
+                    for (xw.items) |*e| {
+                        if (!e.is_dir and e.addr == x.addr) {
+                            e.val = v;
+                            replaced = true;
+                            break;
+                        }
+                    }
+                    if (!replaced) try xw.append(self.gpa, .{ .addr = x.addr, .val = v, .is_dir = false });
+                    pc += 1;
+                },
+                .label => pc += 1,
+                .br => |t| {
+                    pc = self.findLabel(t) orelse return false;
+                },
+                .br_ifnz => |x| {
+                    const v = foldGet(x.cond, &regs, &dirs) orelse return false;
+                    pc = if (v != 0) (self.findLabel(x.target) orelse return false) else pc + 1;
+                },
+                .br_ifz => |x| {
+                    const v = foldGet(x.cond, &regs, &dirs) orelse return false;
+                    pc = if (v == 0) (self.findLabel(x.target) orelse return false) else pc + 1;
+                },
+                .cmp_br => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    pc = if (foldCc(x.cc, a, b)) (self.findLabel(x.target) orelse return false) else pc + 1;
+                },
+                .ret => {
+                    folded = true;
+                    break;
+                },
+                else => return false,
+            }
+        }
+        if (!folded) return false;
+
+        // 用常量写回替换整个函数体：vreg 0 作为临时，nregs = 1。
+        const new_ops: std.ArrayListUnmanaged(mcsmir.Op) = .empty;
+        self.ops.deinit(self.gpa);
+        self.ops = new_ops;
+        self.nregs = 1;
+        const tmp = mcsmir.v(0);
+        for (xw.items) |e| {
+            try self.ops.append(self.gpa, .{ .imm = .{ .dst = tmp, .value = e.val } });
+            try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = e.addr, .src = tmp } });
+        }
+        var d: u16 = 0;
+        while (d < 256) : (d += 1) {
+            if (!wrote_dir[d]) continue;
+            try self.ops.append(self.gpa, .{ .imm = .{ .dst = tmp, .value = dirs[d] } });
+            try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(d), .src = tmp } });
+        }
+        try self.ops.append(self.gpa, .{ .ret = {} });
+        return true;
+    }
+
+    fn findLabel(self: *Lower, id: u32) ?usize {
+        for (self.ops.items, 0..) |op, i| switch (op) {
+            .label => |l| if (l == id) return i + 1,
+            else => {},
+        };
+        return null;
+    }
+
     fn emitCondBr(self: *Lower, inst: Air.Inst.Index) codegen.Error!void {
         const air = self.air;
         const cb = air.unwrapCondBr(inst);
@@ -516,6 +679,11 @@ pub fn generate(
     }
 
     _ = try lw.emitBody(body);
+
+    // 部分求值（切片 A）：无参 + 纯内部计算 → 编译期算完，只留常量写回。
+    if (!is_isr and lw.arg_cursor == 0) {
+        if (try lw.foldPure()) lw.saw_ret = true;
+    }
 
     if (!lw.saw_ret) {
         return zcu.codegenFail(func.owner_nav, "mcs2: 函数体缺少 ret", .{});

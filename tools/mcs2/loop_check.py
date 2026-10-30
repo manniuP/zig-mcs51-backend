@@ -60,12 +60,14 @@ def main() -> int:
     cases = [
         ("sum", 5, 10),
         ("cnt", 7, 7),
+        ("sum_to", None, 44),   # 0+1+...+24 = 300 -> u8 回绕 44；PE 应折叠
     ]
     fail = False
     for fn, arg, want in cases:
         driver = "    .area CSEG (CODE)\n"
         driver += "    mov sp,#0x7F\n"
-        driver += f"    mov dpl,#0x{arg:02X}\n"
+        if arg is not None:
+            driver += f"    mov dpl,#0x{arg:02X}\n"
         driver += f"    lcall _{fn}\n"
         driver += "    mov a,dpl\n    mov dptr,#0x8000\n    movx @dptr,a\n    sjmp .\n"
         merged = BUILD / f"{fn}_full.asm"
@@ -85,7 +87,8 @@ def main() -> int:
             continue
         got = int(m.group(1).split()[0], 16)
         ok = got == want
-        print(f"{fn}({arg}) = {got}（期望 {want}）{'PASS' if ok else 'FAIL'}")
+        label = f"{fn}({arg})" if arg is not None else f"{fn}()"
+        print(f"{label} = {got}（期望 {want}）{'PASS' if ok else 'FAIL'}")
         if not ok:
             fail = True
     return 1 if fail else 0
