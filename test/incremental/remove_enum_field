@@ -1,0 +1,39 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const MyEnum = enum(u8) {
+    foo = 1,
+    bar = 2,
+};
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{}\n", .{@backingInt(MyEnum.foo)});
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update
+#check stdout {
+1
+#}
+
+#write main.zig {
+const MyEnum = enum(u8) {
+    //foo = 1,
+    bar = 2,
+};
+pub fn main() !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("{}\n", .{@backingInt(MyEnum.foo)});
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+remove enum field#}
+#check errors {
+main.zig:7:68: error: enum 'main.MyEnum' has no member named 'foo'
+main.zig:1:16: note: enum declared here
+#}

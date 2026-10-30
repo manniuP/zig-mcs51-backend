@@ -1,0 +1,64 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+pub fn main() !void {
+    @compileError("uh oh");
+}
+#}
+#update
+#check errors {
+main.zig:2:5: error: uh oh
+#}
+
+#write main.zig {
+pub fn main() !void {
+    @compileError("uh oh");
+#}
+#update {
+add parse error#}
+#check errors {
+main.zig:3:1: error: expected statement, found 'EOF'
+#}
+
+#write main.zig {
+pub fn main() !void {
+    @compileError("uh oh");
+}
+#}
+#update {
+fix parse error#}
+#check errors {
+main.zig:2:5: error: uh oh
+#}
+
+#write main.zig {
+pub fn main() !void {
+    @compileError("uh oh");
+#}
+#update {
+add parse error again#}
+#check errors {
+main.zig:3:1: error: expected statement, found 'EOF'
+#}
+
+#write main.zig {
+pub fn main() !void {
+    //@compileError("uh oh");
+#}
+#update {
+comment @compileError call#}
+#check errors {
+main.zig:3:1: error: expected statement, found 'EOF'
+#}
+
+#write main.zig {
+pub fn main() !void {
+    //@compileError("uh oh");
+}
+#}
+#update {
+fix parse error again#}
+#check stdout {
+#}

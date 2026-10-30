@@ -1,0 +1,87 @@
+#exe {
+--dep foo -Mroot=main.zig
+-Mfoo=foo.zig
+#}
+
+#write main.zig {
+pub fn main() void {
+    _ = @import("foo");
+    //_ = @import("other.zig");
+}
+#}
+#write foo.zig {
+comptime {
+    _ = @import("other.zig");
+}
+#}
+#write other.zig {
+fn f() void {
+    @compileLog(@src().module);
+}
+comptime {
+    f();
+}
+#}
+#update
+#check errors {
+other.zig:2:5: error: found compile log statement
+
+Compile Log Output:
+@as([:0]const u8, "foo"[0..3])
+#}
+
+#write main.zig {
+pub fn main() void {
+    _ = @import("foo");
+    _ = @import("other.zig");
+}
+#}
+#write foo.zig {
+comptime {
+    //_ = @import("other.zig");
+}
+#}
+#update {
+change module of other.zig#}
+#check errors {
+other.zig:2:5: error: found compile log statement
+
+Compile Log Output:
+@as([:0]const u8, "root"[0..4])
+#}
+
+#write main.zig {
+pub fn main() void {
+    _ = @import("foo");
+    _ = @import("other.zig");
+}
+#}
+#write foo.zig {
+comptime {
+    _ = @import("other.zig");
+}
+#}
+#update {
+put other.zig in both modules#}
+#check errors {
+other.zig:1:1: error: file exists in modules 'root' and 'foo'
+other.zig:1:1: note: files must belong to only one module
+main.zig:3:17: note: file is imported here by the root of module 'root'
+foo.zig:2:17: note: file is imported here by the root of module 'foo'
+#}
+
+#write main.zig {
+pub fn main() void {
+    _ = @import("foo");
+    //_ = @import("other.zig");
+}
+#}
+#write foo.zig {
+comptime {
+    //_ = @import("other.zig");
+}
+#}
+#update {
+put other.zig in no modules#}
+#check stdout {
+#}

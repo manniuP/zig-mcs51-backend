@@ -1,0 +1,11 @@
+{
+  "zig_lib_path": "lib",
+  "enable_build_on_save": false,
+  "semantic_tokens": "full",
+  "inlay_hints_show_variable_type_hints": true,
+  "inlay_hints_show_parameter_name": true,
+  "inlay_hints_show_struct_literal_field_type": true,
+  "highlight_global_var_declarations": true,
+  "warn_style": true,
+  "skip_std_references": false
+}

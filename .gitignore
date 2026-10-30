@@ -1,0 +1,28 @@
+# This file is for zig-specific build artifacts.
+# If you have OS-specific or editor-specific files to ignore,
+# such as *.swp or .DS_Store, put those in your global
+# ~/.gitignore and put this in your ~/.gitconfig:
+#
+# [core]
+#     excludesfile = ~/.gitignore
+#
+# Cheers!
+# -andrewrk
+
+.zig-cache/
+zig-out/
+/release/
+/debug/
+/build/
+/build-*/
+/docgen_tmp/
+
+# 本仓库本地工具（如 ZLS 二进制），不入库
+.tools/
+./docs
+
+# 本地：mcs2 后端迭代的缓存与产物（不入库）
+/.zig-cache-mcs2/
+__pycache__/
+tools/mcs2/build/
+

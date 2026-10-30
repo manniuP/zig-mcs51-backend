@@ -1,0 +1,60 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, a);
+}
+const a = "Hello, World!\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update
+#check stdout {
+Hello, World!
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, a);
+}
+const a = @compileError("bad a");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+introduce compile error#}
+#check errors {
+main.zig:5:11: error: bad a
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, b);
+}
+const a = @compileError("bad a");
+const b = "Hi there!\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+remove error reference#}
+#check stdout {
+Hi there!
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, a);
+}
+const a = "Back to a\n";
+const b = @compileError("bad b");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+introduce and remove reference to error#}
+#check stdout {
+Back to a
+#}

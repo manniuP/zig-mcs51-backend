@@ -1,0 +1,37 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const foo = @as(u8, 123);
+comptime {
+    // depends on value of `foo`
+    if (foo != 123) unreachable;
+}
+comptime {
+    // depends on type of `foo`
+    if (@TypeOf(&foo) != *const u8) unreachable;
+}
+pub fn main() void {}
+#}
+#update
+#check stdout {
+#}
+
+#write main.zig {
+const foo = @as(u16, 123);
+comptime {
+    // depends on value of `foo`
+    if (foo != 123) unreachable;
+}
+comptime {
+    // depends on type of `foo`
+    if (@TypeOf(&foo) != *const u8) unreachable;
+}
+pub fn main() void {}
+#}
+#update {
+change the type#}
+#check errors {
+main.zig:8:37: error: reached unreachable code
+#}

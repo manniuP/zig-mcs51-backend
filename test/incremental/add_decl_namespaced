@@ -1,0 +1,92 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, @This().foo);
+}
+const foo = "good morning\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update
+#check stdout {
+good morning
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, @This().foo);
+}
+const foo = "good morning\n";
+const bar = "good evening\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+add new declaration#}
+#check stdout {
+good morning
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, @This().bar);
+}
+const foo = "good morning\n";
+const bar = "good evening\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+reference new declaration#}
+#check stdout {
+good evening
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, @This().qux);
+}
+const foo = "good morning\n";
+const bar = "good evening\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+reference missing declaration#}
+#check errors {
+main.zig:3:59: error: root source file struct 'main' has no member named 'qux'
+main.zig:1:1: note: struct declared here
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, @This().qux);
+}
+const foo = "good morning\n";
+const bar = "good evening\n";
+const qux = "good night\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+add missing declaration#}
+#check stdout {
+good night
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, @This().qux);
+}
+const qux = "good night\n";
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+remove unused declarations#}
+#check stdout {
+good night
+#}

@@ -1,0 +1,37 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Zig: 目标层探针",
+      "type": "shell",
+      "command": "zig",
+      "args": ["run", "--zig-lib-dir", "lib", "tools/mcs2/target_probe.zig"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Zig: mcs2 MIR → ihx/hex",
+      "type": "shell",
+      "command": "python",
+      "args": ["tools/mcs2/verify.py"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Zig: 类型检查 std",
+      "type": "shell",
+      "command": "zig",
+      "args": ["build-obj", "-fno-emit-bin", "--zig-lib-dir", "lib", "lib/std/std.zig"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    },
+    {
+      "label": "Zig: 格式化 src/tools",
+      "type": "shell",
+      "command": "zig",
+      "args": ["fmt", "src", "tools"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": []
+    }
+  ]
+}

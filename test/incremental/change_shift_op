@@ -1,0 +1,36 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+pub fn main() !void {
+    try foo(0x1300);
+}
+fn foo(x: u16) !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("0x{x}\n", .{x << 4});
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update
+#check stdout {
+0x3000
+#}
+
+#write main.zig {
+pub fn main() !void {
+    try foo(0x1300);
+}
+fn foo(x: u16) !void {
+    var stdout_writer = std.Io.File.stdout().writerStreaming(io, &.{});
+    try stdout_writer.interface.print("0x{x}\n", .{x >> 4});
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+change to right shift#}
+#check stdout {
+0x130
+#}

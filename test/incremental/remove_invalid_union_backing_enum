@@ -1,0 +1,39 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const E = enum { a, b, c };
+const U = union(E) {
+    a: i32,
+    b: f64,
+    c: f64,
+    d: f64,
+};
+pub fn main() void {
+    const u: U = .{ .a = 123 };
+    _ = u;
+}
+#}
+#update
+#check errors {
+main.zig:6:5: error: no field named 'd' in enum 'main.E'
+main.zig:1:11: note: enum declared here
+#}
+
+#write main.zig {
+const U = union {
+    a: i32,
+    b: f64,
+    c: f64,
+    d: f64,
+};
+pub fn main() void {
+    const u: U = .{ .a = 123 };
+    _ = u;
+}
+#}
+#update {
+remove invalid backing enum#}
+#check stdout {
+#}

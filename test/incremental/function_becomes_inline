@@ -1,0 +1,51 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+pub fn main() !void {
+    try foo();
+}
+fn foo() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+non-inline version#}
+#check stdout {
+Hello, World!
+#}
+
+#write main.zig {
+pub fn main() !void {
+    try foo();
+}
+inline fn foo() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+make function inline#}
+#check stdout {
+Hello, World!
+#}
+
+#write main.zig {
+pub fn main() !void {
+    try foo();
+}
+inline fn foo() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, `inline` World!\n");
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+change string#}
+#check stdout {
+Hello, `inline` World!
+#}

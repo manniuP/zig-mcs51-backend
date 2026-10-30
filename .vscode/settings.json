@@ -1,0 +1,37 @@
+{
+  "zig.path": "zig",
+  "zig.zls.enabled": "on",
+  "zig.zls.path": "zls",
+  "zig.formattingProvider": "zls",
+  "zig.buildOnSaveProvider": "off",
+  "zig.zls.semanticTokens": "full",
+  "zig.zls.inlayHintsShowVariableTypeHints": true,
+  "zig.zls.inlayHintsShowParameterName": true,
+  "zig.zls.inlayHintsShowStructLiteralFieldType": true,
+  "zig.zls.highlightGlobalVarDeclarations": true,
+  "zig.zls.warnStyle": true,
+  "zig.zls.skipStdReferences": false,
+  "editor.formatOnSave": true,
+  "editor.insertSpaces": true,
+  "editor.tabSize": 4,
+  "[zig]": {
+    "editor.defaultFormatter": "ziglang.vscode-zig",
+    "editor.formatOnSave": true,
+    "files.eol": "\n"
+  },
+  "files.associations": {
+    "*.zon": "zig"
+  },
+  "search.exclude": {
+    "**/.zig-cache": true,
+    "**/zig-out": true,
+    "**/.tools": true,
+    "**/build-*": true
+  },
+  "files.watcherExclude": {
+    "**/.zig-cache/**": true,
+    "**/zig-out/**": true,
+    "**/.tools/**": true,
+    "**/build-*/**": true
+  }
+}

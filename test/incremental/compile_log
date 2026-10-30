@@ -1,0 +1,46 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
+}
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+no compile log#}
+#check stdout {
+Hello, World!
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
+    @compileLog("this is a log");
+}
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+add compile log#}
+#check errors {
+main.zig:4:5: error: found compile log statement
+
+Compile Log Output:
+@as(*const [13:0]u8, "this is a log")
+#}
+
+#write main.zig {
+const std = @import("std");
+pub fn main() !void {
+    try std.Io.File.stdout().writeStreamingAll(io, "Hello, World!\n");
+}
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+remove compile log#}
+#check stdout {
+Hello, World!
+#}

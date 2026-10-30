@@ -1,0 +1,1501 @@
+//! Allocation-free, (best-effort) constant-time, finite field arithmetic for large integers.
+//!
+//! Unlike `std.math.big`, these integers have a fixed maximum length and are only designed to be used for modular arithmetic.
+//! Arithmetic operations are meant to run in constant-time for a given modulus, making them suitable for cryptography.
+//!
+//! Functions with `Public` in their name are the exception.
+//!
+//! Parts of that code was ported from the BSD-licensed crypto/internal/bigmod/nat.go file in the Go language, itself inspired from BearSSL.
+
+const std = @import("std");
+const builtin = @import("builtin");
+const crypto = std.crypto;
+const math = std.math;
+const mem = std.mem;
+const testing = std.testing;
+const assert = std.debug.assert;
+const Endian = std.builtin.Endian;
+
+// A Limb is a single digit in a big integer.
+const Limb = usize;
+
+// The number of reserved bits in a Limb.
+const carry_bits = 1;
+
+// The number of active bits in a Limb.
+const t_bits: usize = @bitSizeOf(Limb) - carry_bits;
+
+// A TLimb is a Limb that is truncated to t_bits.
+const TLimb = @Int(.unsigned, t_bits);
+
+const native_endian = builtin.target.cpu.arch.endian();
+
+// A WideLimb is a Limb that is twice as wide as a normal Limb.
+const WideLimb = struct {
+    hi: Limb,
+    lo: Limb,
+};
+
+/// Value is too large for the destination.
+pub const OverflowError = error{Overflow};
+
+/// Invalid modulus. Modulus must be odd.
+pub const InvalidModulusError = error{ EvenModulus, ModulusTooSmall };
+
+/// Exponentiation with a null exponent.
+/// Exponentiation in cryptographic protocols is almost always a sign of a bug which can lead to trivial attacks.
+/// Therefore, this module returns an error when a null exponent is encountered, encouraging applications to handle this case explicitly.
+pub const NullExponentError = error{NullExponent};
+
+/// Invalid field element for the given modulus.
+pub const FieldElementError = error{NonCanonical};
+
+/// Invalid representation (Montgomery vs non-Montgomery domain.)
+pub const RepresentationError = error{UnexpectedRepresentation};
+
+pub const DivisionByZeroError = error{DivisionByZero};
+
+/// The set of all possible errors `std.crypto.ff` functions can return.
+pub const Error = OverflowError || InvalidModulusError || NullExponentError || FieldElementError || RepresentationError || DivisionByZeroError;
+
+/// An unsigned big integer with a fixed maximum size (`max_bits`), suitable for cryptographic operations.
+/// Storage rounds up to whole limbs and can hold up to `capacity_bits` bits.
+/// Unless side-channels mitigations are explicitly disabled, operations are designed to be constant-time.
+pub fn Uint(comptime max_bits: comptime_int) type {
+    comptime assert(@bitSizeOf(Limb) % 8 == 0); // Limb size must be a multiple of 8
+    comptime assert(max_bits > 0);
+
+    return struct {
+        const Self = @This();
+        const max_limbs_count = @divCeil(max_bits, t_bits);
+
+        pub const capacity_bits = max_limbs_count * t_bits;
+
+        limbs_buffer: [max_limbs_count]Limb,
+        /// The number of active limbs.
+        limbs_len: usize,
+
+        /// Number of bytes required to serialize an integer.
+        pub const encoded_bytes = @divCeil(max_bits, 8);
+
+        /// Constant slice of active limbs.
+        fn limbsConst(self: *const Self) []const Limb {
+            return self.limbs_buffer[0..self.limbs_len];
+        }
+
+        /// Mutable slice of active limbs.
+        fn limbs(self: *Self) []Limb {
+            return self.limbs_buffer[0..self.limbs_len];
+        }
+
+        // Removes limbs whose value is zero from the active limbs.
+        fn normalize(self: Self) Self {
+            var res = self;
+            if (self.limbs_len < 2) {
+                return res;
+            }
+            var i = self.limbs_len - 1;
+            while (i > 0 and res.limbsConst()[i] == 0) : (i -= 1) {}
+            res.limbs_len = i + 1;
+            assert(res.limbs_len <= res.limbs_buffer.len);
+            return res;
+        }
+
+        /// The zero integer.
+        pub const zero: Self = .{
+            .limbs_buffer = @splat(0),
+            .limbs_len = max_limbs_count,
+        };
+
+        /// Creates a new big integer from a primitive type.
+        /// This function may not run in constant time.
+        pub fn fromPrimitive(comptime T: type, init_value: T) OverflowError!Self {
+            const U = @Int(.unsigned, @bitSizeOf(T));
+            var x = math.cast(U, init_value) orelse return error.Overflow;
+            var out: Self = .{
+                .limbs_buffer = undefined,
+                .limbs_len = max_limbs_count,
+            };
+            for (&out.limbs_buffer) |*limb| {
+                limb.* = if (@bitSizeOf(T) > t_bits) @as(TLimb, @truncate(x)) else x;
+                x = math.shr(U, x, t_bits);
+            }
+            if (x != 0) {
+                return error.Overflow;
+            }
+            return out;
+        }
+
+        /// Converts a big integer to a primitive type.
+        /// This function may not run in constant time.
+        pub fn toPrimitive(self: Self, comptime T: type) OverflowError!T {
+            const U = @Int(.unsigned, @bitSizeOf(T));
+            var x: U = 0;
+            var i = self.limbs_len - 1;
+            while (true) : (i -= 1) {
+                // Check for overflow before shifting, even when the destination is narrower than a limb.
+                const discarded = if (@bitSizeOf(U) >= t_bits) math.shr(U, x, @bitSizeOf(U) - t_bits) else x;
+                if (discarded != 0) {
+                    return error.Overflow;
+                }
+                x = math.shl(U, x, t_bits);
+                const v = math.cast(U, self.limbsConst()[i]) orelse return error.Overflow;
+                x |= v;
+                if (i == 0) break;
+            }
+            return math.cast(T, x) orelse error.Overflow;
+        }
+
+        /// Encodes a big integer into a byte array.
+        pub fn toBytes(self: Self, bytes: []u8, comptime endian: Endian) OverflowError!void {
+            if (bytes.len == 0) {
+                if (self.isZero()) return;
+                return error.Overflow;
+            }
+            @memset(bytes, 0);
+            var shift: usize = 0;
+            var out_i: usize = switch (endian) {
+                .big => bytes.len - 1,
+                .little => 0,
+            };
+            for (0..self.limbs_len) |i| {
+                var remaining_bits = t_bits;
+                var limb = self.limbsConst()[i];
+                while (remaining_bits >= 8) {
+                    bytes[out_i] |= math.shl(u8, @truncate(limb), shift);
+                    const consumed = 8 - shift;
+                    limb >>= @truncate(consumed);
+                    remaining_bits -= consumed;
+                    shift = 0;
+                    switch (endian) {
+                        .big => {
+                            if (out_i == 0) {
+                                if (limb | orLimbs(self.limbsConst()[i + 1 ..]) != 0) {
+                                    return error.Overflow;
+                                }
+                                return;
+                            }
+                            out_i -= 1;
+                        },
+                        .little => {
+                            out_i += 1;
+                            if (out_i == bytes.len) {
+                                if (limb | orLimbs(self.limbsConst()[i + 1 ..]) != 0) {
+                                    return error.Overflow;
+                                }
+                                return;
+                            }
+                        },
+                    }
+                }
+                bytes[out_i] |= @truncate(limb);
+                shift = remaining_bits;
+            }
+        }
+
+        /// Creates a new big integer from a byte array.
+        pub fn fromBytes(bytes: []const u8, comptime endian: Endian) OverflowError!Self {
+            var out = Self.zero;
+            if (decodeBytes(out.limbs(), bytes, endian) != 0) {
+                return error.Overflow;
+            }
+            return out;
+        }
+
+        /// Returns `true` if both integers are equal.
+        pub fn eql(x: Self, y: Self) bool {
+            return crypto.timing_safe.eql([max_limbs_count]Limb, x.limbs_buffer, y.limbs_buffer);
+        }
+
+        /// Compares two integers.
+        pub fn compare(x: Self, y: Self) math.Order {
+            return crypto.timing_safe.compare(
+                Limb,
+                &x.limbs_buffer,
+                &y.limbs_buffer,
+                .little,
+            );
+        }
+
+        /// Returns `true` if the integer is zero.
+        pub fn isZero(x: Self) bool {
+            return ct.eql(orLimbs(x.limbsConst()), 0);
+        }
+
+        /// Returns `true` if the integer is odd.
+        pub fn isOdd(x: Self) bool {
+            return @as(u1, @truncate(x.limbsConst()[0])) != 0;
+        }
+
+        pub fn isOne(x: Self) bool {
+            const x_limbs = x.limbsConst();
+            return ct.eql((x_limbs[0] ^ 1) | orLimbs(x_limbs[1..]), 0);
+        }
+
+        /// Adds `y` to `x`, wrapping at the larger active width. Returns 1 on overflow.
+        pub fn addWithOverflow(x: *Self, y: Self) u1 {
+            x.expandTo(@max(x.limbs_len, y.limbs_len));
+            return x.conditionalAddWithOverflow(true, y);
+        }
+
+        /// Subtracts `y` from `x`, wrapping at the larger active width. Returns 1 on underflow.
+        pub fn subWithOverflow(x: *Self, y: Self) u1 {
+            x.expandTo(@max(x.limbs_len, y.limbs_len));
+            return x.conditionalSubWithOverflow(true, y);
+        }
+
+        /// Adds the product of `x` and `y` to `acc`, wrapping at the active width.
+        /// Returns 1 if any part of the result was discarded.
+        pub fn mulAddWithOverflow(acc: *Self, x: Self, y: Self) u1 {
+            assert(x.limbs_len == acc.limbs_len);
+            assert(y.limbs_len == acc.limbs_len);
+            const n = acc.limbs_len;
+            var wide: [2 * max_limbs_count]Limb = undefined;
+            @memcpy(wide[0..n], acc.limbsConst());
+            mulAddWide(wide[0 .. 2 * n], x.limbsConst(), y.limbsConst());
+            @memcpy(acc.limbs(), wide[0..n]);
+            return @intFromBool(!ct.eql(orLimbs(wide[n..][0..n]), 0));
+        }
+
+        /// Returns the bit length, or 0 for zero.
+        pub fn bitLenPublic(x: Self) usize {
+            var i = x.limbs_len;
+            while (i != 0) {
+                i -= 1;
+                const limb = x.limbsConst()[i];
+                if (limb != 0) {
+                    return i * t_bits + t_bits - @clz(@as(TLimb, @intCast(limb)));
+                }
+            }
+            return 0;
+        }
+
+        /// Returns the number of trailing zero bits, or the active width for zero.
+        pub fn trailingZeroBitsPublic(x: Self) usize {
+            for (x.limbsConst(), 0..) |limb, i| {
+                if (limb != 0) {
+                    return i * t_bits + @ctz(@as(TLimb, @intCast(limb)));
+                }
+            }
+            return x.limbs_len * t_bits;
+        }
+
+        pub fn shiftRightPublic(x: *Self, shift: usize) void {
+            const limb_shift = shift / t_bits;
+            const bit_shift = shift % t_bits;
+            const x_limbs = x.limbs();
+            if (limb_shift >= x_limbs.len) {
+                @memset(x_limbs, 0);
+                return;
+            }
+            const active = x_limbs.len - limb_shift;
+            for (0..active) |i| {
+                const lo = math.shr(Limb, x_limbs[i + limb_shift], bit_shift);
+                const hi = if (i + limb_shift + 1 < x_limbs.len)
+                    math.shl(Limb, x_limbs[i + limb_shift + 1], t_bits - bit_shift)
+                else
+                    0;
+                x_limbs[i] = @as(TLimb, @truncate(lo | hi));
+            }
+            @memset(x_limbs[active..], 0);
+        }
+
+        /// Divides by `divisor` in place and returns the remainder.
+        /// Returns `error.DivisionByZero` without changing the integer if `divisor` is zero.
+        pub fn divRemPublic(x: *Self, divisor: usize) DivisionByZeroError!usize {
+            if (divisor == 0) return error.DivisionByZero;
+            const Wide = @Int(.unsigned, 2 * @bitSizeOf(Limb));
+            const x_limbs = x.limbs();
+            var rem: Limb = 0;
+            var i = x.limbs_len;
+            while (i != 0) {
+                i -= 1;
+                const num = (@as(Wide, rem) << t_bits) | x_limbs[i];
+                x_limbs[i] = @intCast(num / divisor);
+                rem = @intCast(num % divisor);
+            }
+            return rem;
+        }
+
+        /// Returns the greatest common divisor, with gcd(x, 0) = x.
+        /// Returns `error.DivisionByZero` if both operands are zero.
+        pub fn gcdPublic(x: Self, y: Self) DivisionByZeroError!Self {
+            if (x.isZero() and y.isZero()) return error.DivisionByZero;
+            if (x.isZero()) return y;
+            if (y.isZero()) return x;
+
+            var a = x;
+            var b = y;
+            const len = @max(a.limbs_len, b.limbs_len);
+            a.expandTo(len);
+            b.expandTo(len);
+
+            const a_shift = a.trailingZeroBitsPublic();
+            const b_shift = b.trailingZeroBitsPublic();
+            a.shiftRightPublic(a_shift);
+            b.shiftRightPublic(b_shift);
+            while (true) {
+                switch (a.compare(b)) {
+                    .eq => break,
+                    .lt => mem.swap(Self, &a, &b),
+                    .gt => {},
+                }
+                _ = a.subWithOverflow(b);
+                a.shiftRightPublic(a.trailingZeroBitsPublic());
+            }
+
+            a.shiftLeft(@min(a_shift, b_shift)); // GCD always fits in either input, overflow is never an issue
+            return a;
+        }
+
+        fn expandTo(x: *Self, new_len: usize) void {
+            assert(new_len >= x.limbs_len and new_len <= x.limbs_buffer.len);
+            @memset(x.limbs_buffer[x.limbs_len..new_len], 0);
+            x.limbs_len = new_len;
+        }
+
+        // Replaces the limbs of `x` with the limbs of `y` if `on` is `true`.
+        fn cmov(x: *Self, on: bool, y: Self) void {
+            for (x.limbs(), y.limbsConst()) |*x_limb, y_limb| {
+                x_limb.* = ct.select(on, y_limb, x_limb.*);
+            }
+        }
+
+        // Zeroed unused limbs allow `y` to be narrower than `x`.
+        fn conditionalAddWithOverflow(x: *Self, on: bool, y: Self) u1 {
+            var carry: u1 = 0;
+            assert(y.limbs_len <= x.limbs_len);
+            for (x.limbs(), 0..) |*x_limb, i| {
+                const res = x_limb.* + y.limbs_buffer[i] + carry;
+                x_limb.* = ct.select(on, @as(TLimb, @truncate(res)), x_limb.*);
+                carry = @truncate(res >> t_bits);
+            }
+            return carry;
+        }
+
+        // Zeroed unused limbs allow `y` to be narrower than `x`.
+        fn conditionalSubWithOverflow(x: *Self, on: bool, y: Self) u1 {
+            var borrow: u1 = 0;
+            assert(y.limbs_len <= x.limbs_len);
+            for (x.limbs(), 0..) |*x_limb, i| {
+                const res = x_limb.* -% y.limbs_buffer[i] -% borrow;
+                x_limb.* = ct.select(on, @as(TLimb, @truncate(res)), x_limb.*);
+                borrow = @truncate(res >> t_bits);
+            }
+            return borrow;
+        }
+
+        fn shiftLeft(x: *Self, shift: usize) void {
+            assert(x.bitLenPublic() + shift <= x.limbs_len * t_bits);
+            const limb_shift = shift / t_bits;
+            const bit_shift = shift % t_bits;
+            const x_limbs = x.limbs();
+            var i = x_limbs.len;
+            while (i != 0) {
+                i -= 1;
+                const hi = if (i >= limb_shift)
+                    math.shl(Limb, x_limbs[i - limb_shift], bit_shift)
+                else
+                    0;
+                const lo = if (i >= limb_shift + 1)
+                    math.shr(Limb, x_limbs[i - limb_shift - 1], t_bits - bit_shift)
+                else
+                    0;
+                x_limbs[i] = @as(TLimb, @truncate(hi | lo));
+            }
+        }
+
+        // Shifts in `carry` at the top and returns the low bit shifted out.
+        fn shiftRightByOneWithCarry(x: *Self, carry: u1) u1 {
+            var c: Limb = carry;
+            var i = x.limbs_len;
+            const x_limbs = x.limbs();
+            while (i != 0) {
+                i -= 1;
+                const limb = x_limbs[i];
+                x_limbs[i] = (limb >> 1) | (c << (t_bits - 1));
+                c = @as(u1, @truncate(limb));
+            }
+            return @truncate(c);
+        }
+    };
+}
+
+/// A field element.
+fn Fe_(comptime bits: comptime_int) type {
+    return struct {
+        const Self = @This();
+
+        const FeUint = Uint(bits);
+
+        /// The element value as a `Uint`.
+        v: FeUint,
+
+        /// `true` if the element is in Montgomery form.
+        montgomery: bool = false,
+
+        /// The maximum number of bytes required to encode a field element.
+        pub const encoded_bytes = FeUint.encoded_bytes;
+
+        // The number of active limbs to represent the field element.
+        fn limbs_count(self: Self) usize {
+            return self.v.limbs_len;
+        }
+
+        /// Creates a field element from a primitive.
+        /// This function may not run in constant time.
+        pub fn fromPrimitive(comptime T: type, m: Modulus(bits), x: T) (OverflowError || FieldElementError)!Self {
+            comptime assert(@bitSizeOf(T) <= bits); // Primitive type is larger than the modulus type.
+            const v = try FeUint.fromPrimitive(T, x);
+            var fe = Self{ .v = v };
+            try m.shrink(&fe);
+            try m.rejectNonCanonical(fe);
+            return fe;
+        }
+
+        /// Converts the field element to a primitive.
+        /// This function may not run in constant time.
+        /// Returns an error if the element is in Montgomery form.
+        pub fn toPrimitive(self: Self, comptime T: type) (OverflowError || RepresentationError)!T {
+            if (self.montgomery) {
+                return error.UnexpectedRepresentation;
+            }
+            return self.v.toPrimitive(T);
+        }
+
+        /// Creates a field element from a byte string.
+        pub fn fromBytes(m: Modulus(bits), bytes: []const u8, comptime endian: Endian) (OverflowError || FieldElementError)!Self {
+            const v = try FeUint.fromBytes(bytes, endian);
+            var fe = Self{ .v = v };
+            try m.shrink(&fe);
+            try m.rejectNonCanonical(fe);
+            return fe;
+        }
+
+        /// Converts the field element to a byte string.
+        /// Returns an error if the element is in Montgomery form.
+        pub fn toBytes(self: Self, bytes: []u8, comptime endian: Endian) (OverflowError || RepresentationError)!void {
+            if (self.montgomery) {
+                return error.UnexpectedRepresentation;
+            }
+            return self.v.toBytes(bytes, endian);
+        }
+
+        /// Returns `true` if the field elements are equal, in constant time.
+        /// Elements in different representations compare unequal; convert them to the same form to compare values.
+        pub fn eql(x: Self, y: Self) bool {
+            const values_equal = x.v.eql(y.v);
+            return x.montgomery == y.montgomery and values_equal;
+        }
+
+        /// Compares two field elements in constant time.
+        pub fn compare(x: Self, y: Self) math.Order {
+            assert(!x.montgomery and !y.montgomery);
+            return x.v.compare(y.v);
+        }
+
+        /// Returns `true` if the element is zero.
+        pub fn isZero(self: Self) bool {
+            return self.v.isZero();
+        }
+
+        /// Returns `true` is the element is odd.
+        /// Requires plain form because Montgomery encoding doesn't preserve parity.
+        pub fn isOdd(self: Self) bool {
+            assert(!self.montgomery);
+            return self.v.isOdd();
+        }
+    };
+}
+
+// Decodes into zeroed limbs and returns the OR of the bits that didn't fit.
+fn decodeBytes(limbs: []Limb, bytes: []const u8, comptime endian: Endian) Limb {
+    var acc: Limb = 0;
+    var shift: usize = 0;
+    var out_i: usize = 0;
+    for (0..bytes.len) |k| {
+        const bi = bytes[
+            switch (endian) {
+                .big => bytes.len - 1 - k,
+                .little => k,
+            }
+        ];
+        if (out_i >= limbs.len) {
+            acc |= bi;
+            continue;
+        }
+        limbs[out_i] |= math.shl(Limb, bi, shift);
+        shift += 8;
+        if (shift >= t_bits) {
+            shift -= t_bits;
+            limbs[out_i] = @as(TLimb, @truncate(limbs[out_i]));
+            const spill = math.shr(Limb, bi, 8 - shift);
+            out_i += 1;
+            if (out_i < limbs.len) {
+                limbs[out_i] = spill;
+            } else {
+                acc |= spill;
+            }
+        }
+    }
+    return acc;
+}
+
+fn orLimbs(limbs: []const Limb) Limb {
+    var t: Limb = 0;
+    for (limbs) |limb| {
+        t |= limb;
+    }
+    return t;
+}
+
+// Adds `x * y` to `z` and returns the carry.
+fn mulAddLimb(z: []Limb, x: []const Limb, y: Limb) Limb {
+    assert(z.len == x.len);
+    var carry: Limb = 0;
+    for (z, x) |*z_limb, x_limb| {
+        const wide = ct.mulWide(x_limb, y);
+        var z_lo = @addWithOverflow(z_limb.*, wide.lo);
+        var z_hi = wide.hi +% z_lo[1];
+        z_lo = @addWithOverflow(z_lo[0], carry);
+        z_hi +%= z_lo[1];
+        z_limb.* = @as(TLimb, @truncate(z_lo[0]));
+        carry = (z_hi << 1) | (z_lo[0] >> t_bits);
+    }
+    return carry;
+}
+
+// Adds `x * y` to the low `x.len` limbs of `z`. The upper limbs need no initialization.
+fn mulAddWide(z: []Limb, x: []const Limb, y: []const Limb) void {
+    assert(z.len == x.len + y.len);
+    for (y, 0..) |y_limb, i| {
+        z[i + x.len] = mulAddLimb(z[i..][0..x.len], x, y_limb);
+    }
+}
+
+/// A modulus, defining a finite field.
+/// All operations within the field are performed modulo this modulus, without heap allocations.
+/// `max_bits` represents the number of bits in the maximum value the modulus can be set to.
+pub fn Modulus(comptime max_bits: comptime_int) type {
+    return struct {
+        const Self = @This();
+
+        /// A field element, representing a value within the field defined by this modulus.
+        /// Use elements only with the modulus that created them, even if another modulus has the same size.
+        pub const Fe = Fe_(max_bits);
+
+        const FeUint = Fe.FeUint;
+
+        /// The neutral element.
+        zero: Fe,
+
+        /// The modulus value.
+        v: FeUint,
+
+        /// R^2 for the Montgomery representation.
+        rr: Fe,
+        /// Inverse of the first limb
+        m0inv: Limb,
+        /// Number of leading zero bits in the modulus.
+        leading: usize,
+
+        // Number of active limbs in the modulus.
+        fn limbs_count(self: Self) usize {
+            return self.v.limbs_len;
+        }
+
+        /// Actual size of the modulus, in bits.
+        pub fn bits(self: Self) usize {
+            return self.limbs_count() * t_bits - self.leading;
+        }
+
+        /// Returns the encoded length, in bytes.
+        pub fn encodedLen(self: Self) usize {
+            return @divCeil(self.bits(), 8);
+        }
+
+        /// Returns the element `1`.
+        pub fn one(self: Self) Fe {
+            var fe = self.zero;
+            fe.v.limbs()[0] = 1;
+            return fe;
+        }
+
+        /// Creates a new modulus from a `Uint` value.
+        /// The modulus must be odd and larger than 2.
+        pub fn fromUint(v_: FeUint) InvalidModulusError!Self {
+            if (!v_.isOdd()) return error.EvenModulus;
+
+            var v = v_.normalize();
+            const hi = v.limbsConst()[v.limbs_len - 1];
+            const lo = v.limbsConst()[0];
+
+            if (v.limbs_len < 2 and lo < 3) {
+                return error.ModulusTooSmall;
+            }
+
+            const leading = @clz(hi) - carry_bits;
+
+            var y = lo;
+
+            inline for (0..comptime math.log2_int(usize, t_bits)) |_| {
+                y = y *% (2 -% lo *% y);
+            }
+            const m0inv = (@as(Limb, 1) << t_bits) - (@as(TLimb, @truncate(y)));
+
+            const zero = Fe{ .v = FeUint.zero };
+
+            var m = Self{
+                .zero = zero,
+                .v = v,
+                .leading = leading,
+                .m0inv = m0inv,
+                .rr = undefined, // will be computed right after
+            };
+            m.shrink(&m.zero) catch unreachable;
+            computeRR(&m);
+
+            return m;
+        }
+
+        /// Creates a new modulus from a primitive value.
+        /// The modulus must be odd and larger than 2.
+        pub fn fromPrimitive(comptime T: type, x: T) (InvalidModulusError || OverflowError)!Self {
+            comptime assert(@bitSizeOf(T) <= max_bits); // Primitive type is larger than the modulus type.
+            const v = try FeUint.fromPrimitive(T, x);
+            return try Self.fromUint(v);
+        }
+
+        /// Creates a new modulus from a byte string.
+        pub fn fromBytes(bytes: []const u8, comptime endian: Endian) (InvalidModulusError || OverflowError)!Self {
+            const v = try FeUint.fromBytes(bytes, endian);
+            return try Self.fromUint(v);
+        }
+
+        /// Serializes the modulus to a byte string.
+        pub fn toBytes(self: Self, bytes: []u8, comptime endian: Endian) OverflowError!void {
+            return self.v.toBytes(bytes, endian);
+        }
+
+        /// Returns the modulus as an integer
+        pub fn toUint(self: Self) FeUint {
+            return self.v;
+        }
+
+        /// Rejects field elements that are not in the canonical form.
+        pub fn rejectNonCanonical(self: Self, fe: Fe) error{NonCanonical}!void {
+            if (fe.limbs_count() != self.limbs_count() or ct.limbsCmpGeq(fe.v, self.v)) {
+                return error.NonCanonical;
+            }
+        }
+
+        // Makes the number of active limbs in a field element match the one of the modulus.
+        fn shrink(self: Self, fe: *Fe) OverflowError!void {
+            const new_len = self.limbs_count();
+            if (fe.limbs_count() < new_len) return error.Overflow;
+            var acc: Limb = 0;
+            for (fe.v.limbsConst()[new_len..]) |limb| {
+                acc |= limb;
+            }
+            if (acc != 0) return error.Overflow;
+            if (new_len > fe.v.limbs_buffer.len) return error.Overflow;
+            fe.v.limbs_len = new_len;
+        }
+
+        // Computes R^2 for the Montgomery representation.
+        fn computeRR(self: *Self) void {
+            self.rr = self.zero;
+            const n = self.rr.limbs_count();
+            self.rr.v.limbs()[n - 1] = 1;
+            for ((n - 1)..(2 * n)) |_| {
+                self.shiftIn(&self.rr, 0);
+            }
+            self.shrink(&self.rr) catch unreachable;
+        }
+
+        /// Computes x << t_bits + y (mod m)
+        fn shiftIn(self: Self, x: *Fe, y: Limb) void {
+            var d = self.zero;
+            const x_limbs = x.v.limbs();
+            const d_limbs = d.v.limbs();
+            const m_limbs = self.v.limbsConst();
+
+            var need_sub = false;
+            var i: usize = t_bits - 1;
+            while (true) : (i -= 1) {
+                var carry: u1 = @truncate(math.shr(Limb, y, i));
+                var borrow: u1 = 0;
+                for (0..self.limbs_count()) |j| {
+                    const l = ct.select(need_sub, d_limbs[j], x_limbs[j]);
+                    var res = (l << 1) + carry;
+                    x_limbs[j] = @as(TLimb, @truncate(res));
+                    carry = @truncate(res >> t_bits);
+
+                    res = x_limbs[j] -% m_limbs[j] -% borrow;
+                    d_limbs[j] = @as(TLimb, @truncate(res));
+
+                    borrow = @truncate(res >> t_bits);
+                }
+                need_sub = ct.eql(carry, borrow);
+                if (i == 0) break;
+            }
+            x.v.cmov(need_sub, d.v);
+        }
+
+        /// Adds two field elements (mod m).
+        pub fn add(self: Self, x: Fe, y: Fe) Fe {
+            var out = x;
+            if (x.montgomery == y.montgomery) {
+                @branchHint(.likely);
+                const overflow = out.v.addWithOverflow(y.v);
+                const underflow: u1 = @bitCast(ct.limbsCmpLt(out.v, self.v));
+                const need_sub = ct.eql(overflow, underflow);
+                _ = out.v.conditionalSubWithOverflow(need_sub, self.v);
+                return out;
+            } else {
+                var y_ = y;
+                if (y.montgomery) {
+                    self.fromMontgomery(&y_) catch unreachable;
+                } else {
+                    self.toMontgomery(&y_) catch unreachable;
+                }
+                const overflow = out.v.addWithOverflow(y_.v);
+                const underflow: u1 = @bitCast(ct.limbsCmpLt(out.v, self.v));
+                const need_sub = ct.eql(overflow, underflow);
+                _ = out.v.conditionalSubWithOverflow(need_sub, self.v);
+                return out;
+            }
+        }
+
+        /// Subtracts two field elements (mod m).
+        pub fn sub(self: Self, x: Fe, y: Fe) Fe {
+            var out = x;
+            if (x.montgomery == y.montgomery) {
+                const underflow: bool = @bitCast(out.v.subWithOverflow(y.v));
+                _ = out.v.conditionalAddWithOverflow(underflow, self.v);
+                return out;
+            } else {
+                var y_ = y;
+                if (y.montgomery) {
+                    self.fromMontgomery(&y_) catch unreachable;
+                } else {
+                    self.toMontgomery(&y_) catch unreachable;
+                }
+                const underflow: bool = @bitCast(out.v.subWithOverflow(y_.v));
+                _ = out.v.conditionalAddWithOverflow(underflow, self.v);
+                return out;
+            }
+        }
+
+        /// Converts a field element to the Montgomery form.
+        pub fn toMontgomery(self: Self, x: *Fe) RepresentationError!void {
+            if (x.montgomery) {
+                return error.UnexpectedRepresentation;
+            }
+            self.shrink(x) catch unreachable;
+            x.* = self.montgomeryMul(x.*, self.rr);
+            x.montgomery = true;
+        }
+
+        /// Takes a field element out of the Montgomery form.
+        pub fn fromMontgomery(self: Self, x: *Fe) RepresentationError!void {
+            if (!x.montgomery) {
+                return error.UnexpectedRepresentation;
+            }
+            self.shrink(x) catch unreachable;
+            x.* = self.montgomeryMul(x.*, self.one());
+            x.montgomery = false;
+        }
+
+        /// Reduces an arbitrary `Uint`, converting it to a field element.
+        pub fn reduce(self: Self, x: anytype) Fe {
+            var out = self.zero;
+            var i = x.limbs_len - 1;
+            if (self.limbs_count() >= 2) {
+                const start = @min(i, self.limbs_count() - 2);
+                var j = start;
+                while (true) : (j -= 1) {
+                    out.v.limbs()[j] = x.limbsConst()[i];
+                    i -= 1;
+                    if (j == 0) break;
+                }
+            }
+            while (true) : (i -= 1) {
+                self.shiftIn(&out, x.limbsConst()[i]);
+                if (i == 0) break;
+            }
+            return out;
+        }
+
+        fn montgomeryLoop(self: Self, d: *Fe, x: Fe, y: Fe) u1 {
+            assert(d.limbs_count() == x.limbs_count());
+            assert(d.limbs_count() == y.limbs_count());
+            assert(d.limbs_count() == self.limbs_count());
+
+            const a_limbs = x.v.limbsConst();
+            const b_limbs = y.v.limbsConst();
+            const d_limbs = d.v.limbs();
+            const m_limbs = self.v.limbsConst();
+
+            var overflow: u1 = 0;
+            for (0..self.limbs_count()) |i| {
+                var carry: Limb = 0;
+
+                var wide = ct.mulWide(a_limbs[i], b_limbs[0]);
+                var z_lo = @addWithOverflow(d_limbs[0], wide.lo);
+                const f = @as(TLimb, @truncate(z_lo[0] *% self.m0inv));
+                var z_hi = wide.hi +% z_lo[1];
+                wide = ct.mulWide(f, m_limbs[0]);
+                z_lo = @addWithOverflow(z_lo[0], wide.lo);
+                z_hi +%= z_lo[1];
+                z_hi +%= wide.hi;
+                carry = (z_hi << 1) | (z_lo[0] >> t_bits);
+
+                for (1..self.limbs_count()) |j| {
+                    wide = ct.mulWide(a_limbs[i], b_limbs[j]);
+                    z_lo = @addWithOverflow(d_limbs[j], wide.lo);
+                    z_hi = wide.hi +% z_lo[1];
+                    wide = ct.mulWide(f, m_limbs[j]);
+                    z_lo = @addWithOverflow(z_lo[0], wide.lo);
+                    z_hi +%= z_lo[1];
+                    z_hi +%= wide.hi;
+                    z_lo = @addWithOverflow(z_lo[0], carry);
+                    z_hi +%= z_lo[1];
+                    if (j > 0) {
+                        d_limbs[j - 1] = @as(TLimb, @truncate(z_lo[0]));
+                    }
+                    carry = (z_hi << 1) | (z_lo[0] >> t_bits);
+                }
+                const z = overflow + carry;
+                d_limbs[self.limbs_count() - 1] = @as(TLimb, @truncate(z));
+                overflow = @as(u1, @truncate(z >> t_bits));
+            }
+            return overflow;
+        }
+
+        // Montgomery multiplication.
+        fn montgomeryMul(self: Self, x: Fe, y: Fe) Fe {
+            var d = self.zero;
+            assert(x.limbs_count() == self.limbs_count());
+            assert(y.limbs_count() == self.limbs_count());
+            const overflow = self.montgomeryLoop(&d, x, y);
+            const underflow = 1 -% @intFromBool(ct.limbsCmpGeq(d.v, self.v));
+            const need_sub = ct.eql(overflow, underflow);
+            _ = d.v.conditionalSubWithOverflow(need_sub, self.v);
+            d.montgomery = x.montgomery == y.montgomery;
+            return d;
+        }
+
+        // Montgomery squaring.
+        fn montgomerySq(self: Self, x: Fe) Fe {
+            var d = self.zero;
+            assert(x.limbs_count() == self.limbs_count());
+            const overflow = self.montgomeryLoop(&d, x, x);
+            const underflow = 1 -% @intFromBool(ct.limbsCmpGeq(d.v, self.v));
+            const need_sub = ct.eql(overflow, underflow);
+            _ = d.v.conditionalSubWithOverflow(need_sub, self.v);
+            d.montgomery = true;
+            return d;
+        }
+
+        // Returns x^e (mod m), with the exponent provided as a byte string.
+        // `public` must be set to `false` if the exponent it secret.
+        fn powWithEncodedExponentInternal(self: Self, x: Fe, e: []const u8, endian: Endian, comptime public: bool) NullExponentError!Fe {
+            var acc: u8 = 0;
+            for (e) |b| acc |= b;
+            if (acc == 0) return error.NullExponent;
+
+            const was_montgomery = x.montgomery;
+
+            var out = self.one();
+            self.toMontgomery(&out) catch unreachable;
+
+            if (public and
+                (e.len < 3 or (e.len == 3 and e[if (endian == .big) 0 else 2] <= 0b1111)))
+            {
+                // Do not use a precomputation table for short, public exponents
+                var x_m = x;
+                if (!x.montgomery) {
+                    self.toMontgomery(&x_m) catch unreachable;
+                }
+                var s = switch (endian) {
+                    .big => 0,
+                    .little => e.len - 1,
+                };
+                while (true) {
+                    const b = e[s];
+                    var j: u3 = 7;
+                    while (true) : (j -= 1) {
+                        out = self.montgomerySq(out);
+                        const k: u1 = @truncate(b >> j);
+                        if (k != 0) {
+                            const t = self.montgomeryMul(out, x_m);
+                            @memcpy(out.v.limbs(), t.v.limbsConst());
+                        }
+                        if (j == 0) break;
+                    }
+                    switch (endian) {
+                        .big => {
+                            s += 1;
+                            if (s == e.len) break;
+                        },
+                        .little => {
+                            if (s == 0) break;
+                            s -= 1;
+                        },
+                    }
+                }
+            } else {
+                // Use a precomputation table for large exponents
+                var pc: [15]Fe = [1]Fe{x} ++ @as([14]Fe, @splat(self.zero));
+                if (!x.montgomery) {
+                    self.toMontgomery(&pc[0]) catch unreachable;
+                }
+                for (1..pc.len) |i| {
+                    pc[i] = self.montgomeryMul(pc[i - 1], pc[0]);
+                }
+                var t0 = self.zero;
+                var s = switch (endian) {
+                    .big => 0,
+                    .little => e.len - 1,
+                };
+                while (true) {
+                    const b = e[s];
+                    for ([_]u3{ 4, 0 }) |j| {
+                        for (0..4) |_| {
+                            out = self.montgomerySq(out);
+                        }
+                        const k = (b >> j) & 0b1111;
+                        if (public or std.options.side_channels_mitigations == .none) {
+                            if (k == 0) continue;
+                            t0 = pc[k - 1];
+                        } else {
+                            for (pc, 0..) |t, i| {
+                                t0.v.cmov(ct.eql(k, @as(u8, @truncate(i + 1))), t.v);
+                            }
+                        }
+                        const t1 = self.montgomeryMul(out, t0);
+                        if (public) {
+                            @memcpy(out.v.limbs(), t1.v.limbsConst());
+                        } else {
+                            out.v.cmov(!ct.eql(k, 0), t1.v);
+                        }
+                    }
+                    switch (endian) {
+                        .big => {
+                            s += 1;
+                            if (s == e.len) break;
+                        },
+                        .little => {
+                            if (s == 0) break;
+                            s -= 1;
+                        },
+                    }
+                }
+            }
+            if (!was_montgomery) {
+                self.fromMontgomery(&out) catch unreachable;
+            }
+            return out;
+        }
+
+        /// Multiplies two field elements.
+        /// Result preserves the first operand's form.
+        pub fn mul(self: Self, x: Fe, y: Fe) Fe {
+            if (x.montgomery) {
+                const y_ = if (!y.montgomery) blk: {
+                    var yy = y;
+                    self.toMontgomery(&yy) catch unreachable;
+                    break :blk yy;
+                } else y;
+                return self.montgomeryMul(x, y_);
+            } else {
+                var x_m = x;
+                var y_m = if (y.montgomery) blk: {
+                    var yy = y;
+                    self.fromMontgomery(&yy) catch unreachable;
+                    break :blk yy;
+                } else y;
+                self.toMontgomery(&x_m) catch unreachable;
+                self.toMontgomery(&y_m) catch unreachable;
+                var out = self.montgomeryMul(x_m, y_m);
+                self.fromMontgomery(&out) catch unreachable;
+                return out;
+            }
+        }
+
+        /// Squares a field element.
+        pub fn sq(self: Self, x: Fe) Fe {
+            if (x.montgomery) {
+                return self.montgomerySq(x);
+            } else {
+                var out = x;
+                self.toMontgomery(&out) catch unreachable;
+                out = self.montgomerySq(out);
+                self.fromMontgomery(&out) catch unreachable;
+                return out;
+            }
+        }
+
+        const max_encoded_bytes = @divCeil(FeUint.capacity_bits, 8);
+
+        /// Returns x^e (mod m) in constant time.
+        pub fn pow(self: Self, x: Fe, e: Fe) (NullExponentError || RepresentationError)!Fe {
+            if (e.montgomery) {
+                return error.UnexpectedRepresentation;
+            }
+
+            var buf: [max_encoded_bytes]u8 = undefined;
+            const len = self.encodedLen();
+            e.toBytes(buf[0..len], native_endian) catch unreachable;
+            return self.powWithEncodedExponent(x, buf[0..len], native_endian);
+        }
+
+        /// Returns x^e (mod m), assuming that the exponent is public.
+        /// The function remains constant time with respect to `x`.
+        pub fn powPublic(self: Self, x: Fe, e: Fe) (NullExponentError || RepresentationError)!Fe {
+            if (e.montgomery) {
+                return error.UnexpectedRepresentation;
+            }
+            var buf_: [max_encoded_bytes]u8 = undefined;
+            const buf = buf_[0..@divCeil(e.v.bitLenPublic(), 8)];
+            e.toBytes(buf, .little) catch unreachable;
+            return self.powWithEncodedPublicExponent(x, buf, .little);
+        }
+
+        /// Returns x^e (mod m), with the exponent provided as a byte string.
+        /// Exponents are usually small, so this function is faster than `powPublic` as a field element
+        /// doesn't have to be created if a serialized representation is already available.
+        ///
+        /// If the exponent is public, `powWithEncodedPublicExponent()` can be used instead for a slight speedup.
+        pub fn powWithEncodedExponent(self: Self, x: Fe, e: []const u8, endian: Endian) NullExponentError!Fe {
+            return self.powWithEncodedExponentInternal(x, e, endian, false);
+        }
+
+        /// Returns x^e (mod m), the exponent being public and provided as a byte string.
+        /// Exponents are usually small, so this function is faster than `powPublic` as a field element
+        /// doesn't have to be created if a serialized representation is already available.
+        ///
+        /// If the exponent is secret, `powWithEncodedExponent` must be used instead.
+        pub fn powWithEncodedPublicExponent(self: Self, x: Fe, e: []const u8, endian: Endian) NullExponentError!Fe {
+            return self.powWithEncodedExponentInternal(x, e, endian, true);
+        }
+    };
+}
+
+const ct = if (std.options.side_channels_mitigations == .none) ct_unprotected else ct_protected;
+
+const ct_protected = struct {
+    // Returns x if on is true, otherwise y.
+    fn select(on: bool, x: Limb, y: Limb) Limb {
+        const mask = @as(Limb, 0) -% @intFromBool(on);
+        return y ^ (mask & (y ^ x));
+    }
+
+    // Compares two values in constant time.
+    fn eql(x: anytype, y: @TypeOf(x)) bool {
+        const c1 = @subWithOverflow(x, y)[1];
+        const c2 = @subWithOverflow(y, x)[1];
+        return @as(bool, @bitCast(1 - (c1 | c2)));
+    }
+
+    // Compares two big integers in constant time, returning true if x < y.
+    fn limbsCmpLt(x: anytype, y: @TypeOf(x)) bool {
+        var c: u1 = 0;
+        for (x.limbsConst(), y.limbsConst()) |x_limb, y_limb| {
+            c = @truncate((x_limb -% y_limb -% c) >> t_bits);
+        }
+        return c != 0;
+    }
+
+    // Compares two big integers in constant time, returning true if x >= y.
+    fn limbsCmpGeq(x: anytype, y: @TypeOf(x)) bool {
+        return !limbsCmpLt(x, y);
+    }
+
+    // Multiplies two limbs and returns the result as a wide limb.
+    fn mulWide(x: Limb, y: Limb) WideLimb {
+        const half_bits = @typeInfo(Limb).int.bits / 2;
+        const Half = @Int(.unsigned, half_bits);
+        const x0 = @as(Half, @truncate(x));
+        const x1 = @as(Half, @truncate(x >> half_bits));
+        const y0 = @as(Half, @truncate(y));
+        const y1 = @as(Half, @truncate(y >> half_bits));
+        const w0 = math.mulWide(Half, x0, y0);
+        const t = math.mulWide(Half, x1, y0) + (w0 >> half_bits);
+        var w1: Limb = @as(Half, @truncate(t));
+        const w2 = @as(Half, @truncate(t >> half_bits));
+        w1 += math.mulWide(Half, x0, y1);
+        const hi = math.mulWide(Half, x1, y1) + w2 + (w1 >> half_bits);
+        const lo = x *% y;
+        return .{ .hi = hi, .lo = lo };
+    }
+};
+
+const ct_unprotected = struct {
+    // Returns x if on is true, otherwise y.
+    fn select(on: bool, x: Limb, y: Limb) Limb {
+        return if (on) x else y;
+    }
+
+    // Compares two values in constant time.
+    fn eql(x: anytype, y: @TypeOf(x)) bool {
+        return x == y;
+    }
+
+    // Compares two big integers in constant time, returning true if x < y.
+    fn limbsCmpLt(x: anytype, y: @TypeOf(x)) bool {
+        const x_limbs = x.limbsConst();
+        const y_limbs = y.limbsConst();
+        assert(x_limbs.len == y_limbs.len);
+
+        var i = x_limbs.len;
+        while (i != 0) {
+            i -= 1;
+            if (x_limbs[i] != y_limbs[i]) {
+                return x_limbs[i] < y_limbs[i];
+            }
+        }
+        return false;
+    }
+
+    // Compares two big integers in constant time, returning true if x >= y.
+    fn limbsCmpGeq(x: anytype, y: @TypeOf(x)) bool {
+        return !limbsCmpLt(x, y);
+    }
+
+    // Multiplies two limbs and returns the result as a wide limb.
+    fn mulWide(x: Limb, y: Limb) WideLimb {
+        const wide = math.mulWide(Limb, x, y);
+        return .{
+            .hi = @as(Limb, @truncate(wide >> @typeInfo(Limb).int.bits)),
+            .lo = @as(Limb, @truncate(wide)),
+        };
+    }
+};
+
+test "finite field arithmetic" {
+    const M = Modulus(256);
+    const m = try M.fromPrimitive(u256, 3429938563481314093726330772853735541133072814650493833233);
+    var x = try M.Fe.fromPrimitive(u256, m, 80169837251094269539116136208111827396136208141182357733);
+    const y = try M.Fe.fromPrimitive(u256, m, 24620149608466364616251608466389896540098571);
+
+    const x_ = try x.toPrimitive(u256);
+    try testing.expect((try M.Fe.fromPrimitive(@TypeOf(x_), m, x_)).eql(x));
+    try testing.expectError(error.Overflow, x.toPrimitive(u50));
+
+    const bits = m.bits();
+    try testing.expectEqual(bits, 192);
+
+    var x_y = m.mul(x, y);
+    try testing.expectEqual(x_y.toPrimitive(u256), 1666576607955767413750776202132407807424848069716933450241);
+
+    try m.toMontgomery(&x);
+    x_y = m.mul(x, y);
+    try testing.expect(x_y.montgomery); // result preserves first operand's form
+    try m.fromMontgomery(&x_y);
+    try testing.expectEqual(x_y.toPrimitive(u256), 1666576607955767413750776202132407807424848069716933450241);
+    try m.fromMontgomery(&x);
+
+    x = m.add(x, y);
+    try testing.expectEqual(x.toPrimitive(u256), 80169837251118889688724602572728079004602598037722456304);
+    x = m.sub(x, y);
+    try testing.expectEqual(x.toPrimitive(u256), 80169837251094269539116136208111827396136208141182357733);
+
+    const big = try Uint(512).fromPrimitive(u495, 77285373554113307281465049383342993856348131409372633077285373554113307281465049383323332333429938563481314093726330772853735541133072814650493833233);
+    const reduced = m.reduce(big);
+    try testing.expectEqual(reduced.toPrimitive(u495), 858047099884257670294681641776170038885500210968322054970);
+
+    const x_pow_y = try m.powPublic(x, y);
+    try testing.expectEqual(x_pow_y.toPrimitive(u256), 1631933139300737762906024873185789093007782131928298618473);
+    try testing.expect(!x_pow_y.montgomery);
+    try m.toMontgomery(&x);
+    var x_pow_y2 = try m.powPublic(x, y);
+    try testing.expect(x_pow_y2.montgomery);
+    try m.fromMontgomery(&x_pow_y2);
+    try m.fromMontgomery(&x);
+    try testing.expect(x_pow_y2.eql(x_pow_y));
+    try testing.expectError(error.NullExponent, m.powPublic(x, m.zero));
+
+    try testing.expect(!x.isZero());
+    try testing.expect(!y.isZero());
+    try testing.expect(m.v.isOdd());
+
+    const x_sq = m.sq(x);
+    const x_sq2 = m.mul(x, x);
+    try testing.expect(!x_sq.montgomery);
+    try testing.expect(!x_sq2.montgomery);
+    try testing.expect(x_sq.eql(x_sq2));
+    try m.toMontgomery(&x);
+    var x_sq3 = m.sq(x);
+    var x_sq4 = m.mul(x, x);
+    try testing.expect(x_sq3.montgomery);
+    try testing.expect(x_sq4.montgomery);
+    try m.fromMontgomery(&x_sq3);
+    try m.fromMontgomery(&x_sq4);
+    try testing.expect(x_sq.eql(x_sq3));
+    try testing.expect(x_sq3.eql(x_sq4));
+    try m.fromMontgomery(&x);
+
+    var x_mont = x;
+    try m.toMontgomery(&x_mont);
+
+    // Non-montgomery + montgomery
+    const add_nm_m = m.add(x, x_mont);
+    try testing.expect(!add_nm_m.montgomery);
+    var add_m_nm = m.add(x_mont, x);
+    try testing.expect(add_m_nm.montgomery);
+    try m.fromMontgomery(&add_m_nm);
+    try testing.expect(add_nm_m.eql(add_m_nm));
+
+    // Non-montgomery - montgomery
+    var y_mont = y;
+    try m.toMontgomery(&y_mont);
+    const sub_nm_m = m.sub(x, y_mont);
+    try testing.expect(!sub_nm_m.montgomery);
+    var sub_m_nm = m.sub(x_mont, y);
+    try testing.expect(sub_m_nm.montgomery);
+    try m.fromMontgomery(&sub_m_nm);
+    try testing.expect(sub_nm_m.eql(sub_m_nm));
+
+    // mul: preserves first operand's form
+    const mul_nm_m = m.mul(x, x_mont);
+    try testing.expect(!mul_nm_m.montgomery);
+    const mul_nm_nm = m.mul(x, x);
+    try testing.expect(mul_nm_m.eql(mul_nm_nm));
+    var mul_m_nm = m.mul(x_mont, x);
+    try testing.expect(mul_m_nm.montgomery);
+    try m.fromMontgomery(&mul_m_nm);
+    try testing.expect(mul_m_nm.eql(mul_nm_nm));
+
+    try testing.expectEqual(x.toPrimitive(u256), 80169837251094269539116136208111827396136208141182357733);
+    try testing.expectError(error.UnexpectedRepresentation, x_mont.toPrimitive(u256));
+}
+
+fn testCt(ct_: anytype) !void {
+    const l0: Limb = 0;
+    const l1: Limb = 1;
+    try testing.expectEqual(l1, ct_.select(true, l1, l0));
+    try testing.expectEqual(l0, ct_.select(false, l1, l0));
+    try testing.expectEqual(false, ct_.eql(l1, l0));
+    try testing.expectEqual(true, ct_.eql(l1, l1));
+
+    const M = Modulus(256);
+    const m = try M.fromPrimitive(u256, 3429938563481314093726330772853735541133072814650493833233);
+    const x = try M.Fe.fromPrimitive(u256, m, 80169837251094269539116136208111827396136208141182357733);
+    const y = try M.Fe.fromPrimitive(u256, m, 24620149608466364616251608466389896540098571);
+    try testing.expectEqual(false, ct_.limbsCmpLt(x.v, y.v));
+    try testing.expectEqual(true, ct_.limbsCmpGeq(x.v, y.v));
+
+    try testing.expectEqual(WideLimb{ .hi = 0, .lo = 0x88 }, ct_.mulWide(1 << 3, (1 << 4) + 1));
+}
+
+test ct {
+    try testCt(ct_protected);
+    try testCt(ct_unprotected);
+}
+
+fn expectWellFormedLimbs(x: anytype) !void {
+    for (x.limbsConst()) |limb| {
+        try testing.expect(limb <= math.maxInt(TLimb));
+    }
+    for (x.limbs_buffer[x.limbs_len..]) |limb| {
+        try testing.expectEqual(0, limb);
+    }
+}
+
+// Big-endian encoding of the largest value a `Uint` can store.
+fn maxUintBytes(comptime U: type) [@divCeil(U.capacity_bits, 8)]u8 {
+    var buf: [@divCeil(U.capacity_bits, 8)]u8 = @splat(0xff);
+    buf[0] = 0xff >> (8 * buf.len - U.capacity_bits);
+    return buf;
+}
+
+test "modulus creation" {
+    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+
+    const M = Modulus(256);
+    try testing.expectError(error.EvenModulus, M.fromPrimitive(u8, 0));
+    try testing.expectError(error.ModulusTooSmall, M.fromPrimitive(u8, 1));
+    try testing.expectError(error.EvenModulus, M.fromPrimitive(u8, 2));
+    for ([_]u65{ 3, 255, (1 << 64) + 1 }) |v| {
+        const m = try M.fromPrimitive(u65, v);
+        try testing.expectEqual(v, try m.toUint().toPrimitive(u65));
+        try testing.expectEqual(@divCeil(65 - @clz(v), 8), m.encodedLen());
+        try testing.expect((try M.fromUint(m.toUint())).v.eql(m.v));
+    }
+    const cap = maxUintBytes(Uint(256));
+    try testing.expectEqual(cap.len, (try M.fromBytes(&cap, .big)).encodedLen());
+}
+
+test "Uint serialization" {
+    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+
+    const U = Uint(256);
+    const x = try U.fromPrimitive(u128, (1 << t_bits) + 5);
+    try testing.expectError(error.Overflow, Uint(64).fromPrimitive(u256, 1 << 200));
+    try testing.expectError(error.Overflow, x.toPrimitive(u8));
+    try testing.expectError(error.Overflow, x.toPrimitive(@Int(.unsigned, t_bits)));
+    try testing.expectEqual((1 << t_bits) + 5, try x.toPrimitive(@Int(.unsigned, t_bits + 1)));
+    const max = try U.fromPrimitive(u128, (1 << t_bits) - 1);
+    try testing.expectEqual((1 << t_bits) - 1, try max.toPrimitive(@Int(.unsigned, t_bits)));
+    try testing.expectError(error.Overflow, max.toPrimitive(@Int(.unsigned, t_bits - 1)));
+    const signed_max = try U.fromPrimitive(u128, math.maxInt(i128));
+    try testing.expectEqual(math.maxInt(i128), try signed_max.toPrimitive(i128));
+    try testing.expectError(error.Overflow, (try U.fromPrimitive(u128, 1 << 127)).toPrimitive(i128));
+
+    inline for (.{ .big, .little }) |endian| {
+        const zero = try U.fromBytes(&.{}, endian);
+        var empty: [0]u8 = .{};
+        try zero.toBytes(&empty, endian);
+        try testing.expectError(error.Overflow, x.toBytes(&empty, endian));
+        var tight: [16]u8 = undefined;
+        try x.toBytes(&tight, endian);
+        try testing.expectEqual((1 << t_bits) + 5, mem.readInt(u128, &tight, endian));
+        try testing.expect(x.eql(try U.fromBytes(&tight, endian)));
+        var normalized: [16]u8 = undefined;
+        try x.normalize().toBytes(&normalized, endian);
+        try testing.expectEqualSlices(u8, &tight, &normalized);
+
+        var cap = maxUintBytes(U);
+        if (endian == .little) mem.reverse(u8, &cap);
+        const full = try U.fromBytes(&cap, endian);
+        try expectWellFormedLimbs(full);
+        var out: [cap.len]u8 = undefined;
+        try full.toBytes(&out, endian);
+        try testing.expectEqualSlices(u8, &cap, &out);
+        out[if (endian == .big) 0 else out.len - 1] |= 1 << (U.capacity_bits % 8);
+        try testing.expectError(error.Overflow, U.fromBytes(&out, endian));
+        var padded = if (endian == .big) [_]u8{0} ++ cap else cap ++ [_]u8{0};
+        try testing.expect(full.eql(try U.fromBytes(&padded, endian)));
+        padded[if (endian == .big) 0 else padded.len - 1] = 1;
+        try testing.expectError(error.Overflow, U.fromBytes(&padded, endian));
+    }
+}
+
+test "field element decoding" {
+    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+
+    const M = Modulus(256);
+    const mv: u256 = (1 << 190) + 33;
+    const m = try M.fromPrimitive(u256, mv);
+    try testing.expectError(error.NonCanonical, M.Fe.fromPrimitive(u256, m, mv));
+    try testing.expectError(error.Overflow, M.Fe.fromPrimitive(u256, m, 1 << 255));
+
+    inline for (.{ .big, .little }) |endian| {
+        var buf: [32]u8 = undefined;
+        try m.toBytes(&buf, endian);
+        try testing.expectError(error.NonCanonical, M.Fe.fromBytes(m, &buf, endian));
+        const x = try M.Fe.fromPrimitive(u256, m, mv - 1);
+        try x.toBytes(&buf, endian);
+        try testing.expect(x.eql(try M.Fe.fromBytes(m, &buf, endian)));
+    }
+}
+
+test "Uint bit measurement and shifts" {
+    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+
+    const U = Uint(256);
+    try testing.expectEqual(0, U.zero.bitLenPublic());
+    try testing.expectEqual(U.max_limbs_count * t_bits, U.zero.trailingZeroBitsPublic());
+    try testing.expectEqual(t_bits, U.zero.normalize().trailingZeroBitsPublic());
+    for ([_]usize{ 0, t_bits - 1, t_bits, t_bits + 1, 255 }) |offset| {
+        const x = try U.fromPrimitive(u256, math.shl(u256, 1, offset));
+        try testing.expectEqual(offset + 1, x.bitLenPublic());
+        try testing.expectEqual(offset, x.trailingZeroBitsPublic());
+    }
+
+    const v: u256 = (1 << 255) | (1 << t_bits) | 3;
+    for ([_]usize{ 0, 1, t_bits - 1, t_bits, t_bits + 1, U.max_limbs_count * t_bits, 10_000 }) |shift| {
+        var x = try U.fromPrimitive(u256, v);
+        x.shiftRightPublic(shift);
+        try testing.expectEqual(math.shr(u256, v, shift), try x.toPrimitive(u256));
+        try testing.expectEqual(U.max_limbs_count, x.limbs_len);
+        try expectWellFormedLimbs(x);
+    }
+    for ([_]usize{ 0, 1, t_bits - 1, t_bits, t_bits + 1 }) |shift| {
+        var x = try U.fromPrimitive(u256, (1 << t_bits) + 3);
+        x.shiftLeft(shift);
+        try testing.expectEqual(math.shl(u256, (1 << t_bits) + 3, shift), try x.toPrimitive(u256));
+    }
+
+    var x = (try U.fromPrimitive(u8, 5)).normalize();
+    try testing.expectEqual(1, x.shiftRightByOneWithCarry(1));
+    try testing.expectEqual((1 << (t_bits - 1)) + 2, try x.toPrimitive(u64));
+    try testing.expectEqual(0, x.shiftRightByOneWithCarry(0));
+    x.shiftRightPublic(t_bits);
+    try testing.expect(x.isZero());
+    try testing.expectEqual(1, x.limbs_len);
+}
+
+test "Uint division and gcd" {
+    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+
+    const U = Uint(256);
+    const v: u256 = (1 << 255) + (1 << t_bits) + 13;
+    for ([_]usize{ 1, 7, math.maxInt(TLimb), (1 << t_bits) + 5, math.maxInt(usize) }) |divisor| {
+        var x = try U.fromPrimitive(u256, v);
+        try testing.expectEqual(v % divisor, try x.divRemPublic(divisor));
+        try testing.expectEqual(v / divisor, try x.toPrimitive(u256));
+        try expectWellFormedLimbs(x);
+    }
+    var x = (try U.fromPrimitive(u16, 1000)).normalize();
+    try testing.expectError(error.DivisionByZero, x.divRemPublic(0));
+    try testing.expectEqual(6, try x.divRemPublic(7));
+    try testing.expectEqual(142, try x.toPrimitive(u16));
+    try testing.expectEqual(1, x.limbs_len);
+    try testing.expectEqual(142, try x.divRemPublic(1000));
+    try testing.expectEqual(0, try x.divRemPublic(7));
+
+    for ([_][3]u256{ .{ 0, 5, 5 }, .{ 6, 6, 6 }, .{ 17, 4, 1 }, .{ 15 << 200, 21 << 100, 3 << 100 } }) |c| {
+        const a = (try U.fromPrimitive(u256, c[0])).normalize();
+        const b = try U.fromPrimitive(u256, c[1]);
+        try testing.expectEqual(c[2], try (try a.gcdPublic(b)).toPrimitive(u256));
+        try testing.expectEqual(c[2], try (try b.gcdPublic(a)).toPrimitive(u256));
+    }
+    try testing.expectError(error.DivisionByZero, U.zero.gcdPublic(U.zero));
+}
+
+test "Uint addition and multiply-add" {
+    if (builtin.zig_backend == .stage2_c) return error.SkipZigTest;
+
+    const U = Uint(256);
+    const full = try U.fromBytes(&maxUintBytes(U), .big);
+    const one = try U.fromPrimitive(u8, 1);
+    var carry = (try U.fromPrimitive(u64, math.maxInt(TLimb))).normalize();
+    try testing.expectEqual(0, carry.addWithOverflow(one));
+    try testing.expectEqual(one.limbs_len, carry.limbs_len);
+    try testing.expectEqual(1 << t_bits, try carry.toPrimitive(u128));
+    try testing.expectEqual(0, carry.subWithOverflow(one.normalize()));
+    try testing.expectEqual(math.maxInt(TLimb), try carry.toPrimitive(u64));
+    var wrapped = U.zero.normalize();
+    try testing.expectEqual(1, wrapped.subWithOverflow(one));
+    try testing.expect(wrapped.eql(full));
+    try testing.expectEqual(1, wrapped.addWithOverflow(one));
+    try testing.expect(wrapped.isZero());
+
+    for ([_]struct { acc: U, x: U, y: U, overflow: u1, expected: U }{
+        .{ .acc = U.zero, .x = full, .y = one, .overflow = 0, .expected = full },
+        .{ .acc = full, .x = U.zero, .y = full, .overflow = 0, .expected = full },
+        .{ .acc = full, .x = full, .y = U.zero, .overflow = 0, .expected = full },
+        .{ .acc = U.zero, .x = full, .y = full, .overflow = 1, .expected = one },
+        .{ .acc = full, .x = one, .y = one, .overflow = 1, .expected = U.zero },
+    }) |c| {
+        var acc = c.acc;
+        try testing.expectEqual(c.overflow, acc.mulAddWithOverflow(c.x, c.y));
+        try testing.expect(acc.eql(c.expected));
+        try expectWellFormedLimbs(acc);
+    }
+    const a: u256 = (1 << 100) + 3;
+    const b: u256 = (1 << 80) + 7;
+    var acc = try U.fromPrimitive(u256, a);
+    try testing.expectEqual(0, acc.mulAddWithOverflow(try U.fromPrimitive(u256, a), try U.fromPrimitive(u256, b)));
+    try testing.expectEqual(a + a * b, try acc.toPrimitive(u256));
+
+    var short = one.normalize();
+    const high = (try U.fromPrimitive(u64, 1 << (t_bits - 1))).normalize();
+    const two = (try U.fromPrimitive(u8, 2)).normalize();
+    try testing.expectEqual(1, short.mulAddWithOverflow(high, two));
+    try testing.expectEqual(1, short.limbs_len);
+    try testing.expect(short.isOne());
+}

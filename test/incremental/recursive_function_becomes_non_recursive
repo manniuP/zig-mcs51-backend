@@ -1,0 +1,38 @@
+#exe {
+-Mroot=main.zig
+#}
+
+#write main.zig {
+pub fn main() !void {
+    try foo(false);
+}
+fn foo(recurse: bool) !void {
+    const stdout = std.Io.File.stdout();
+    if (recurse) return foo(true);
+    try stdout.writeStreamingAll(io, "non-recursive path\n");
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update
+#check stdout {
+non-recursive path
+#}
+
+#write main.zig {
+pub fn main() !void {
+    try foo(true);
+}
+fn foo(recurse: bool) !void {
+    const stdout = std.Io.File.stdout();
+    if (recurse) return stdout.writeStreamingAll(io, "x==1\n");
+    try stdout.writeStreamingAll(io, "non-recursive path\n");
+}
+const std = @import("std");
+const io = std.Io.Threaded.global_single_threaded.io();
+#}
+#update {
+eliminate recursion and change argument#}
+#check stdout {
+x==1
+#}
