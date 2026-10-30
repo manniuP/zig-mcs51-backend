@@ -234,7 +234,8 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 });
             },
             .label => |n| try items.append(gpa, .{ .label = n }),
-            .br => |t| try items.append(gpa, .{ .line = .{ .text = "sjmp", .jump = t } }),
+            // 默认发长跳，布局后由 relaxJumps() 收缩（M2.3）。
+            .br => |t| try items.append(gpa, .{ .line = .{ .text = "ljmp", .jump = t } }),
             .br_ifnz => |x| {
                 // 8051 的 JZ/JNZ 只测 A：先把源搬进 A 再条件跳。
                 const c = try byteText(gpa, x.cond);
@@ -320,7 +321,150 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
     }
     items.shrinkRetainingCapacity(w);
 
+    try relaxJumps(gpa, &items);
+
     return items;
+}
+
+
+/// 指令字节数（M2.3 松弛用）。只覆盖本后端会发出的形态；
+/// 未知指令按 3 字节保守估算（宁可高估，不低估）。
+fn instrBytes(text: []const u8) usize {
+    const t = std.mem.trimStart(u8, text, " \t");
+    if (std.mem.startsWith(u8, t, "sjmp")) return 2;
+    if (std.mem.startsWith(u8, t, "ljmp")) return 3;
+    if (std.mem.startsWith(u8, t, "lcall")) return 3;
+    if (std.mem.startsWith(u8, t, "j")) return 2; // jz/jnz/jc/jnc/jb/jnb
+    if (std.mem.startsWith(u8, t, "ret")) return 1;
+    if (std.mem.startsWith(u8, t, "nop")) return 1;
+    if (std.mem.startsWith(u8, t, "clr")) return 2; // clr a / clr c 实为 1，取保守值
+    if (std.mem.startsWith(u8, t, "movx")) return 1;
+    if (std.mem.startsWith(u8, t, "mov")) {
+        // mov a,#imm / mov a,dir / mov dir,a / mov dir,#imm / mov dir,dir
+        const comma = std.mem.indexOfScalar(u8, t, ',') orelse return 3;
+        const dst = t[4..comma];
+        const src = t[comma + 1 ..];
+        const dst_is_a = std.mem.eql(u8, dst, "a");
+        const src_is_a = std.mem.eql(u8, src, "a");
+        if (src.len > 0 and src[0] == '#') {
+            return if (dst_is_a) 2 else 3;
+        }
+        if (dst_is_a or src_is_a) return 2;
+        if (std.mem.startsWith(u8, src, "dptr")) return 3;
+        return 3;
+    }
+    if (std.mem.startsWith(u8, t, "push") or std.mem.startsWith(u8, t, "pop")) return 2;
+    if (std.mem.startsWith(u8, t, "inc") or std.mem.startsWith(u8, t, "dec")) return 2;
+    if (std.mem.startsWith(u8, t, "add") or std.mem.startsWith(u8, t, "subb")) return 2;
+    if (std.mem.startsWith(u8, t, "xrl") or std.mem.startsWith(u8, t, "anl") or std.mem.startsWith(u8, t, "orl")) return 2;
+    return 3;
+}
+
+/// 条件跳转取反（长距离展开用）。
+fn invertCond(t: []const u8) ?[]const u8 {
+    const pairs = [_][2][]const u8{
+        .{ "jz", "jnz" },  .{ "jnz", "jz" },
+        .{ "jc", "jnc" },  .{ "jnc", "jc" },
+        .{ "jb", "jnb" },  .{ "jnb", "jb" },
+    };
+    for (pairs) |pr| if (std.mem.eql(u8, t, pr[0])) return pr[1];
+    return null;
+}
+
+/// M2.3 跳转松弛：
+///   1) 条件跳转超出 ±128 → 展开成「反条件跳过 + ljmp」（结构变更，重算一轮）；
+///   2) 无条件跳转在 ljmp(3B)/sjmp(2B) 间迭代收敛。
+fn relaxJumps(gpa: std.mem.Allocator, items: *std.ArrayListUnmanaged(Item)) !void {
+    var round: usize = 0;
+    while (round < 16) : (round += 1) {
+        // 1) 算地址
+        var label_off = std.AutoHashMapUnmanaged(u32, usize){};
+        defer label_off.deinit(gpa);
+        var cur: usize = 0;
+        for (items.items) |item| switch (item) {
+            .label => |n| try label_off.put(gpa, n, cur),
+            .line => |l| cur += instrBytes(l.text),
+            .raw => |t| cur += t.len,
+        };
+
+        // 2) 条件跳转越界 → 展开（结构变更）
+        var max_label: u32 = 0;
+        for (items.items) |item| switch (item) {
+            .label => |n| max_label = @max(max_label, n),
+            else => {},
+        };
+        var expanded = false;
+        {
+            var out: std.ArrayListUnmanaged(Item) = .empty;
+            errdefer out.deinit(gpa);
+            var off: usize = 0;
+            for (items.items) |item| switch (item) {
+                .label => |n| {
+                    try out.append(gpa, .{ .label = n });
+                },
+                .raw => |t| {
+                    try out.append(gpa, .{ .raw = t });
+                    off += t.len;
+                },
+                .line => |l| {
+                    const t = std.mem.trimStart(u8, l.text, " \t");
+                    const size = instrBytes(l.text);
+                    var emit_item = true;
+                    if (invertCond(t)) |inv| {
+                        if (l.jump) |target| if (label_off.get(target)) |toff| {
+                            const delta: isize = @as(isize, @intCast(toff)) - @as(isize, @intCast(off + size));
+                            if (delta < -128 or delta > 127) {
+                                max_label += 1;
+                                const skip = max_label;
+                                try out.append(gpa, .{ .line = .{ .text = inv, .jump = skip } });
+                                try out.append(gpa, .{ .line = .{ .text = "ljmp", .jump = target } });
+                                try out.append(gpa, .{ .label = skip });
+                                expanded = true;
+                                emit_item = false;
+                            }
+                        };
+                    }
+                    if (emit_item) try out.append(gpa, .{ .line = l });
+                    off += size;
+                },
+            };
+            if (expanded) {
+                items.deinit(gpa);
+                items.* = out;
+                continue;
+            }
+            out.deinit(gpa);
+        }
+
+        // 3) 无条件跳转收缩/放宽
+        var changed = false;
+        var off: usize = 0;
+        for (items.items) |*item| switch (item.*) {
+            .label => {},
+            .raw => |t| off += t.len,
+            .line => |*l| {
+                const t = std.mem.trimStart(u8, l.text, " \t");
+                const is_s = std.mem.startsWith(u8, t, "sjmp");
+                const is_l = std.mem.startsWith(u8, t, "ljmp");
+                if ((is_s or is_l) and l.jump != null) {
+                    const size: usize = if (is_s) 2 else 3;
+                    if (label_off.get(l.jump.?)) |target| {
+                        const delta: isize = @as(isize, @intCast(target)) - @as(isize, @intCast(off + size));
+                        const fits = delta >= -128 and delta <= 127;
+                        if (fits and is_l) {
+                            l.text = "sjmp";
+                            changed = true;
+                        } else if (!fits and is_s) {
+                            l.text = "ljmp";
+                            changed = true;
+                        }
+                    }
+                }
+                off += instrBytes(l.text);
+            },
+        };
+        if (!changed) break;
+    }
 }
 
 /// 窥孔（条目流上）。`peephole.enabled/diag` 控制开关与统计。
