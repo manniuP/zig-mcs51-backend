@@ -127,16 +127,26 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
         switch (m_op) {
             .imm => |x| {
                 const d = try byteText(gpa, x.dst);
-                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
-                    gpa,
-                    "    mov a,#0x{X:0>2}",
-                    .{x.value},
-                ), .jump = null } });
-                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
-                    gpa,
-                    "    mov {s},a",
-                    .{d},
-                ), .jump = null } });
+                switch (x.dst) {
+                    // 直址立即数一条搞定（mov dir,#imm），比经 A 中转短 1 字节。
+                    .dir => try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                        gpa,
+                        "    mov {s},#0x{X:0>2}",
+                        .{ d, x.value },
+                    ), .jump = null } }),
+                    else => {
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                            gpa,
+                            "    mov a,#0x{X:0>2}",
+                            .{x.value},
+                        ), .jump = null } });
+                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                            gpa,
+                            "    mov {s},a",
+                            .{d},
+                        ), .jump = null } });
+                    },
+                }
             },
             .add => |x| {
                 const l = try byteText(gpa, x.lhs);
@@ -276,6 +286,39 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             },
         }
     }
+
+    // M2.2：删掉「跳到紧邻的下一个标签」——布局期的 fallthrough 优化。
+    // 只处理 sjmp/ljmp 且目标就是下一条 label 的情形（保守，不动其它跳转）。
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < items.items.len) : (r += 1) {
+        const it = items.items[r];
+        var drop = false;
+        switch (it) {
+            .line => |l| {
+                const t = std.mem.trimStart(u8, l.text, " \t");
+                const is_jump = std.mem.startsWith(u8, t, "sjmp") or std.mem.startsWith(u8, t, "ljmp");
+                if (is_jump) {
+                    if (l.jump) |target| {
+                        if (r + 1 < items.items.len) {
+                            switch (items.items[r + 1]) {
+                                .label => |n| if (n == target) {
+                                    drop = true;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        if (!drop) {
+            items.items[w] = it;
+            w += 1;
+        }
+    }
+    items.shrinkRetainingCapacity(w);
 
     return items;
 }

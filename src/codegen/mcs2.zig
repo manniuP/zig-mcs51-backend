@@ -319,8 +319,8 @@ const Lower = struct {
         var d: u16 = 0;
         while (d < 256) : (d += 1) {
             if (!wrote_dir[d]) continue;
-            try self.ops.append(self.gpa, .{ .imm = .{ .dst = tmp, .value = dirs[d] } });
-            try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(d), .src = tmp } });
+            // PE.2：直接写直址（mov dir,#imm），不再经 vreg 中转。
+            try self.ops.append(self.gpa, .{ .imm = .{ .dst = .{ .dir = @intCast(d) }, .value = dirs[d] } });
         }
         try self.ops.append(self.gpa, .{ .ret = {} });
         return true;
