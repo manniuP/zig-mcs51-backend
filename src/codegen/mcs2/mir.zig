@@ -104,6 +104,8 @@ pub const Op = union(enum) {
     br: u32,
     /// dst <- src（8 位搬运；直址到直址合法）。
     mov: struct { dst: Byte, src: Byte },
+    /// 递减并跳转（M2.4 / djnz）：dst -= 1；若结果非零则跳到 target。
+    dec_br_nz: struct { dst: Byte, target: u32 },
     /// 比较 + 条件跳转（融合形态）：cc 成立则跳到 target。
     /// 51 发射为 clr c / mov a / subb / jcc，或 xrl / jz(jnz)。
     cmp_br: struct { lhs: Byte, rhs: Byte, cc: Cc, target: u32 },

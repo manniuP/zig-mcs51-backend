@@ -172,6 +172,213 @@ const Lower = struct {
     /// cond_br：优先把“比较 → 分支”融合成 cmp_br（M2 第一刀）；
     /// 否则按字节测零（br_ifz）。条件为编译期常量时直接发单边。
 
+
+    // ==== M2.4：循环旋转 → djnz ====
+    //
+    // 目标形态：
+    //   label L
+    //   cmp_br(eq, i, 0 -> Lexit)      ; 顶部测试保留
+    //   label Lbody                    ; 新增
+    //     <body，去掉 sub i,#1>
+    //   dec_br_nz(i, Lbody)            ; 替换原来的 br L
+    //   label Lexit
+    // 前置：body 里对 i 只有一处 imm 1 + sub i,i,1；只有一条 br L。
+
+    fn vregOf(b: mcsmir.Byte) ?u8 {
+        return switch (b) {
+            .vreg => |r| r,
+            else => null,
+        };
+    }
+
+    fn refsVreg(op: mcsmir.Op, r: u8) bool {
+        const eq = struct {
+            fn f(x: mcsmir.Byte, rr: u8) bool {
+                return switch (x) {
+                    .vreg => |v| v == rr,
+                    else => false,
+                };
+            }
+        }.f;
+        return switch (op) {
+            .imm => |x| eq(x.dst, r),
+            .add => |x| eq(x.dst, r) or eq(x.lhs, r) or eq(x.rhs, r),
+            .sub => |x| eq(x.dst, r) or eq(x.lhs, r) or eq(x.rhs, r),
+            .dec => |d| d == r,
+            .mov => |x| eq(x.dst, r) or eq(x.src, r),
+            .load_dir => |x| eq(x.dst, r),
+            .store_dir => |x| eq(x.src, r),
+            .store_xdata => |x| eq(x.src, r),
+            .load_xdata => |x| eq(x.dst, r),
+            .br_ifnz => |x| eq(x.cond, r),
+            .br_ifz => |x| eq(x.cond, r),
+            .cmp_br => |x| eq(x.lhs, r) or eq(x.rhs, r),
+            .dec_br_nz => |x| eq(x.dst, r),
+            .push => |x| eq(x.src, r),
+            .pop => |x| eq(x.dst, r),
+            else => false,
+        };
+    }
+
+    /// 从 upto 往前找最近一次写 r 的指令，要求是 imm 0。
+    fn isZeroAt(self: *Lower, r: u8, upto: usize) bool {
+        var i = upto;
+        while (i > 0) {
+            i -= 1;
+            switch (self.ops.items[i]) {
+                .imm => |x| if (vregOf(x.dst)) |d| {
+                    if (d == r) return x.value == 0;
+                },
+                .mov => |x| if (vregOf(x.dst)) |d| {
+                    if (d == r) return false;
+                },
+                .add => |y| if (vregOf(y.dst)) |d| {
+                    if (d == r) return false;
+                },
+                .sub => |y| if (vregOf(y.dst)) |d| {
+                    if (d == r) return false;
+                },
+                .load_dir => |y| if (vregOf(y.dst)) |d| {
+                    if (d == r) return false;
+                },
+                .load_xdata => |y| if (vregOf(y.dst)) |d| {
+                    if (d == r) return false;
+                },
+                .dec => |d| if (d == r) return false,
+                else => {},
+            }
+        }
+        return false;
+    }
+
+    fn rotateDjnz(self: *Lower) codegen.Error!void {
+        var i: usize = 0;
+        while (i + 1 < self.ops.items.len) : (i += 1) {
+            const ops = self.ops.items;
+            const head = switch (ops[i]) {
+                .label => |n| n,
+                else => continue,
+            };
+            // 顶部测试：标签后允许一小段读操作数（如 load i），再遇到 cmp_br。
+            var test_pos: ?usize = null;
+            var k1: usize = i + 1;
+            while (k1 < ops.len and k1 < i + 8) : (k1 += 1) {
+                switch (ops[k1]) {
+                    .cmp_br => {
+                        test_pos = k1;
+                        break;
+                    },
+                    .label, .br, .ret, .halt, .br_ifnz, .br_ifz, .dec_br_nz => break,
+                    else => {},
+                }
+            }
+            const tp = test_pos orelse continue;
+            const cb = ops[tp].cmp_br;
+            if (cb.cc != .eq) continue;
+
+            const lhs_r = vregOf(cb.lhs);
+            const rhs_r = vregOf(cb.rhs);
+            var counter: ?u8 = null;
+            if (lhs_r != null and self.isZeroAt(lhs_r.?, tp)) {
+                if (rhs_r) |r| counter = r;
+            } else if (rhs_r != null and self.isZeroAt(rhs_r.?, tp)) {
+                if (lhs_r) |r| counter = r;
+            }
+            const c0 = counter orelse continue;
+            // 测试用的操作数常是「刚载入的副本」（mov c0, s）——真正被递减的是 s。
+            var c = c0;
+            var pk: usize = i + 1;
+            while (pk < tp) : (pk += 1) {
+                switch (ops[pk]) {
+                    .mov => |x| if (vregOf(x.dst) == @as(?u8, c)) {
+                        if (vregOf(x.src)) |s| c = s;
+                    },
+                    else => {},
+                }
+            }
+
+            // 回边：正文里最后一条「br L 紧跟 label」的 br（就是 repeat）
+            var back_pos: ?usize = null;
+            var kk: usize = i + 2;
+            while (kk + 1 < ops.len) : (kk += 1) {
+                switch (ops[kk]) {
+                    .br => |t| if (t == head) {
+                        switch (ops[kk + 1]) {
+                            .label => back_pos = kk,
+                            else => {},
+                        }
+                    },
+                    else => {},
+                }
+            }
+            const bp = back_pos orelse continue;
+            const ep = bp + 1;
+
+            // body 里必须恰好一处 imm 1 + sub(c,c,1)，且没有别的 c 引用
+            var sub_pos: ?usize = null;
+            var imm_pos: ?usize = null;
+            var bad = false;
+            var k2 = tp + 1;
+            while (k2 < bp) : (k2 += 1) {
+                const op = ops[k2];
+                const is_sub = switch (op) {
+                    .sub => |x| vregOf(x.dst) == @as(?u8, c) and vregOf(x.lhs) == @as(?u8, c) and switch (x.rhs) {
+                        .vreg => true,
+                        else => false,
+                    },
+                    else => false,
+                };
+                if (is_sub) {
+                    if (sub_pos != null) {
+                        bad = true;
+                        break;
+                    }
+                    const x = op.sub;
+                    const rk = vregOf(x.rhs).?;
+                    if (k2 == 0) {
+                        bad = true;
+                        break;
+                    }
+                    const is_one = switch (ops[k2 - 1]) {
+                        .imm => |y| vregOf(y.dst) == @as(?u8, rk) and y.value == 1,
+                        else => false,
+                    };
+                    if (!is_one) {
+                        bad = true;
+                        break;
+                    }
+                    sub_pos = k2;
+                    imm_pos = k2 - 1;
+                    continue;
+                }
+                if (refsVreg(op, c)) {
+                    bad = true;
+                    break;
+                }
+            }
+            if (bad or sub_pos == null) continue;
+
+            const sp = sub_pos.?;
+            const ip = imm_pos.?;
+
+            // 组装新序列
+            const body_lbl = self.tempLabel();
+            var out: std.ArrayListUnmanaged(mcsmir.Op) = .empty;
+            errdefer out.deinit(self.gpa);
+            try out.appendSlice(self.gpa, ops[0 .. tp + 1]);
+            try out.append(self.gpa, .{ .label = body_lbl });
+            for (ops[tp + 1 .. bp], tp + 1..) |op, k| {
+                if (k == sp or k == ip) continue;
+                try out.append(self.gpa, op);
+            }
+            try out.append(self.gpa, .{ .dec_br_nz = .{ .dst = .{ .vreg = c }, .target = body_lbl } });
+            try out.appendSlice(self.gpa, ops[bp + 1 ..]);
+            self.ops.deinit(self.gpa);
+            self.ops = out;
+            i = ep;
+        }
+    }
+
     // ==== 部分求值（切片 A）====
     //
     // 条件：无参数、无 SFR/xdata 读、无栈操作、步数有界、能走到 ret。
@@ -296,6 +503,12 @@ const Lower = struct {
                     const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
                     const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
                     pc = if (foldCc(x.cc, a, b)) (self.findLabel(x.target) orelse return false) else pc + 1;
+                },
+                .dec_br_nz => |x| {
+                    const v = foldGet(x.dst, &regs, &dirs) orelse return false;
+                    const nv = v -% 1;
+                    if (!foldSet(x.dst, nv, &regs, &dirs)) return false;
+                    pc = if (nv != 0) (self.findLabel(x.target) orelse return false) else pc + 1;
                 },
                 .ret => {
                     folded = true;
@@ -679,6 +892,9 @@ pub fn generate(
     }
 
     _ = try lw.emitBody(body);
+
+    // M2.4：循环旋转（top-test + 底部递减 → djnz）。
+    try lw.rotateDjnz();
 
     // 部分求值（切片 A）：无参 + 纯内部计算 → 编译期算完，只留常量写回。
     if (!is_isr and lw.arg_cursor == 0) {

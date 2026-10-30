@@ -113,6 +113,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .mov => |x| .{ .mov = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
             .br_ifnz => |x| .{ .br_ifnz = .{ .cond = byteOf(x.cond, f.vreg_base), .target = x.target } },
             .br_ifz => |x| .{ .br_ifz = .{ .cond = byteOf(x.cond, f.vreg_base), .target = x.target } },
+            .dec_br_nz => |x| .{ .dec_br_nz = .{ .dst = byteOf(x.dst, f.vreg_base), .target = x.target } },
             .cmp_br => |x| .{ .cmp_br = .{
                 .lhs = byteOf(x.lhs, f.vreg_base),
                 .rhs = byteOf(x.rhs, f.vreg_base),
@@ -279,6 +280,14 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     },
                 }
             },
+            .dec_br_nz => |x| {
+                const d = try byteText(gpa, x.dst);
+                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                    gpa,
+                    "    djnz {s}",
+                    .{d},
+                ), .jump = x.target } });
+            },
             .ret => try items.append(gpa, .{ .line = .{ .text = "    ret", .jump = null } }),
             .halt => {
                 // `sjmp .`：跳转到自身死循环。目标不是局部标签（jump=null），
@@ -354,6 +363,7 @@ fn instrBytes(text: []const u8) usize {
         return 3;
     }
     if (std.mem.startsWith(u8, t, "push") or std.mem.startsWith(u8, t, "pop")) return 2;
+    if (std.mem.startsWith(u8, t, "djnz")) return 3;
     if (std.mem.startsWith(u8, t, "inc") or std.mem.startsWith(u8, t, "dec")) return 2;
     if (std.mem.startsWith(u8, t, "add") or std.mem.startsWith(u8, t, "subb")) return 2;
     if (std.mem.startsWith(u8, t, "xrl") or std.mem.startsWith(u8, t, "anl") or std.mem.startsWith(u8, t, "orl")) return 2;
