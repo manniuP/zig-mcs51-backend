@@ -298,6 +298,28 @@ CASES: dict[str, dict] = {
     "u32carry": dict(kind="call", src="multi.zig", fn="u32carry", args=[("DPL", 1)], want32=0x00010000),
     "u16shl":   dict(kind="call", src="multi.zig", fn="u16shl", args=[("DPL", 0)], want16=0x0100),
     "u16shr":   dict(kind="call", src="multi.zig", fn="u16shr", args=[("DPL", 0)], want16=0x0080),
+    # 有符号（i8/i16/i32）与多字节比较/位运算：符号扩展 + 算术右移 + 有符号比较
+    "sexcmp":   dict(kind="call", src="signed.zig", fn="sexcmp", args=[("DPL", 0xFB)], want=1),
+    "sexcmp2":  dict(kind="call", src="signed.zig", fn="sexcmp", args=[("DPL", 0x05)], want=0),
+    "sex16":    dict(kind="call", src="signed.zig", fn="sex16",
+                     args=[("DPL", 0x00), ("DPH", 0x80)], want32=0xFFFF8000),
+    "i32add":   dict(kind="call", src="wide.zig", fn="i32add",
+                     args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x80),
+                           ("PARM_2", 0xFF), ("PARM_3", 0xFF), ("PARM_4", 0xFF), ("PARM_5", 0xFF)],
+                     want32=0x7FFFFFFF),
+    "sar32":    dict(kind="call", src="sar.zig", fn="sar32",
+                     args=[("DPL", 0xF0), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF)],
+                     want32=0xFFFFFFFE),
+    "sar8":     dict(kind="call", src="sar.zig", fn="sar8", args=[("DPL", 0xF0)], want=0xFC),
+    "ucmp_eq":  dict(kind="call", src="wide.zig", fn="ucmp32",
+                     args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x01), ("ACC", 0x00)], want=2),
+    "ucmp_gt":  dict(kind="call", src="wide.zig", fn="ucmp32",
+                     args=[("DPL", 0xFF), ("DPH", 0xFF), ("B", 0x00), ("ACC", 0x00)], want=1),
+    "ucmp_lt":  dict(kind="call", src="wide.zig", fn="ucmp32",
+                     args=[("DPL", 0x01), ("DPH", 0x00), ("B", 0x01), ("ACC", 0x00)], want=3),
+    "wbits":    dict(kind="call", src="wide.zig", fn="wbits",
+                     args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
+                     want32=0xEDFFA90F),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -306,7 +328,9 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "interrupt", "memrt", "bitfn", "xor2", "ne5", "ne_imm", "bitpoll", "bitclear",
          "shl2", "shr3", "setbit", "clrbit",
          "mul8", "div8", "rem8", "not8", "xnor8",
-         "u16add", "u16sub", "u16carry", "u16shl", "u16shr", "u32add", "u32carry", "ringdemo"]
+         "u16add", "u16sub", "u16carry", "u16shl", "u16shr", "u32add", "u32carry",
+         "sexcmp", "sexcmp2", "sex16", "i32add", "sar32", "sar8",
+         "ucmp_eq", "ucmp_gt", "ucmp_lt", "wbits", "ringdemo"]
 
 
 def check_selftest() -> bool:

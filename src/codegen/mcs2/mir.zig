@@ -56,6 +56,20 @@ pub const abi = struct {
     pub const max_arg_bytes = arg_regs.len;
 };
 
+/// 多字节比较 + 条件跳转的载荷（见 `Op.cmp_wide_br`）。
+pub const CmpWide = struct {
+    /// 左右操作数的槽基址（低字节在前，连续 n 个槽）。
+    lhs: u8,
+    rhs: u8,
+    n: u8,
+    /// 比较用的临时字节（符号扩展或等值异或的累加器）。
+    tmp: Byte,
+    cc: Cc,
+    /// true = 有符号比较（翻转最高字节符号位，把有符号序映射成无符号序）。
+    signed: bool,
+    target: u32,
+};
+
 /// 比较条件码（8 位无符号语义）。
 pub const Cc = enum {
     lt,
@@ -107,8 +121,14 @@ pub const Op = union(enum) {
     not_: struct { dst: Byte, src: Byte },
     /// dst = lhs << n（8 位；n 必须是编译期常量）。发射：`mov a,lhs; clr c; rlc a` ×n。
     shl: struct { dst: Byte, lhs: Byte, n: u8 },
-    /// dst = lhs >> n（逻辑右移）。发射：`mov a,lhs; clr c; rrc a` ×n。
-    shr: struct { dst: Byte, lhs: Byte, n: u8 },
+    /// dst = lhs >> n（右移；arith=true 时算术右移，填符号位）。
+    /// 8 位逻辑右移发射：`mov a,lhs; clr c; rrc a` ×n。
+    shr: struct { dst: Byte, lhs: Byte, n: u8, arith: bool = false },
+    /// dst = 0x00 / 0xFF（按 src 的符号位）。有符号放大的符号扩展用：
+    /// 发射为 `mov a,src; rlc a`（C=位7）+ `subb a,acc`（A = 0-C）。
+    sex: struct { dst: Byte, src: Byte },
+    /// 多字节比较 + 条件跳转：cc(lhs, rhs) 成立则跳到 target。
+    cmp_wide_br: CmpWide,
     /// 带进位左环移（不清 C）：多字节左移的逐字节模板。
     rlc: struct { dst: Byte, src: Byte },
     /// 带进位右环移（不清 C）：多字节右移的逐字节模板。

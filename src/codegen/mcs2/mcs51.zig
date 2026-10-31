@@ -170,7 +170,8 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .push => |x| if (touchesDplDph(x.src)) null else prev,
         .pop => |x| if (touchesDplDph(x.dst)) null else prev,
         .dec => prev,
-        .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .ret, .reti, .halt => null,
+        .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .ret, .reti, .halt,
+        .sex, .cmp_wide_br => null,
     };
 }
 
@@ -277,7 +278,17 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .rlc => |x| .{ .rlc = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
             .rrc => |x| .{ .rrc = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
             .shl => |x| .{ .shl = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
-            .shr => |x| .{ .shr = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
+            .shr => |x| .{ .shr = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n, .arith = x.arith } },
+            .sex => |x| .{ .sex = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
+            .cmp_wide_br => |x| .{ .cmp_wide_br = .{
+                .lhs = f.vreg_base + x.lhs,
+                .rhs = f.vreg_base + x.rhs,
+                .n = x.n,
+                .tmp = byteOf(x.tmp, f.vreg_base),
+                .cc = x.cc,
+                .signed = x.signed,
+                .target = x.target,
+            } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .label, .br, .ret, .reti, .halt, .bit_br, .clr_c => op,
@@ -723,6 +734,17 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     },
                 }
             },
+            .sex => |x| {
+                const s = try byteText(gpa, x.src);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
+                    .{ .line = .{ .text = "    rlc a", .jump = null } },
+                    .{ .line = .{ .text = "    subb a,0xE0", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .cmp_wide_br => |x| try emitCmpWide(gpa, &items, x),
             .dec_br_nz => |x| {
                 const d = try byteText(gpa, x.dst);
                 try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
@@ -748,6 +770,87 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
     return items;
 }
 
+
+
+/// 多字节比较 + 条件跳转的展开（`Op.cmp_wide_br`）。
+///
+/// 只用两种原语：**严格小于**（借位链 + `jc`）和**相等**（逐字节异或后归零）。
+/// `gt`/`le` 交换操作数复用前两种；有符号比较把最高字节的符号位翻掉
+/// ——`x^0x80` 是单调双射，把有符号序映射成无符号序，低位借位链完全不受影响，
+/// 所以同一套链式 subb 既做无符号也做有符号，只差最高字节的两次 xrl。
+fn emitCmpWide(
+    gpa: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(Item),
+    x: mir.CmpWide,
+) !void {
+    const add = struct {
+        fn f(
+            g: std.mem.Allocator,
+            it: *std.ArrayListUnmanaged(Item),
+            comptime fmt: []const u8,
+            args: anytype,
+            target: ?u32,
+        ) !void {
+            try it.append(g, .{ .line = .{
+                .text = try std.fmt.allocPrint(g, fmt, args),
+                .jump = target,
+            } });
+        }
+    }.f;
+    const n = x.n;
+    const tmp_t = try byteText(gpa, x.tmp);
+    switch (x.cc) {
+        .lt, .ge, .gt, .le => {
+            // gt/le = 交换操作数后的 lt/ge（借位即 a>b 的否定）。
+            const swap = x.cc == .gt or x.cc == .le;
+            const abase: u8 = if (swap) x.rhs else x.lhs;
+            const bbase: u8 = if (swap) x.lhs else x.rhs;
+            // 先清借位：多字节 subb 链的入口。mov a,.. 与 xrl a,#imm 都不改 C。
+            try add(gpa, items, "    clr c", .{}, null);
+            var k: u8 = 0;
+            while (k < n) : (k += 1) {
+                const a: u8 = abase +% k;
+                const b: u8 = bbase +% k;
+                if (x.signed and k + 1 == n) {
+                    // 最高字节：两边都翻符号位再相减（借位出即「有符号 a<b」）。
+                    // 顺序与链保持一致：A 放被减数 a^0x80，tmp 放减数 b^0x80。
+                    try add(gpa, items, "    mov a,_mcs_v{d}", .{b}, null);
+                    try add(gpa, items, "    xrl a,#0x80", .{}, null);
+                    try add(gpa, items, "    mov {s},a", .{tmp_t}, null);
+                    try add(gpa, items, "    mov a,_mcs_v{d}", .{a}, null);
+                    try add(gpa, items, "    xrl a,#0x80", .{}, null);
+                    try add(gpa, items, "    subb a,{s}", .{tmp_t}, null);
+                } else {
+                    try add(gpa, items, "    mov a,_mcs_v{d}", .{a}, null);
+                    try add(gpa, items, "    subb a,_mcs_v{d}", .{b}, null);
+                }
+            }
+            if (x.cc == .lt or x.cc == .gt) {
+                try add(gpa, items, "    jc", .{}, x.target);
+            } else {
+                try add(gpa, items, "    jnc", .{}, x.target);
+            }
+        },
+        .eq, .ne => {
+            // 相等 = 所有字节异或为 0：逐字节 xrl 累加进 tmp。
+            var k: u8 = 0;
+            while (k < n) : (k += 1) {
+                try add(gpa, items, "    mov a,_mcs_v{d}", .{x.lhs +% k}, null);
+                try add(gpa, items, "    xrl a,_mcs_v{d}", .{x.rhs +% k}, null);
+                if (k + 1 < n) {
+                    if (k > 0) try add(gpa, items, "    orl a,{s}", .{tmp_t}, null);
+                    try add(gpa, items, "    mov {s},a", .{tmp_t}, null);
+                }
+            }
+            if (n > 1) try add(gpa, items, "    mov a,{s}", .{tmp_t}, null);
+            if (x.cc == .eq) {
+                try add(gpa, items, "    jz", .{}, x.target);
+            } else {
+                try add(gpa, items, "    jnz", .{}, x.target);
+            }
+        },
+    }
+}
 
 /// SFR 的位地址：只有 8 字节对齐的 SFR 可位寻址，位地址 = SFR 地址 + 位号。
 fn sfrBitAddr(addr: u8, mask: u8) ?u8 {
