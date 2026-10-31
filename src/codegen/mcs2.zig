@@ -62,6 +62,12 @@ var no_isr_save: bool = false;
 /// 一个 8 位值的位置（M1：全部经 direct 寻址可达）。
 const Loc = mcsmir.Byte;
 
+/// 指针值：固定地址（`@ptrFromInt` 常量），或「常量基址 + 运行期下标」。
+const PtrRef = union(enum) {
+    fixed: u64,
+    elem: struct { base: u64, idx: Loc },
+};
+
 /// M1 的线性降级器。不做活跃分析：`.arg` 原地用 ABI 寄存器（零序言），
 /// 双目结果默认落新 vreg，唯一的单消费者优化是「ret 前看一眼」——
 /// 结果直接写 DPL，省一次 vreg 往返（`add8` 预算内的关键一招）。
@@ -76,12 +82,16 @@ const Lower = struct {
     nregs: u8 = 0,
     arg_cursor: usize = 0,
     vals: []?Loc = &.{},
+    ptr_vals: []?PtrRef = &.{},
     parms: std.ArrayListUnmanaged([]const u8) = .empty,
     is_isr: bool = false,
     ret_byte: ?u8, // u8 返回的 ABI 地址；void 时为 null
     saw_ret: bool = false,
     /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
     label_base: u32 = 0,
+    /// 本模块是否用到 dptr（取址/解引用）。用到时 arg0（DPL）必须先搬进 vreg：
+    /// 0x82 同时是 DPTR 低字节，地址计算会把它踩掉。
+    needs_dptr: bool = false,
 
     /// 固定地址解引用：interned ptr（base=.int）→ 字节地址；非固定地址 → null。
     fn constPtrAddr(self: *Lower, ref: Air.Inst.Ref) ?u64 {
@@ -95,6 +105,54 @@ const Lower = struct {
             .int => return ptr.byte_offset,
             else => return null,
         }
+    }
+
+    /// 指针引用：固定地址，或已记录下来的「基址 + 运行期下标」。
+    fn ptrRefOf(self: *Lower, ref: Air.Inst.Ref) ?PtrRef {
+        if (self.constPtrAddr(ref)) |addr| return .{ .fixed = addr };
+        const idx = ref.toIndex() orelse return null;
+        return self.ptr_vals[@backingInt(idx)];
+    }
+
+    /// 整个编译单元是否出现会写 DPTR 的指令（保守：多算几个函数只多花 3 字节）。
+    fn airNeedsDptr(self: *Lower) bool {
+        const tags = self.air.instructions.items(.tag);
+        const datas = self.air.instructions.items(.data);
+        for (tags, 0..) |t, i| switch (t) {
+            .ptr_elem_ptr, .ptr_elem_val => return true,
+            .load => if (self.constPtrAddr(datas[i].ty_op.operand) != null) return true,
+            .store => if (self.constPtrAddr(datas[i].bin_op.lhs) != null) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// 编译期 u8 常量（用于把常量下标折进固定地址）。
+    fn constU8(self: *Lower, ref: Air.Inst.Ref) ?u8 {
+        const ip_index = ref.toInterned() orelse return null;
+        const key = self.zcu.intern_pool.indexToKey(ip_index);
+        return switch (key) {
+            .int => |int| switch (int.storage) {
+                .u64 => |v| if (v <= 0xFF) @as(u8, @intCast(v)) else null,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// 跳过调试指令，找下一条真正参与代码生成的指令下标。
+    /// P1 的「紧邻」判断必须用它：Zig 常在 load 与 add 之间插 dbg_*。
+    fn nextRealIdx(self: *Lower, body: []const Air.Inst.Index, idx: usize) ?usize {
+        const tags = self.air.instructions.items(.tag);
+        var j = idx + 1;
+        while (j < body.len) : (j += 1) {
+            switch (tags[@backingInt(body[j])]) {
+                .dbg_stmt, .dbg_empty_stmt, .dbg_inline_block,
+                .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => {},
+                else => return j,
+            }
+        }
+        return null;
     }
 
     fn fail(self: *Lower, comptime fmt: []const u8, args: anytype) codegen.Error {
@@ -293,6 +351,135 @@ const Lower = struct {
             }
         }
         return false;
+    }
+
+    // ==== M2.12：相邻拷贝折叠 ====
+    //
+    // `mov vd,vs` 后紧跟唯一一次读 vd 的指令 → 把该操作数换成 vs，删掉 mov。
+    // 只看紧邻、不跨标签/跳转，所以不需要活跃期分析；读次数 == 1 保证删掉 mov 不丢值。
+
+    fn isVregByte(b: mcsmir.Byte, r: u8) bool {
+        return switch (b) {
+            .vreg => |v| v == r,
+            else => false,
+        };
+    }
+
+    fn readsVreg(op: mcsmir.Op, r: u8) bool {
+        return switch (op) {
+            .add => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .sub => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .and_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .or_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .xor_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .mov => |x| isVregByte(x.src, r),
+            .cmp_br => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .br_ifnz => |x| isVregByte(x.cond, r),
+            .br_ifz => |x| isVregByte(x.cond, r),
+            .push => |x| isVregByte(x.src, r),
+            .store_dir => |x| isVregByte(x.src, r),
+            .store_xdata => |x| isVregByte(x.src, r),
+            .dec_br_nz => |x| isVregByte(x.dst, r),
+            .load_xdata_idx => |x| isVregByte(x.idx, r),
+            .store_xdata_idx => |x| isVregByte(x.idx, r) or isVregByte(x.src, r),
+            else => false,
+        };
+    }
+
+    fn readCountVreg(ops: []const mcsmir.Op, r: u8) usize {
+        var n: usize = 0;
+        for (ops) |op| if (readsVreg(op, r)) {
+            n += 1;
+        };
+        return n;
+    }
+
+    /// 把 op 里读 from 的操作数换成 to；无法替换（或属于写操作数）返回 null。
+    fn substReadVreg(op: mcsmir.Op, from: u8, to: mcsmir.Byte) ?mcsmir.Op {
+        return switch (op) {
+            .mov => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .mov = .{ .dst = x.dst, .src = to } } else null,
+            .add => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .add = y };
+            },
+            .sub => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .sub = y };
+            },
+            .and_ => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .and_ = y };
+            },
+            .or_ => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .or_ = y };
+            },
+            .xor_ => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .xor_ = y };
+            },
+            .cmp_br => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .cmp_br = y };
+            },
+            .br_ifnz => |x| if (isVregByte(x.cond, from)) mcsmir.Op{ .br_ifnz = .{ .cond = to, .target = x.target } } else null,
+            .br_ifz => |x| if (isVregByte(x.cond, from)) mcsmir.Op{ .br_ifz = .{ .cond = to, .target = x.target } } else null,
+            .push => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .push = .{ .src = to } } else null,
+            .store_dir => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .store_dir = .{ .addr = x.addr, .src = to } } else null,
+            .store_xdata => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .store_xdata = .{ .addr = x.addr, .src = to } } else null,
+            .load_xdata_idx => |x| if (isVregByte(x.idx, from)) mcsmir.Op{ .load_xdata_idx = .{ .dst = x.dst, .base = x.base, .idx = to } } else null,
+            .store_xdata_idx => |x| blk: {
+                if (isVregByte(x.idx, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = to, .src = x.src } };
+                if (isVregByte(x.src, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = x.idx, .src = to } };
+                break :blk null;
+            },
+            else => null,
+        };
+    }
+
+    /// 相邻拷贝折叠：`mov vd,vs` + 紧邻的唯一读 vd → 删掉 mov。
+    fn foldCopies(self: *Lower) void {
+        var i: usize = 0;
+        while (i + 1 < self.ops.items.len) {
+            const m = switch (self.ops.items[i]) {
+                .mov => |x| x,
+                else => {
+                    i += 1;
+                    continue;
+                },
+            };
+            const d = switch (m.dst) {
+                .vreg => |v| v,
+                else => {
+                    i += 1;
+                    continue;
+                },
+            };
+            const nxt = self.ops.items[i + 1];
+            const boundary = switch (nxt) {
+                .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .ret, .reti, .halt => true,
+                else => false,
+            };
+            if (boundary or !readsVreg(nxt, d) or readCountVreg(self.ops.items, d) != 1) {
+                i += 1;
+                continue;
+            }
+            const replaced = substReadVreg(nxt, d, m.src) orelse {
+                i += 1;
+                continue;
+            };
+            self.ops.items[i + 1] = replaced;
+            var k = i;
+            while (k + 1 < self.ops.items.len) : (k += 1) self.ops.items[k] = self.ops.items[k + 1];
+            self.ops.items.len -= 1;
+            if (i > 0) i -= 1;
+        }
     }
 
     fn rotateDjnz(self: *Lower) codegen.Error!void {
@@ -494,6 +681,7 @@ const Lower = struct {
             // 硬件访问一律不折：SFR/xdata 的读写带时序与副作用，折了会丢时序。
             // 唯一例外是 DPL(0x82)——那是 u8 返回值的 ABI 出口，不是硬件副作用。
             .load_dir, .load_xdata, .store_xdata,
+            .load_xdata_idx, .store_xdata_idx,
             .push, .pop, .reti, .halt => return false,
             .store_dir => |x| if (x.addr != 0x82) return false,
             else => {},
@@ -539,6 +727,24 @@ const Lower = struct {
                 },
                 .dec => |r| {
                     regs[r] -%= 1;
+                    pc += 1;
+                },
+                .and_ => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, a & b, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .or_ => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, a | b, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .xor_ => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, a ^ b, &regs, &dirs)) return false;
                     pc += 1;
                 },
                 .store_dir => |x| {
@@ -705,7 +911,17 @@ const Lower = struct {
                 }
                 // ADR-001 边界 ABI：arg0 → DPL；arg1+ → 静态 `_名_PARM_n`（SDCC 同款）。
                 if (self.arg_cursor == 0) {
-                    self.vals[@backingInt(inst)] = .{ .dir = mcsmir.abi.arg_regs[0] };
+                    if (self.needs_dptr) {
+                        // DPL 会被地址计算覆盖：先落到 vreg（3 字节，换正确性）。
+                        const r0 = try self.allocVreg();
+                        try self.ops.append(self.gpa, .{ .mov = .{
+                            .dst = mcsmir.v(r0),
+                            .src = .{ .dir = mcsmir.abi.arg_regs[0] },
+                        } });
+                        self.vals[@backingInt(inst)] = mcsmir.v(r0);
+                    } else {
+                        self.vals[@backingInt(inst)] = .{ .dir = mcsmir.abi.arg_regs[0] };
+                    }
                 } else {
                     const psym = try std.fmt.allocPrint(
                         self.gpa,
@@ -716,6 +932,25 @@ const Lower = struct {
                     self.vals[@backingInt(inst)] = .{ .sym = psym };
                 }
                 self.arg_cursor += 1;
+            },
+
+            .ptr_elem_ptr => {
+                // 运行期下标：基址必须是固定地址（@ptrFromInt；全局符号待 M2.5 后补）。
+                const bin = self.air.extraData(Air.Bin, @intCast(data.ty_pl.payload)).data;
+                const pr = self.ptrRefOf(bin.lhs) orelse
+                    return self.fail("指针下标的基址必须是固定地址（暂不支持运行期指针）", .{});
+                switch (pr) {
+                    .fixed => |base| {
+                        // 常量下标直接折进固定地址，保持原有常量地址路径。
+                        if (self.constU8(bin.rhs)) |k| {
+                            self.ptr_vals[@backingInt(inst)] = .{ .fixed = base + k };
+                            continue;
+                        }
+                        const idx_loc = try self.refLoc(bin.rhs);
+                        self.ptr_vals[@backingInt(inst)] = .{ .elem = .{ .base = base, .idx = idx_loc } };
+                    },
+                    .elem => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
+                }
             },
 
             .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap => {
@@ -743,17 +978,18 @@ const Lower = struct {
                     mcsmir.v(try self.allocVreg());
 
                 // P1：结果紧接着写回某个本地槽 → 直接写那个槽，store 整条省掉。
-                if (!consumed_by_ret and idx + 1 < body.len) {
-                    const nxt = body[idx + 1];
-                    const ntag = self.air.instructions.items(.tag)[@backingInt(nxt)];
-                    if (ntag == .store or ntag == .store_safe) {
-                        const nd = self.air.instructions.items(.data)[@backingInt(nxt)].bin_op;
-                        const rhs_is_me = if (nd.rhs.toIndex()) |x| @backingInt(x) == @backingInt(inst) else false;
-                        if (rhs_is_me and self.constPtrAddr(nd.lhs) == null) {
-                            if (nd.lhs.toIndex()) |pi| {
-                                if (self.vals[@backingInt(pi)]) |slot| {
-                                    dst = slot;
-                                    skip_idx = idx + 1;
+                if (!consumed_by_ret) {
+                    if (self.nextRealIdx(body, idx)) |nxt| {
+                        const ntag = self.air.instructions.items(.tag)[@backingInt(body[nxt])];
+                        if (ntag == .store or ntag == .store_safe) {
+                            const nd = self.air.instructions.items(.data)[@backingInt(body[nxt])].bin_op;
+                            const rhs_is_me = if (nd.rhs.toIndex()) |x| @backingInt(x) == @backingInt(inst) else false;
+                            if (rhs_is_me and self.constPtrAddr(nd.lhs) == null) {
+                                if (nd.lhs.toIndex()) |pi| {
+                                    if (self.vals[@backingInt(pi)]) |slot| {
+                                        dst = slot;
+                                        skip_idx = nxt;
+                                    }
                                 }
                             }
                         }
@@ -770,6 +1006,36 @@ const Lower = struct {
                 self.vals[@backingInt(inst)] = dst;
             },
 
+            .bit_and, .bit_or, .xor => {
+                const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                if (!self.typeIsU8(ty)) return self.fail("位运算只支持 u8（暂不实现其它宽度）", .{});
+                const bin = data.bin_op;
+                const lhs = try self.refLoc(bin.lhs);
+                const rhs = try self.refLoc(bin.rhs);
+                const d = mcsmir.v(try self.allocVreg());
+                try self.ops.append(self.gpa, switch (tag) {
+                    .bit_and => .{ .and_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
+                    .bit_or => .{ .or_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
+                    else => .{ .xor_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
+                });
+                self.vals[@backingInt(inst)] = d;
+            },
+
+            // 整数转换：≤16 位一律透传（本后端只跟踪 8 位值；下标被当作 u8 使用）。
+            // 目的：让 `buf[i]`（i: u8 → usize 下标）不再被拒绝。
+            .int_cast, .int_cast_safe, .trunc => {
+                const ty_op = data.ty_op;
+                const src_ty = self.air.typeOf(ty_op.operand, &self.zcu.intern_pool);
+                const dst_ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                // 只跟踪 8 位：放宽（源 ≤8 位）与截断（目标 ≤8 位）都不改低字节，
+                // 可以原样透传；两侧都更宽时语义不可丢失，直接拒绝。
+                const src_bits = src_ty.bitSize(self.zcu);
+                const dst_bits = dst_ty.bitSize(self.zcu);
+                if (src_bits > 8 and dst_bits > 8)
+                    return self.fail("整数转换两侧都超过 8 位（M1 只跟踪低字节）", .{});
+                self.vals[@backingInt(inst)] = try self.refLoc(ty_op.operand);
+            },
+
             .alloc => {
                 // M1：每个局部槽一个 vreg（DSEG 直址）；活跃期优化留给后续 pass。
                 const r = try self.allocVreg();
@@ -780,13 +1046,26 @@ const Lower = struct {
                 // bin_op：lhs = 目标，rhs = 值。
                 // 目标为固定地址指针（@ptrFromInt）：≤0xFF → SFR/直址；>0xFF → xdata。
                 const bin = data.bin_op;
-                if (self.constPtrAddr(bin.lhs)) |addr| {
+                if (self.ptrRefOf(bin.lhs)) |pr| {
                     const value = try self.refLoc(bin.rhs);
-                    if (addr <= 0xFF) {
-                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(addr), .src = value } });
-                    } else if (addr <= 0xFFFF) {
-                        try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = @intCast(addr), .src = value } });
-                    } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
+                    switch (pr) {
+                        .fixed => |addr| {
+                            if (addr <= 0xFF) {
+                                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(addr), .src = value } });
+                            } else if (addr <= 0xFFFF) {
+                                try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = @intCast(addr), .src = value } });
+                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
+                        },
+                        .elem => |e| {
+                            if (e.base > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{e.base});
+                            if (e.base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
+                            try self.ops.append(self.gpa, .{ .store_xdata_idx = .{
+                                .base = @intCast(e.base),
+                                .idx = e.idx,
+                                .src = value,
+                            } });
+                        },
+                    }
                     continue;
                 }
                 const dest = try self.refLoc(bin.lhs);
@@ -795,32 +1074,79 @@ const Lower = struct {
                 // store 本身无结果值
             },
 
+            // `buf[i]` 的读取形态：AIR 把「取元素指针 + 解引用」折成 ptr_elem_val。
+            .ptr_elem_val => {
+                const bin = data.bin_op;
+                const pr = self.ptrRefOf(bin.lhs) orelse
+                    return self.fail("元素读取的基址必须是固定地址（暂不支持运行期指针）", .{});
+                const r = try self.allocVreg();
+                switch (pr) {
+                    .fixed => |base| {
+                        if (self.constU8(bin.rhs)) |k| {
+                            const addr = base + k;
+                            if (addr <= 0xFF) {
+                                try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
+                            } else if (addr <= 0xFFFF) {
+                                try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
+                            } else return self.fail("地址 0x{X} 超出 51 可寻址范围", .{addr});
+                        } else {
+                            if (base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
+                            if (base > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{base});
+                            const idx_loc = try self.refLoc(bin.rhs);
+                            try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
+                                .dst = mcsmir.v(r),
+                                .base = @intCast(base),
+                                .idx = idx_loc,
+                            } });
+                        }
+                    },
+                    .elem => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
+                }
+                self.vals[@backingInt(inst)] = mcsmir.v(r);
+            },
+
             .load => {
                 // ty_op：operand = 指针。固定地址 → load_dir（≤0xFF）/ load_xdata（>0xFF）；
                 // 本地槽 → 直读。
                 const ty_op = data.ty_op;
-                if (self.constPtrAddr(ty_op.operand)) |addr| {
+                if (self.ptrRefOf(ty_op.operand)) |pr| {
                     const r = try self.allocVreg();
-                    if (addr <= 0xFF) {
-                        try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                    } else if (addr <= 0xFFFF) {
-                        try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                    } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
+                    switch (pr) {
+                        .fixed => |addr| {
+                            if (addr <= 0xFF) {
+                                try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
+                            } else if (addr <= 0xFFFF) {
+                                try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
+                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
+                        },
+                        .elem => |e| {
+                            if (e.base > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{e.base});
+                            if (e.base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
+                            try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
+                                .dst = mcsmir.v(r),
+                                .base = @intCast(e.base),
+                                .idx = e.idx,
+                            } });
+                        },
+                    }
                     self.vals[@backingInt(inst)] = mcsmir.v(r);
                     continue;
                 }
                 const src = try self.refLoc(ty_op.operand);
                 // P1：值只被紧接的一条指令消费 → 直接把槽位置当值，省掉一次 mov。
-                if (idx + 1 < body.len and self.useCount(body, inst, idx) == 1) {
-                    const ntag = self.air.instructions.items(.tag)[@backingInt(body[idx + 1])];
-                    const consumes = switch (ntag) {
-                        .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap, .store, .store_safe => true,
-                        .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq => true,
-                        else => false,
-                    };
-                    if (consumes) {
-                        self.vals[@backingInt(inst)] = src;
-                        continue;
+                if (self.useCount(body, inst, idx) == 1) {
+                    if (self.nextRealIdx(body, idx)) |ni| {
+                        const ntag = self.air.instructions.items(.tag)[@backingInt(body[ni])];
+                        const consumes = switch (ntag) {
+                            .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap, .store, .store_safe => true,
+                            .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq => true,
+                            .bit_and, .bit_or, .xor => true,
+                            else => false,
+                        };
+                        if (consumes) {
+                            self.vals[@backingInt(inst)] = src;
+                            continue;
+                        }
                     }
                 }
                 const r = try self.allocVreg();
@@ -998,6 +1324,12 @@ pub fn generate(
     defer gpa.free(lw.vals);
     @memset(lw.vals, null);
 
+    lw.ptr_vals = try gpa.alloc(?PtrRef, air.instructions.len);
+    defer gpa.free(lw.ptr_vals);
+    @memset(lw.ptr_vals, null);
+
+    lw.needs_dptr = lw.airNeedsDptr();
+
     if (is_isr and !no_isr_save) {
         // 现场保存：A/PSW/DPTR（M1 指令集用到的全部硬件寄存器；B 未用）。
         // 注意顺序与尾声严格相反。诊断开关 MCS2_NO_ISR_SAVE=1 可跳过。
@@ -1010,6 +1342,9 @@ pub fn generate(
     }
 
     const body_terminated = try lw.emitBody(body);
+
+    // M2.12：相邻拷贝折叠（去掉 mov vd,vs 的纯中转）。
+    lw.foldCopies();
 
     // M2.4：循环旋转（top-test + 底部递减 → djnz）。
     try lw.rotateDjnz();

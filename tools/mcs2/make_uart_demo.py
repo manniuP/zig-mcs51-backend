@@ -1,10 +1,9 @@
+#!/usr/bin/env python3
+"""生成 UART 实机固件（build/fw/uart_demo_8h8k64u.ihx）。
+
+兼容入口：实际实现在 mcs2.py fw。
+"""
 import sys
-sys.path.insert(0, '.')
-from pathlib import Path
-from assemble51 import assemble
-body = Path('build/uart_demo.asm').read_text(encoding='utf-8')
-drv = Path('build/uart_entry.asm').read_text(encoding='utf-8')
-merged = Path('build/uart_full.asm')
-merged.write_text(drv + '\n' + body, encoding='utf-8', newline='\n')
-ihx = assemble(merged, Path('build'), 'uart_full', dseg_base=0x30, cseg_base=0x0000)
-print('OK', ihx)
+from mcs2 import main
+
+sys.exit(main(["fw", "uart"]))

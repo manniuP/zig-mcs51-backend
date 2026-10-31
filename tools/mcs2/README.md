@@ -23,23 +23,36 @@ MIR(host Zig) → out.asm → sdas8051 → out.rel → sdld → out.ihx → ucsi
 
 ## 运行
 
-从本目录执行：
+**只有一个入口** `mcs2.py`（工具发现 / 环境 / 布局 / 驱动桩 / ucsim 解析都在这里）：
 
 ```bash
-python verify.py
+cd zig-0.17/tools/mcs2
+python mcs2.py build          # 同步源码 + 构建编译器（增量几秒 / 全量 2-3 分钟）
+python mcs2.py check          # 全部仿真验收（15 项）
+python mcs2.py check add sum  # 只跑点名用例
+python mcs2.py fw uart --tag 45.1584M_9600   # 出固件 build/fw/uart_demo_8h8k64u_45.1584M_9600.ihx
+python mcs2.py doctor         # 体检：工具/产物在哪、源码是否已同步
+python mcs2.py clean          # 删编译器缓存（zig017/cache-mcs2*；下次全量构建）
+python mcs2.py all            # build + check
 ```
 
-依赖：
+固件产物统一写到**工作区 `build/fw/`**（与历史固件同处，烧录脚本按目录取）；
+`--tag` 用来在文件名里记下时钟/波特率这一版是按什么算的。
+环境变量 `ZIG017` 可覆盖编译器路径（默认构建树产物）。
 
-- `zig` 0.17 在 PATH；
-- `sdas8051.exe` / `sdld.exe`：默认取工作区相邻的 `mcs251/tools/sdcc-mcs251-windows-x64/.../bin`；
-- `ucsim_51.exe`：优先 `UCSIM51` 环境变量，其次 PATH，最后 SDCC 默认安装目录。
+旧脚本（`verify.py` / `add_check.py` / `loop_check.py` / `relax_check.py` /
+`interrupt_check.py` / `make_uart_demo.py`）保留为薄封装，行为不变。
 
-可用环境变量覆盖：
+### 两棵树与硬链接
 
-```bash
-MCS_SDCC_BIN=<dir> UCSIM51=<path> python verify.py
-```
+- `zig-0.17/src/codegen/mcs2*`：**源码真源**，所有编辑都在这里；
+- `zig017/mcs2build`：**编译器构建树**，它的 `src/lib` 是打过 mcs51/mcs251
+  （含 `McsInterruptOptions`）补丁的版本；
+- `mcs2.py sync` 把源码**硬链接**进构建树（同一文件，改一处两处都变）；
+  跨卷失败时自动退回复制。**不再需要手工 Copy-Item。**
+
+依赖：系统 `zig`（构建编译器本身）、`sdas8051/sdld`（`MCS_SDCC_BIN` 可覆盖）、
+`ucsim_51`（`UCSIM51` 可覆盖）。
 
 ## 调试产物
 

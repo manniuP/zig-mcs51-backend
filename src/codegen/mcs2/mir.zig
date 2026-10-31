@@ -85,6 +85,12 @@ pub const Op = union(enum) {
     add: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs - rhs（8 位，回绕）。发射：`clr c; mov a,lhs; subb a,rhs; mov dst,a`。
     sub: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs & rhs（按位与）。发射：`mov a,lhs; anl a,rhs; mov dst,a`。
+    and_: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs | rhs（按位或）。发射：`mov a,lhs; orl a,rhs; mov dst,a`。
+    or_: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs ^ rhs（按位异或）。发射：`mov a,lhs; xrl a,rhs; mov dst,a`。
+    xor_: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst -= 1（8 位，回绕；8051 的 `dec direct`）。
     dec: u8,
     /// dst <- 直接地址 mem[addr]（读 SFR/ABI 寄存器等）。
@@ -100,6 +106,10 @@ pub const Op = union(enum) {
     store_dir: struct { addr: u8, src: Byte },
     /// 把源位置写入 xdata 的 16 位绝对地址。
     store_xdata: struct { addr: u16, src: Byte },
+    /// dst <- xdata mem[base + idx]（运行期下标：dptr = base + idx，base 须为常量）。
+    load_xdata_idx: struct { dst: Byte, base: u16, idx: Byte },
+    /// xdata mem[base + idx] <- src（运行期下标）。
+    store_xdata_idx: struct { base: u16, idx: Byte, src: Byte },
     /// 局部标签定义，供 br/br_ifnz 引用。
     label: u32,
     /// 无条件跳转到标签。
