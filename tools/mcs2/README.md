@@ -30,7 +30,8 @@ cd zig-0.17/tools/mcs2
 python mcs2.py build          # 同步源码 + 构建编译器（增量几秒 / 全量 2-3 分钟）
 python mcs2.py check          # 全部仿真验收（64 项）
 python feature_probe.py       # 定点能力矩阵（28 项支持 / 1 项拒绝）
-python bench_compare.py       # mcs2 / SDCC / Keil 三方尺寸（Keil 用 KEIL_BIN 或自动发现）
+python bench_compare.py       # mcs2 / SDCC / Keil 三方**函数体**尺寸（Keil 用 KEIL_BIN 或自动发现）
+python fwsize.py              # 三方**总固件**尺寸（含被拉进来的库），Δ 相对空程序基线
 python realcheck.py --sim     # 真机脚本分组 + ucsim 自检（48 项 / 15 组）
 python realcheck.py --read COM14       # 逐组烧录后读串口逐项比对
 python realcheck.py --dl COM14         # 发触发字节让固件软复位进 ISP（免按 RST）
