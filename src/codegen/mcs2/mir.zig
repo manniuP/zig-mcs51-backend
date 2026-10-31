@@ -91,6 +91,10 @@ pub const Op = union(enum) {
     or_: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs ^ rhs（按位异或）。发射：`mov a,lhs; xrl a,rhs; mov dst,a`。
     xor_: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs << n（8 位；n 必须是编译期常量）。发射：`mov a,lhs; clr c; rlc a` ×n。
+    shl: struct { dst: Byte, lhs: Byte, n: u8 },
+    /// dst = lhs >> n（逻辑右移）。发射：`mov a,lhs; clr c; rrc a` ×n。
+    shr: struct { dst: Byte, lhs: Byte, n: u8 },
     /// dst -= 1（8 位，回绕；8051 的 `dec direct`）。
     dec: u8,
     /// dst <- 直接地址 mem[addr]（读 SFR/ABI 寄存器等）。

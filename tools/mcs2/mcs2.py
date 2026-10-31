@@ -254,12 +254,18 @@ CASES: dict[str, dict] = {
     # U2 位测试：SCON.1(TI) 的置位/清零轮询 → jb/jnb
     "bitpoll":  dict(kind="call", src="bit.zig", fn="bitpoll", args=[("DPL", 4)], want=4, steps=3000),
     "bitclear": dict(kind="call", src="bit.zig", fn="bitclear", args=[("DPL", 3)], want=3, steps=3000),
+    # 移位与 SFR 单比特：<< / >> 走 rlc/rrc；|= 单比特 → setb，&= ~单比特 → clr
+    "shl2":   dict(kind="call", src="shifts.zig", fn="shl2", args=[("DPL", 0x41)], want=0x04),
+    "shr3":   dict(kind="call", src="shifts.zig", fn="shr3", args=[("DPL", 0xFF)], want=0x1F),
+    "setbit": dict(kind="call", src="shifts.zig", fn="setbit", args=[], want=0x02),
+    "clrbit": dict(kind="call", src="shifts.zig", fn="clrbit", args=[], want=0xFD),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
 
 ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big",
-         "interrupt", "memrt", "bitfn", "xor2", "ne5", "ne_imm", "bitpoll", "bitclear", "ringdemo"]
+         "interrupt", "memrt", "bitfn", "xor2", "ne5", "ne_imm", "bitpoll", "bitclear",
+         "shl2", "shr3", "setbit", "clrbit", "ringdemo"]
 
 
 def check_selftest() -> bool:

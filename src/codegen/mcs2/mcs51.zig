@@ -153,6 +153,8 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .sub => |x| if (touchesDplDph(x.dst)) null else prev,
         .and_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .or_ => |x| if (touchesDplDph(x.dst)) null else prev,
+        .shl => |x| if (touchesDplDph(x.dst)) null else prev,
+        .shr => |x| if (touchesDplDph(x.dst)) null else prev,
         .xor_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .load_dir => |x| if (touchesDplDph(x.dst)) null else prev,
         .store_dir => |x| if (x.addr == 0x82 or x.addr == 0x83) null else prev,
@@ -257,6 +259,8 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 .src = byteOf(x.src, f.vreg_base),
             } },
             .and_ => |x| .{ .and_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .shl => |x| .{ .shl = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
+            .shr => |x| .{ .shr = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .label, .br, .ret, .reti, .halt, .bit_br => op,
@@ -337,6 +341,40 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    subb a,{s}", .{r}), .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
                 });
+            },
+            .shl => |x| {
+                const l = try byteText(gpa, x.lhs);
+                const d = try byteText(gpa, x.dst);
+                if (x.n == 0) {
+                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},{s}", .{ d, l }), .jump = null } });
+                } else {
+                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } });
+                    var k: u8 = 0;
+                    while (k < x.n) : (k += 1) {
+                        try items.appendSlice(gpa, &.{
+                            .{ .line = .{ .text = "    clr c", .jump = null } },
+                            .{ .line = .{ .text = "    rlc a", .jump = null } },
+                        });
+                    }
+                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } });
+                }
+            },
+            .shr => |x| {
+                const l = try byteText(gpa, x.lhs);
+                const d = try byteText(gpa, x.dst);
+                if (x.n == 0) {
+                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},{s}", .{ d, l }), .jump = null } });
+                } else {
+                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } });
+                    var k: u8 = 0;
+                    while (k < x.n) : (k += 1) {
+                        try items.appendSlice(gpa, &.{
+                            .{ .line = .{ .text = "    clr c", .jump = null } },
+                            .{ .line = .{ .text = "    rrc a", .jump = null } },
+                        });
+                    }
+                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } });
+                }
             },
             .mov => |x| {
                 const d = try byteText(gpa, x.dst);
@@ -428,8 +466,14 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const d = try byteText(gpa, x.dst);
                 if (sameByte(x.dst, x.lhs)) {
                     switch (x.dst) {
-                        .dir => switch (x.rhs) {
+                        .dir => |addr| switch (x.rhs) {
                             .imm => |v| {
+                                // 清除单个位：`clr bit`（2B）比 anl dir,#imm（3B）还省。
+                                const inv: u8 = ~v;
+                                if (sfrBitAddr(addr, inv)) |bit| {
+                                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    clr 0x{X:0>2}", .{bit}), .jump = null } });
+                                    continue;
+                                }
                                 try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    anl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
                                 continue;
                             },
@@ -450,8 +494,13 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const d = try byteText(gpa, x.dst);
                 if (sameByte(x.dst, x.lhs)) {
                     switch (x.dst) {
-                        .dir => switch (x.rhs) {
+                        .dir => |addr| switch (x.rhs) {
                             .imm => |v| {
+                                // 置单个位：`setb bit`（2B）比 orl dir,#imm（3B）省。
+                                if (sfrBitAddr(addr, v)) |bit| {
+                                    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    setb 0x{X:0>2}", .{bit}), .jump = null } });
+                                    continue;
+                                }
                                 try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    orl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
                                 continue;
                             },
@@ -600,6 +649,14 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
 }
 
 
+/// SFR 的位地址：只有 8 字节对齐的 SFR 可位寻址，位地址 = SFR 地址 + 位号。
+fn sfrBitAddr(addr: u8, mask: u8) ?u8 {
+    if (addr < 0x80 or (addr & 0x07) != 0) return null;
+    if (mask == 0 or (mask & (mask - 1)) != 0) return null;
+    const n: u8 = @intCast(@ctz(mask));
+    return addr + n;
+}
+
 /// dptr = base + idx（16 位常量基址 + 8 位运行期下标）。
 /// lo == 0 时不可能进位，直接 `mov dpl,idx`；否则用 add/addc 传播进位。
 fn emitDptrIndex(
@@ -652,6 +709,9 @@ fn instrBytes(text: []const u8) usize {
     if (std.mem.startsWith(u8, t, "lcall")) return 3;
     if (std.mem.startsWith(u8, t, "jb") or std.mem.startsWith(u8, t, "jnb")) return 3; // 位测试带位地址
     if (std.mem.startsWith(u8, t, "j")) return 2; // jz/jnz/jc/jnc
+    if (std.mem.startsWith(u8, t, "rlc") or std.mem.startsWith(u8, t, "rrc")) return 1;
+    if (std.mem.startsWith(u8, t, "setb")) return 2; // setb bit
+    if (std.mem.startsWith(u8, t, "rl a") or std.mem.startsWith(u8, t, "rr a")) return 1;
     if (std.mem.startsWith(u8, t, "ret")) return 1;
     if (std.mem.startsWith(u8, t, "nop")) return 1;
     if (std.mem.startsWith(u8, t, "clr")) return 2; // clr a / clr c 实为 1，取保守值

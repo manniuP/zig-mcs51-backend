@@ -353,6 +353,57 @@ const Lower = struct {
         return false;
     }
 
+    // ==== 位运算：SFR/直址的 RMW 折叠 ====
+    //
+    // `SCON.* |= 0x02` 会降成 load_dir + or_ + store_dir 三条；8051 有单指令 RMW，
+    // 折回 dir 级后发射层就能出 `setb 0x99` / `orl 0x98,#0x03`（2-3B 而非 6B）。
+    fn foldDirRmw(self: *Lower) void {
+        var i: usize = 0;
+        while (i + 2 < self.ops.items.len) : (i += 1) {
+            const ld = switch (self.ops.items[i]) {
+                .load_dir => |x| x,
+                else => continue,
+            };
+            const v1 = vregOfByte(ld.dst) orelse continue;
+            const second = self.ops.items[i + 1];
+            const v2: u8 = blk: {
+                switch (second) {
+                    .or_ => |x| {
+                        if (!sameVregByte(x.lhs, v1)) break :blk 255;
+                        break :blk vregOfByte(x.dst) orelse 255;
+                    },
+                    .and_ => |x| {
+                        if (!sameVregByte(x.lhs, v1)) break :blk 255;
+                        break :blk vregOfByte(x.dst) orelse 255;
+                    },
+                    .xor_ => |x| {
+                        if (!sameVregByte(x.lhs, v1)) break :blk 255;
+                        break :blk vregOfByte(x.dst) orelse 255;
+                    },
+                    else => continue,
+                }
+            };
+            if (v2 == 255) continue;
+            const st = switch (self.ops.items[i + 2]) {
+                .store_dir => |x| x,
+                else => continue,
+            };
+            if (st.addr != ld.addr or !sameVregByte(st.src, v2)) continue;
+            if (readCountVreg(self.ops.items, v1) != 1 or readCountVreg(self.ops.items, v2) != 1) continue;
+
+            const dir_self = mcsmir.Byte{ .dir = ld.addr };
+            self.ops.items[i] = switch (second) {
+                .or_ => |x| mcsmir.Op{ .or_ = .{ .dst = dir_self, .lhs = dir_self, .rhs = x.rhs } },
+                .and_ => |x| mcsmir.Op{ .and_ = .{ .dst = dir_self, .lhs = dir_self, .rhs = x.rhs } },
+                .xor_ => |x| mcsmir.Op{ .xor_ = .{ .dst = dir_self, .lhs = dir_self, .rhs = x.rhs } },
+                else => second,
+            };
+            var k = i + 1;
+            while (k + 2 < self.ops.items.len) : (k += 1) self.ops.items[k] = self.ops.items[k + 2];
+            self.ops.items.len -= 2;
+        }
+    }
+
     // ==== U2：位测试折叠 ====
     //
     // `(SCON & 0x02) != 0` 这一形态在 8051 上就是 `jb 0x99, L`。
@@ -526,6 +577,8 @@ const Lower = struct {
             .and_ => |x| .{ .and_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .or_ => |x| .{ .or_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .shl => |x| .{ .shl = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
+            .shr => |x| .{ .shr = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
             .mov => |x| .{ .mov = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
             .load_dir => |x| .{ .load_dir = .{ .dst = mapByteVreg(x.dst, map), .addr = x.addr } },
             .store_dir => |x| .{ .store_dir = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
@@ -613,6 +666,8 @@ const Lower = struct {
             .and_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .or_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .xor_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .shl => |x| isVregByte(x.lhs, r),
+            .shr => |x| isVregByte(x.lhs, r),
             .mov => |x| isVregByte(x.src, r),
             .cmp_br => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .br_ifnz => |x| isVregByte(x.cond, r),
@@ -664,6 +719,8 @@ const Lower = struct {
                 if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
                 break :blk mcsmir.Op{ .xor_ = y };
             },
+            .shl => |x| if (isVregByte(x.lhs, from)) mcsmir.Op{ .shl = .{ .dst = x.dst, .lhs = to, .n = x.n } } else null,
+            .shr => |x| if (isVregByte(x.lhs, from)) mcsmir.Op{ .shr = .{ .dst = x.dst, .lhs = to, .n = x.n } } else null,
             .cmp_br => |x| blk: {
                 var y = x;
                 if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
@@ -988,6 +1045,18 @@ const Lower = struct {
                     if (!foldSet(x.dst, a ^ b, &regs, &dirs)) return false;
                     pc += 1;
                 },
+                .shl => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const v: u8 = if (x.n >= 8) 0 else a << @intCast(x.n);
+                    if (!foldSet(x.dst, v, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .shr => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const v: u8 = if (x.n >= 8) 0 else a >> @intCast(x.n);
+                    if (!foldSet(x.dst, v, &regs, &dirs)) return false;
+                    pc += 1;
+                },
                 .store_dir => |x| {
                     const v = foldGet(x.src, &regs, &dirs) orelse return false;
                     dirs[x.addr] = v;
@@ -1258,6 +1327,22 @@ const Lower = struct {
                     .bit_and => .{ .and_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                     .bit_or => .{ .or_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                     else => .{ .xor_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
+                });
+                self.vals[@backingInt(inst)] = d;
+            },
+
+            // 移位：只支持 u8 + 编译期常量次数（8051 用 rlc/rrc 逐位做）。
+            .shl, .shl_exact, .shr, .shr_exact => {
+                const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                if (!self.typeIsU8(ty)) return self.fail("移位只支持 u8（暂不实现其它宽度）", .{});
+                const bin = data.bin_op;
+                const n = self.constU8(bin.rhs) orelse
+                    return self.fail("移位次数必须是编译期常量（运行期移位暂不支持）", .{});
+                const lhs = try self.refLoc(bin.lhs);
+                const d = mcsmir.v(try self.allocVreg());
+                try self.ops.append(self.gpa, switch (tag) {
+                    .shl, .shl_exact => .{ .shl = .{ .dst = d, .lhs = lhs, .n = n } },
+                    else => .{ .shr = .{ .dst = d, .lhs = lhs, .n = n } },
                 });
                 self.vals[@backingInt(inst)] = d;
             },
@@ -1589,6 +1674,9 @@ pub fn generate(
 
     // M2.12：相邻拷贝折叠（去掉 mov vd,vs 的纯中转）。
     lw.foldCopies();
+
+    // 位运算：RMW 折叠（load+op+store 同址 → 单指令 dir 级 RMW）。
+    lw.foldDirRmw();
 
     // U2：位测试折叠（(SFR & 单比特) 比较 → jb/jnb）。
     lw.foldBitTests();
