@@ -188,7 +188,7 @@ def case_asm(name: str, spec: dict, slot: int) -> str:
 
 
 def build_group(cases: list[str], idx: int, board: str, fosc: float, baud: int,
-                wait_ti: bool = True) -> tuple[Path, Path]:
+                wait_ti: bool = True, isp: bool = False) -> tuple[Path, Path]:
     """一组（同一 src 文件）→ (ihx, 合并后的 asm)。"""
     src = mcs2.CASES[cases[0]]["src"]
     suffix = "" if wait_ti else "_sim"
@@ -198,7 +198,9 @@ def build_group(cases: list[str], idx: int, board: str, fosc: float, baud: int,
     harness += "_again:\n"
     for i, c in enumerate(cases):
         harness += case_asm(c, mcs2.CASES[c], 0x8000 + i * 4)
-    harness += ISP_WATCH + harness_lib(wait_ti)
+    if isp:
+        harness += ISP_WATCH
+    harness += harness_lib(wait_ti)
     tag = f"real_g{idx}{suffix}_{src.split('.')[0]}"
     merged = mcs2.merge(tag, harness, body)
     ihx = mcs2.assemble(merged, tag, dseg=0x30, cseg=0x0000)
@@ -223,7 +225,10 @@ def main() -> int:
     ap.add_argument("--tries", type=int, default=3, help="--auto 每组最多重试次数")
     ap.add_argument("--watch", metavar="PORT",
                     help="边烧边收：轮询串口累积各组结果，直到 48 项收齐或超时")
-    ap.add_argument("--seconds", type=float, default=600.0, help="--watch 最长秒数")
+    ap.add_argument("--seconds", type=float, default=20.0,
+                    help="--watch/--read 最长秒数（--read 收齐即退）")
+    ap.add_argument("--isp", action="store_true",
+                    help="固件里加「收到串口字节就软复位进 ISP」——**本机 AI8051U 实测无效**（只复位、回不到 ISP），默认关")
     ap.add_argument("--board", choices=("ai8051u", "stc8h"), default="ai8051u",
                     help="ai8051u：UART1 → P3.0/P3.1 + Timer2（默认）；stc8h：P3.6/P3.7 + Timer1")
     ap.add_argument("--baud", type=int, default=115200)
@@ -279,7 +284,8 @@ def main() -> int:
     ok_all = True
     for gi, src in enumerate(order):
         g = by_src[src]
-        ihx, merged = build_group(g, gi, args.board, args.fosc, args.baud, wait_ti=not args.sim)
+        ihx, merged = build_group(g, gi, args.board, args.fosc, args.baud,
+                                  wait_ti=not args.sim, isp=args.isp)
         asm_text = merged.read_text(encoding="utf-8", errors="replace")
         nds = len(re.findall(r"^(_mcs_v\d+|_\w+_PARM_\d+): \.ds 1$", asm_text, re.M))
         print(f"  组{gi} {src}: {', '.join(g)}  ({nds} B DSEG)")
@@ -305,7 +311,7 @@ def main() -> int:
             if not bad:
                 print(f"    PASS 组{gi} {len(g)} 项")
     if args.read:
-        return read_serial(args.read, args.baud, order, by_src)
+        return read_serial(args.read, args.baud, order, by_src, args.seconds)
     print("PASS: 仿真自检全部通过" if ok_all else "FAIL: 有组不一致")
     return 0 if ok_all else 1
 
@@ -482,7 +488,8 @@ def send_download(port: str, baud: int) -> int:
     return 0
 
 
-def read_serial(port: str, baud: int, order: list[str], by_src: dict[str, list[str]]) -> int:
+def read_serial(port: str, baud: int, order: list[str], by_src: dict[str, list[str]],
+                seconds: float = 20.0) -> int:
     try:
         import serial  # pyserial
     except ImportError:
@@ -493,10 +500,13 @@ def read_serial(port: str, baud: int, order: list[str], by_src: dict[str, list[s
         for c in by_src[src]:
             spec = mcs2.CASES[c]
             want[c] = (spec.get("want32", spec.get("want16", spec.get("want"))), ret_bytes(spec))
+    import time
+
     seen: dict[str, int] = {}
-    print(f"== 读 {port} @{baud}：逐组烧录，打印 名字=HEX（共 {len(want)} 项）")
+    deadline = time.time() + seconds
+    print(f"== 读 {port} @{baud}，最长 {seconds:.0f} s（共 {len(want)} 项待收）")
     with serial.Serial(port, baud, timeout=1) as sp:
-        while len(seen) < len(want):
+        while len(seen) < len(want) and time.time() < deadline:
             line = sp.readline().decode("ascii", "replace").strip()
             m = re.match(r"^([a-z0-9_]+)=([0-9A-Fa-f]+)$", line)
             if not m or m.group(1) not in want:
