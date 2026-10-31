@@ -615,7 +615,7 @@ const Lower = struct {
                         if (@backingInt(x) == @backingInt(target)) hit = true;
                     }
                 },
-                .int_cast, .int_cast_safe, .trunc, .not => {
+                .int_cast, .int_cast_safe, .trunc, .not, .bit_cast => {
                     if (d.ty_op.operand.toIndex()) |x| {
                         if (@backingInt(x) == @backingInt(target)) hit = true;
                     }
@@ -2003,7 +2003,9 @@ const Lower = struct {
 
             // 整数转换：≤16 位一律透传（本后端只跟踪 8 位值；下标被当作 u8 使用）。
             // 目的：让 `buf[i]`（i: u8 → usize 下标）不再被拒绝。
-            .int_cast, .int_cast_safe, .trunc => {
+            // bit_cast 也走这条：同宽整数是纯透传；`@intFromBool`（bool→u8）是
+            // 1 位零扩展（源是 bool，不是有符号整数，所以不会误做符号扩展）。
+            .int_cast, .int_cast_safe, .trunc, .bit_cast => {
                 const ty_op = data.ty_op;
                 const src_ty = self.air.typeOf(ty_op.operand, &self.zcu.intern_pool);
                 const dst_ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
