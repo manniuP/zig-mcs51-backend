@@ -28,8 +28,12 @@ MIR(host Zig) → out.asm → sdas8051 → out.rel → sdld → out.ihx → ucsi
 ```bash
 cd zig-0.17/tools/mcs2
 python mcs2.py build          # 同步源码 + 构建编译器（增量几秒 / 全量 2-3 分钟）
-python mcs2.py check          # 全部仿真验收（33 项）
-python feature_probe.py       # 定点能力矩阵（哪些算术能编、哪些明确拒绝）
+python mcs2.py check          # 全部仿真验收（64 项）
+python feature_probe.py       # 定点能力矩阵（28 项支持 / 1 项拒绝）
+python bench_compare.py       # mcs2 / SDCC / Keil 三方尺寸（Keil 用 KEIL_BIN 或自动发现）
+python realcheck.py --sim     # 真机脚本分组 + ucsim 自检（48 项 / 15 组）
+python realcheck.py --read COM8        # 逐组烧录后读串口逐项比对
+python interop/build.py       # C(SDCC)↔Zig(mcs2) 混编实验（能链能跑，见 docs）
 python mcs2.py check add sum  # 只跑点名用例
 python mcs2.py fw uart --tag 45.1584M_9600   # 出固件 build/fw/uart_demo_8h8k64u_45.1584M_9600.ihx
 python mcs2.py doctor         # 体检：工具/产物在哪、源码是否已同步
