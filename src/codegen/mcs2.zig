@@ -353,6 +353,116 @@ const Lower = struct {
         return false;
     }
 
+    // ==== U2：位测试折叠 ====
+    //
+    // `(SCON & 0x02) != 0` 这一形态在 8051 上就是 `jb 0x99, L`。
+    // 匹配：可选 load_dir{A} + and_{v,·,#m} + cmp_br{==0 / !=0, v, #0}，
+    // 其中 m 是单比特、A 在 0x80-0xFF（SFR）或 0x20-0x2F（可位寻址 RAM）。
+    // 位地址：SFR 区 = A + n（且 A 必须 8 字节对齐）；RAM 0x20-0x2F = (A-0x20)*8 + n。
+
+    fn bitAddrOf(addr: u8, mask: u8) ?u8 {
+        if (mask == 0) return null;
+        if ((mask & (mask - 1)) != 0) return null; // 必须只有一个位
+        const n: u8 = @intCast(@ctz(mask));
+        // SFR 区：位地址 = SFR 地址 + 位号（SCON 0x98 的 TI → 0x99）。
+        // 只有 8 字节对齐的 SFR 可位寻址。
+        if (addr >= 0x80) {
+            if (addr & 0x07 != 0) return null;
+            return addr + n;
+        }
+        // 可位寻址 RAM 0x20-0x2F：位地址 = (addr-0x20)*8 + n
+        if (addr >= 0x20 and addr <= 0x2F) return @intCast((@as(u16, addr - 0x20)) * 8 + n);
+        return null;
+    }
+
+    fn foldBitTests(self: *Lower) void {
+        var i: usize = 0;
+        while (i < self.ops.items.len) : (i += 1) {
+            if (i + 2 < self.ops.items.len) {
+                const ld: ?@TypeOf(@as(mcsmir.Op, .{ .load_dir = .{ .dst = .{ .vreg = 0 }, .addr = 0 } }).load_dir) = switch (self.ops.items[i]) {
+                    .load_dir => |x| x,
+                    else => null,
+                };
+                if (ld) |l| {
+                    const w = vregOfByte(l.dst);
+                    const an: ?@TypeOf(@as(mcsmir.Op, .{ .and_ = .{ .dst = .{ .vreg = 0 }, .lhs = .{ .vreg = 0 }, .rhs = .{ .vreg = 0 } } }).and_) = switch (self.ops.items[i + 1]) {
+                        .and_ => |x| x,
+                        else => null,
+                    };
+                    const cb: ?@TypeOf(@as(mcsmir.Op, .{ .cmp_br = .{ .lhs = .{ .vreg = 0 }, .rhs = .{ .vreg = 0 }, .cc = .eq, .target = 0 } }).cmp_br) = switch (self.ops.items[i + 2]) {
+                        .cmp_br => |x| x,
+                        else => null,
+                    };
+                    if (w != null and an != null and cb != null) {
+                        const v = vregOfByte(an.?.dst);
+                        const m: u8 = switch (an.?.rhs) {
+                            .imm => |x| x,
+                            else => 0xFF,
+                        };
+                        const zero: u8 = switch (cb.?.rhs) {
+                            .imm => |x| x,
+                            else => 0xFF,
+                        };
+                        var lhs_ok = false;
+                        if (v) |vv| lhs_ok = sameVregByte(cb.?.lhs, vv);
+                        if (v != null and sameVregByte(an.?.lhs, w.?) and lhs_ok and
+                            zero == 0 and (cb.?.cc == .eq or cb.?.cc == .ne) and
+                            readCountVreg(self.ops.items, v.?) == 1 and
+                            readCountVreg(self.ops.items, w.?) == 1)
+                        {
+                            if (bitAddrOf(l.addr, m)) |bit| {
+                                self.ops.items[i] = .{ .bit_br = .{ .bit = bit, .target = cb.?.target, .on_set = cb.?.cc == .ne } };
+                                var k = i + 1;
+                                while (k + 2 < self.ops.items.len) : (k += 1) self.ops.items[k] = self.ops.items[k + 2];
+                                self.ops.items.len -= 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if (i + 1 < self.ops.items.len) {
+                const an: ?@TypeOf(@as(mcsmir.Op, .{ .and_ = .{ .dst = .{ .vreg = 0 }, .lhs = .{ .vreg = 0 }, .rhs = .{ .vreg = 0 } } }).and_) = switch (self.ops.items[i]) {
+                    .and_ => |x| x,
+                    else => null,
+                };
+                const cb: ?@TypeOf(@as(mcsmir.Op, .{ .cmp_br = .{ .lhs = .{ .vreg = 0 }, .rhs = .{ .vreg = 0 }, .cc = .eq, .target = 0 } }).cmp_br) = switch (self.ops.items[i + 1]) {
+                    .cmp_br => |x| x,
+                    else => null,
+                };
+                if (an != null and cb != null) {
+                    const v = vregOfByte(an.?.dst);
+                    const addr: ?u8 = switch (an.?.lhs) {
+                        .dir => |a| a,
+                        else => null,
+                    };
+                    const m: u8 = switch (an.?.rhs) {
+                        .imm => |x| x,
+                        else => 0xFF,
+                    };
+                    const zero: u8 = switch (cb.?.rhs) {
+                        .imm => |x| x,
+                        else => 0xFF,
+                    };
+                    var lhs_ok = false;
+                    if (v) |vv| lhs_ok = sameVregByte(cb.?.lhs, vv);
+                    if (v != null and addr != null and lhs_ok and zero == 0 and
+                        (cb.?.cc == .eq or cb.?.cc == .ne) and
+                        readCountVreg(self.ops.items, v.?) == 1)
+                    {
+                        if (bitAddrOf(addr.?, m)) |bit| {
+                            self.ops.items[i] = .{ .bit_br = .{ .bit = bit, .target = cb.?.target, .on_set = cb.?.cc == .ne } };
+                            var k = i + 1;
+                            while (k + 1 < self.ops.items.len) : (k += 1) self.ops.items[k] = self.ops.items[k + 1];
+                            self.ops.items.len -= 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // ==== M2.13：寄存器分配（切片 1）====
     //
     // 只挑「自更新的热点值」（dst == lhs 的累加器/计数器）放进 R5/R6/R7。
@@ -430,6 +540,7 @@ const Lower = struct {
             .push => |x| .{ .push = .{ .src = mapByteVreg(x.src, map) } },
             .pop => |x| .{ .pop = .{ .dst = mapByteVreg(x.dst, map) } },
             .dec => op, // 载荷是裸 vreg 下标；对应 vreg 已被禁用映射
+            .bit_br => op,
             .label, .br, .ret, .reti, .halt => op,
         };
     }
@@ -1475,6 +1586,9 @@ pub fn generate(
 
     // M2.12：相邻拷贝折叠（去掉 mov vd,vs 的纯中转）。
     lw.foldCopies();
+
+    // U2：位测试折叠（(SFR & 单比特) 比较 → jb/jnb）。
+    lw.foldBitTests();
 
     // M2.4：循环旋转（top-test + 底部递减 → djnz）。
     try lw.rotateDjnz();

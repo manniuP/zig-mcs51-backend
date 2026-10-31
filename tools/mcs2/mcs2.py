@@ -251,12 +251,15 @@ CASES: dict[str, dict] = {
     # cmp_br(ne) 的两种形态：与运行期值比 / 与立即数比（发射层 cjne）。
     "ne5":     dict(kind="call", src="mem.zig", fn="ne5", args=[("DPL", 5)], want=5, steps=2000),
     "ne_imm":  dict(kind="call", src="mem.zig", fn="ne_imm", args=[], want=3, steps=2000),
+    # U2 位测试：SCON.1(TI) 的置位/清零轮询 → jb/jnb
+    "bitpoll":  dict(kind="call", src="bit.zig", fn="bitpoll", args=[("DPL", 4)], want=4, steps=3000),
+    "bitclear": dict(kind="call", src="bit.zig", fn="bitclear", args=[("DPL", 3)], want=3, steps=3000),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
 
 ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big",
-         "interrupt", "memrt", "bitfn", "xor2", "ne5", "ne_imm", "ringdemo"]
+         "interrupt", "memrt", "bitfn", "xor2", "ne5", "ne_imm", "bitpoll", "bitclear", "ringdemo"]
 
 
 def check_selftest() -> bool:

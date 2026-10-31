@@ -159,7 +159,7 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .push => |x| if (touchesDplDph(x.src)) null else prev,
         .pop => |x| if (touchesDplDph(x.dst)) null else prev,
         .dec => prev,
-        .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .ret, .reti, .halt => null,
+        .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .ret, .reti, .halt => null,
     };
 }
 
@@ -259,7 +259,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .and_ => |x| .{ .and_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
-            .label, .br, .ret, .reti, .halt => op,
+            .label, .br, .ret, .reti, .halt, .bit_br => op,
         };
         // 这次 xdata 访问想要的 DPTR 内容；与当前一致就不重建。
         const want_dptr: ?DptrState = switch (m_op) {
@@ -426,6 +426,18 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const l = try byteText(gpa, x.lhs);
                 const rr = try byteText(gpa, x.rhs);
                 const d = try byteText(gpa, x.dst);
+                if (sameByte(x.dst, x.lhs)) {
+                    switch (x.dst) {
+                        .dir => switch (x.rhs) {
+                            .imm => |v| {
+                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    anl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
+                                continue;
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    anl a,{s}", .{rr}), .jump = null } },
@@ -436,6 +448,18 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const l = try byteText(gpa, x.lhs);
                 const rr = try byteText(gpa, x.rhs);
                 const d = try byteText(gpa, x.dst);
+                if (sameByte(x.dst, x.lhs)) {
+                    switch (x.dst) {
+                        .dir => switch (x.rhs) {
+                            .imm => |v| {
+                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    orl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
+                                continue;
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    orl a,{s}", .{rr}), .jump = null } },
@@ -446,6 +470,18 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const l = try byteText(gpa, x.lhs);
                 const rr = try byteText(gpa, x.rhs);
                 const d = try byteText(gpa, x.dst);
+                if (sameByte(x.dst, x.lhs)) {
+                    switch (x.dst) {
+                        .dir => switch (x.rhs) {
+                            .imm => |v| {
+                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    xrl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
+                                continue;
+                            },
+                            else => {},
+                        },
+                        else => {},
+                    }
+                }
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    xrl a,{s}", .{rr}), .jump = null } },
@@ -465,6 +501,15 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     .{c},
                 ), .jump = null } });
                 try items.append(gpa, .{ .line = .{ .text = "jnz", .jump = x.target } });
+            },
+            .bit_br => |x| {
+                // 8051 位测试：jb/jnb 位地址,rel（3 字节）。
+                const mnemonic = if (x.on_set) "jb" else "jnb";
+                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                    gpa,
+                    "    {s} 0x{X:0>2},",
+                    .{ mnemonic, x.bit },
+                ), .jump = x.target } });
             },
             .br_ifz => |x| {
                 const c = try byteText(gpa, x.cond);
@@ -605,7 +650,8 @@ fn instrBytes(text: []const u8) usize {
     if (std.mem.startsWith(u8, t, "sjmp")) return 2;
     if (std.mem.startsWith(u8, t, "ljmp")) return 3;
     if (std.mem.startsWith(u8, t, "lcall")) return 3;
-    if (std.mem.startsWith(u8, t, "j")) return 2; // jz/jnz/jc/jnc/jb/jnb
+    if (std.mem.startsWith(u8, t, "jb") or std.mem.startsWith(u8, t, "jnb")) return 3; // 位测试带位地址
+    if (std.mem.startsWith(u8, t, "j")) return 2; // jz/jnz/jc/jnc
     if (std.mem.startsWith(u8, t, "ret")) return 1;
     if (std.mem.startsWith(u8, t, "nop")) return 1;
     if (std.mem.startsWith(u8, t, "clr")) return 2; // clr a / clr c 实为 1，取保守值
@@ -646,10 +692,12 @@ fn instrBytes(text: []const u8) usize {
     if (std.mem.startsWith(u8, t, "add") or std.mem.startsWith(u8, t, "subb") or
         std.mem.startsWith(u8, t, "xrl") or std.mem.startsWith(u8, t, "anl") or std.mem.startsWith(u8, t, "orl"))
     {
-        // add a,rN 之类是 1 字节
         const comma = std.mem.indexOfScalar(u8, t, ',') orelse return 2;
+        const first = std.mem.trim(u8, t[4..comma], " ");
         const op = std.mem.trim(u8, t[comma + 1 ..], " ");
-        return if (isRegText(op)) 1 else 2;
+        if (isRegText(op)) return 1; // add a,rN
+        if (!std.mem.eql(u8, first, "a") and op.len > 0 and op[0] == '#') return 3; // anl dir,#imm
+        return 2;
     }
     return 3;
 }

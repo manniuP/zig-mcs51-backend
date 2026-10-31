@@ -126,6 +126,9 @@ pub const Op = union(enum) {
     br_ifnz: struct { cond: Byte, target: u32 },
     /// 位置值为零则跳转（`mov a,src` + `jz rel`）；cond_br 的 else 分支用。
     br_ifz: struct { cond: Byte, target: u32 },
+    /// 位测试跳转（8051 `jb`/`jnb`）：`bit` 是位地址（SFR 区按 (A-0x80)*8+n 算）。
+    /// on_set=true → 置位时跳（jb）；false → 清零时跳（jnb）。
+    bit_br: struct { bit: u8, target: u32, on_set: bool },
     /// 函数返回（51: `ret`；返回值由调用方先放好，见 `abi`）。
     ret,
     /// 停机；当前切片不建立调用栈。
