@@ -43,9 +43,12 @@ CASES: list[tuple[str, str]] = [
     ("bit_set",   "const S: *volatile u8 = @ptrFromInt(0x98); export fn f() u8 { S.* |= 2; return S.*; }"),
     # ---- 多字节（Q15/Q31 的前提）----
     ("u16_add",   "export fn f() u8 { var a: u16 = 0x1234; a +%= 1; return @truncate(a); }"),
+    ("u16_args",  "export fn f(a: u16, b: u16) u16 { return a +% b; }"),
+    ("u16_carry", "export fn f(x: u8) u16 { var a: u16 = 0x00FF; a +%= x; return a; }"),
     ("u16_mul",   "export fn f() u8 { var a: u16 = 0x1234; a *%= 3; return @truncate(a); }"),
+    ("u16_shl",   "export fn f(a: u16) u16 { return a << 1; }"),
+    ("u16_cmp",   "export fn f(a: u16, b: u16) u8 { return if (a < b) 1 else 0; }"),
     ("u32_add",   "export fn f() u8 { var a: u32 = 0x12345678; a +%= 1; return @truncate(a); }"),
-    ("u16_arg",   "export fn f(a: u16) u16 { return a +% 1; }"),
     # ---- 有符号（Q15/Q31 都是带符号）----
     ("i8_add",    "export fn f(a: i8, b: i8) i8 { return a +% b; }"),
     ("i8_shr",    "export fn f(a: i8) i8 { return a >> 1; }"),

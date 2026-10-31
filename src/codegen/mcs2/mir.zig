@@ -91,6 +91,12 @@ pub const Op = union(enum) {
     or_: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs ^ rhs（按位异或）。发射：`mov a,lhs; xrl a,rhs; mov dst,a`。
     xor_: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// 清进位（多字节加减的入口）。
+    clr_c,
+    /// dst = lhs + rhs + C（进位进、进位出）；多字节加法的固定模板用。
+    addc: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs - rhs - C（借位进、借位出）；**不清 C**，由调用方先 clr c。
+    subb: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs * rhs（8 位回绕）。发射：`mov a,lhs; mov b,rhs; mul ab; mov dst,a`。
     mul: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs / rhs（无符号整除）。发射：`mov a,lhs; mov b,rhs; div ab; mov dst,a`。
@@ -103,6 +109,10 @@ pub const Op = union(enum) {
     shl: struct { dst: Byte, lhs: Byte, n: u8 },
     /// dst = lhs >> n（逻辑右移）。发射：`mov a,lhs; clr c; rrc a` ×n。
     shr: struct { dst: Byte, lhs: Byte, n: u8 },
+    /// 带进位左环移（不清 C）：多字节左移的逐字节模板。
+    rlc: struct { dst: Byte, src: Byte },
+    /// 带进位右环移（不清 C）：多字节右移的逐字节模板。
+    rrc: struct { dst: Byte, src: Byte },
     /// dst -= 1（8 位，回绕；8051 的 `dec direct`）。
     dec: u8,
     /// dst <- 直接地址 mem[addr]（读 SFR/ABI 寄存器等）。

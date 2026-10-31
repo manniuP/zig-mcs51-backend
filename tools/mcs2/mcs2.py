@@ -217,18 +217,32 @@ def sim(ihx: Path, steps: int, slots: int = 4, base: int = 0x8000,
     return values
 
 
-def driver_call(fn: str, args: list[tuple[str, int]], slot: int = 0x8000) -> str:
-    """摆参 -> lcall -> 结果（DPL）写 xdata 槽 -> 停机。"""
+def driver_call(fn: str, args: list[tuple[str, int]], slot: int = 0x8000,
+                ret_bytes: int = 1) -> str:
+    """摆参 -> lcall -> 结果写 xdata 槽 -> 停机。
+
+    ret_bytes=1：返回值在 DPL，写一个字节。
+    ret_bytes=2：返回值在 DPL(低)/DPH(高)，写两个字节（u16 ABI）。
+    """
     out = "    .area CSEG (CODE)\n    mov sp,#0x7F\n"
     for pos, val in args:
-        if pos == "DPL":
-            out += f"    mov dpl,#0x{val:02X}\n"
+        if pos in ("DPL", "DPH"):
+            out += f"    mov {pos.lower()},#0x{val:02X}\n"
         elif pos == "PARM2":
             out += f"    mov _{fn}_PARM_2,#0x{val:02X}\n"
+        elif pos.startswith("PARM_"):
+            out += f"    mov _{fn}_{pos},#0x{val:02X}\n"
         else:
             raise SystemExit(f"未知参数位置 {pos}")
-    out += f"    lcall _{fn}\n    mov a,dpl\n"
-    out += f"    mov dptr,#0x{slot:04X}\n    movx @dptr,a\n    sjmp .\n"
+    if ret_bytes == 2:
+        # DPH 就是 DPTR 高位：先把返回值压栈，再建指针，最后取回。
+        out += f"    lcall _{fn}\n    push dph\n    push dpl\n"
+        out += f"    mov dptr,#0x{slot:04X}\n    pop 0xE0\n    movx @dptr,a\n"
+        out += "    inc dptr\n    pop 0xE0\n    movx @dptr,a\n"
+    else:
+        # 先取 A 再建指针：mov dptr 会覆盖 DPL（返回值就在那里）。
+        out += f"    lcall _{fn}\n    mov a,dpl\n    mov dptr,#0x{slot:04X}\n    movx @dptr,a\n"
+    out += "    sjmp .\n"
     return out
 
 
@@ -265,6 +279,16 @@ CASES: dict[str, dict] = {
     "rem8":  dict(kind="call", src="math.zig", fn="rem8", args=[("DPL", 47), ("PARM2", 6)], want=5),
     "not8":  dict(kind="call", src="math.zig", fn="not8", args=[("DPL", 0x0F)], want=0xF0),
     "xnor8": dict(kind="call", src="math.zig", fn="xnor8", args=[("DPL", 0xF0), ("PARM2", 0x0F)], want=0x00),
+    # u16（多字节模板）：参数/返回走 DPL/DPH，arg1 的字节落在 PARM_3/PARM_4
+    "u16add":   dict(kind="call", src="multi.zig", fn="u16add",
+                     args=[("DPL", 0x34), ("DPH", 0x12), ("PARM_3", 0xFF), ("PARM_4", 0x00)],
+                     want16=0x1333),
+    "u16sub":   dict(kind="call", src="multi.zig", fn="u16sub",
+                     args=[("DPL", 0x34), ("DPH", 0x12), ("PARM_3", 0x10), ("PARM_4", 0x00)],
+                     want16=0x1224),
+    "u16carry": dict(kind="call", src="multi.zig", fn="u16carry", args=[("DPL", 1)], want16=0x0100),
+    "u16shl":   dict(kind="call", src="multi.zig", fn="u16shl", args=[("DPL", 0)], want16=0x0100),
+    "u16shr":   dict(kind="call", src="multi.zig", fn="u16shr", args=[("DPL", 0)], want16=0x0080),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -272,7 +296,8 @@ CASES: dict[str, dict] = {
 ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big",
          "interrupt", "memrt", "bitfn", "xor2", "ne5", "ne_imm", "bitpoll", "bitclear",
          "shl2", "shr3", "setbit", "clrbit",
-         "mul8", "div8", "rem8", "not8", "xnor8", "ringdemo"]
+         "mul8", "div8", "rem8", "not8", "xnor8",
+         "u16add", "u16sub", "u16carry", "u16shl", "u16shr", "ringdemo"]
 
 
 def check_selftest() -> bool:
@@ -308,14 +333,21 @@ def check_call(name: str, spec: dict) -> bool:
     if spec.get("want_ljmp") and "ljmp" not in text:
         print("FAIL: 期望长跳（ljmp）但产物里没有——跳转松弛没生效")
         return False
-    merged = merge(name, driver_call(spec["fn"], spec["args"]), text)
+    want16 = spec.get("want16")
+    ret_bytes = 2 if want16 is not None else 1
+    merged = merge(name, driver_call(spec["fn"], spec["args"], ret_bytes=ret_bytes), text)
     ihx = assemble(merged, name, dseg=dseg)
     expect_mem: dict[int, int] = spec.get("expect_mem") or {}
+    if want16 is not None:
+        # u16 返回：DPL 写 0x8000、DPH 写 0x8001
+        expect_mem = {0x8000: want16 & 0xFF, 0x8001: (want16 >> 8) & 0xFF}
     extra = [(min(expect_mem), len(expect_mem))] if expect_mem else None
     got = sim(ihx, steps=steps, slots=1, extra=extra)
-    val = got.get(0x8000)
-    ok = val == spec["want"]
-    print(f"  {'PASS' if ok else 'FAIL'}: {name} = {val}（期望 {spec['want']}）")
+    ok = True
+    if want16 is None:
+        val = got.get(0x8000)
+        ok = val == spec["want"]
+        print(f"  {'PASS' if ok else 'FAIL'}: {name} = {val}（期望 {spec['want']}）")
     for addr, want in expect_mem.items():
         have = got.get(addr)
         good = have == want

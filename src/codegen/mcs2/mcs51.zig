@@ -157,6 +157,11 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .div_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .rem_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .not_ => |x| if (touchesDplDph(x.dst)) null else prev,
+        .clr_c => prev,
+        .addc => |x| if (touchesDplDph(x.dst)) null else prev,
+        .subb => |x| if (touchesDplDph(x.dst)) null else prev,
+        .rlc => |x| if (touchesDplDph(x.dst)) null else prev,
+        .rrc => |x| if (touchesDplDph(x.dst)) null else prev,
         .shl => |x| if (touchesDplDph(x.dst)) null else prev,
         .shr => |x| if (touchesDplDph(x.dst)) null else prev,
         .xor_ => |x| if (touchesDplDph(x.dst)) null else prev,
@@ -235,6 +240,8 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .imm => |x| .{ .imm = .{ .dst = byteOf(x.dst, f.vreg_base), .value = x.value } },
             .add => |x| .{ .add = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .sub => |x| .{ .sub = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .addc => |x| .{ .addc = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .subb => |x| .{ .subb = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .dec => |r| .{ .dec = f.vreg_base + r },
             .load_dir => |x| .{ .load_dir = .{ .dst = byteOf(x.dst, f.vreg_base), .addr = x.addr } },
             .store_dir => |x| .{ .store_dir = .{ .addr = x.addr, .src = byteOf(x.src, f.vreg_base) } },
@@ -267,11 +274,13 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .div_ => |x| .{ .div_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .rem_ => |x| .{ .rem_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .not_ => |x| .{ .not_ = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
+            .rlc => |x| .{ .rlc = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
+            .rrc => |x| .{ .rrc = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
             .shl => |x| .{ .shl = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
             .shr => |x| .{ .shr = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
-            .label, .br, .ret, .reti, .halt, .bit_br => op,
+            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c => op,
         };
         // 这次 xdata 访问想要的 DPTR 内容；与当前一致就不重建。
         const want_dptr: ?DptrState = switch (m_op) {
@@ -427,6 +436,45 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     }
                     try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } });
                 }
+            },
+            .clr_c => try items.append(gpa, .{ .line = .{ .text = "    clr c", .jump = null } }),
+            .rlc => |x| {
+                const s = try byteText(gpa, x.src);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
+                    .{ .line = .{ .text = "    rlc a", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .rrc => |x| {
+                const s = try byteText(gpa, x.src);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
+                    .{ .line = .{ .text = "    rrc a", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .addc => |x| {
+                const l = try byteText(gpa, x.lhs);
+                const rr = try byteText(gpa, x.rhs);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    addc a,{s}", .{rr}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .subb => |x| {
+                const l = try byteText(gpa, x.lhs);
+                const rr = try byteText(gpa, x.rhs);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    subb a,{s}", .{rr}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
             },
             .mov => |x| {
                 const d = try byteText(gpa, x.dst);

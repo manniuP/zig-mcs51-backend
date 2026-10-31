@@ -100,6 +100,12 @@ const Lower = struct {
     ptr_vals: []?PtrRef = &.{},
     parms: std.ArrayListUnmanaged([]const u8) = .empty,
     is_isr: bool = false,
+    /// 多字节值（u16/u32）：低字节 = 首槽 vreg 号，高字节 = 字节数。
+    wide: []?u16 = &.{},
+    /// ABI 字节游标（u16 参数占 2 字节，arg0 起算）。
+    abi_byte: usize = 0,
+    /// 返回宽度：1 = u8（DPL）；2 = u16（DPL/DPH）。
+    ret_wide: u8 = 1,
     ret_byte: ?u8, // u8 返回的 ABI 地址；void 时为 null
     saw_ret: bool = false,
     /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
@@ -170,6 +176,82 @@ const Lower = struct {
             }
         }
         return null;
+    }
+
+    // ---- 多字节（u16/u32）表示与固定模板 ----
+    //
+    // 约定：一个 u16 值放在**两个连续 vreg 槽**里（低字节在前），u32 四个；
+    // 运算全部展开成固定指令序列（clr c + addc/subb 逐字节），不做类型系统。
+
+    fn wideBytes(self: *Lower, ty: Type) ?u8 {
+        if (ty.zigTypeTag(self.zcu) != .int) return null;
+        const bits = ty.bitSize(self.zcu);
+        if (bits == 8 or bits == 16 or bits == 32) return @intCast(bits / 8);
+        return null;
+    }
+
+    fn wideOf(self: *Lower, ref: Air.Inst.Ref) ?u16 {
+        const idx = ref.toIndex() orelse return null;
+        return self.wide[@backingInt(idx)];
+    }
+
+    fn allocWide(self: *Lower, n: u8) !u8 {
+        var base: u8 = 0;
+        var i: u8 = 0;
+        while (i < n) : (i += 1) {
+            const v = try self.allocVreg();
+            if (i == 0) base = v;
+        }
+        return base;
+    }
+
+    fn constWide(self: *Lower, ref: Air.Inst.Ref) ?u32 {
+        const ip_index = ref.toInterned() orelse return null;
+        const key = self.zcu.intern_pool.indexToKey(ip_index);
+        return switch (key) {
+            .int => |int| switch (int.storage) {
+                .u64 => |v| if (v <= 0xFFFF_FFFF) @intCast(v) else null,
+                else => null,
+            },
+            else => null,
+        };
+    }
+
+    /// 把一个操作数准备成 n 个连续槽位，返回基址（不够宽就补零放大）。
+    fn wideOperand(self: *Lower, ref: Air.Inst.Ref, n: u8) !u8 {
+        if (self.wideOf(ref)) |w| {
+            const base: u8 = @truncate(w & 0xFF);
+            const wn: u8 = @truncate(w >> 8);
+            if (wn == n) return base;
+            const dst = try self.allocWide(n);
+            var i: u8 = 0;
+            while (i < n) : (i += 1) {
+                if (i < wn) {
+                    try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dst + i), .src = mcsmir.v(base + i) } });
+                } else {
+                    try self.ops.append(self.gpa, .{ .imm = .{ .dst = mcsmir.v(dst + i), .value = 0 } });
+                }
+            }
+            return dst;
+        }
+        if (self.constWide(ref)) |v| {
+            const dst = try self.allocWide(n);
+            var i: u8 = 0;
+            while (i < n) : (i += 1) {
+                const b: u8 = @truncate(v >> @intCast(8 * @as(u32, i)));
+                try self.ops.append(self.gpa, .{ .imm = .{ .dst = mcsmir.v(dst + i), .value = b } });
+            }
+            return dst;
+        }
+        // 单字节值（u8 提升到 u16/u32）：低字节搬过去，高位补零
+        const loc = try self.refLoc(ref);
+        const dst = try self.allocWide(n);
+        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dst), .src = loc } });
+        var i: u8 = 1;
+        while (i < n) : (i += 1) {
+            try self.ops.append(self.gpa, .{ .imm = .{ .dst = mcsmir.v(dst + i), .value = 0 } });
+        }
+        return dst;
     }
 
     fn fail(self: *Lower, comptime fmt: []const u8, args: anytype) codegen.Error {
@@ -598,6 +680,11 @@ const Lower = struct {
             .div_ => |x| .{ .div_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .rem_ => |x| .{ .rem_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .not_ => |x| .{ .not_ = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
+            .addc => |x| .{ .addc = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .rlc => |x| .{ .rlc = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
+            .rrc => |x| .{ .rrc = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
+            .subb => |x| .{ .subb = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .clr_c => op,
             .shl => |x| .{ .shl = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
             .shr => |x| .{ .shr = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
             .mov => |x| .{ .mov = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
@@ -691,6 +778,10 @@ const Lower = struct {
             .div_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .rem_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .not_ => |x| isVregByte(x.src, r),
+            .addc => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .rlc => |x| isVregByte(x.src, r),
+            .rrc => |x| isVregByte(x.src, r),
+            .subb => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .shl => |x| isVregByte(x.lhs, r),
             .shr => |x| isVregByte(x.lhs, r),
             .mov => |x| isVregByte(x.src, r),
@@ -760,6 +851,18 @@ const Lower = struct {
                 break :blk mcsmir.Op{ .rem_ = y };
             },
             .not_ => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .not_ = .{ .dst = x.dst, .src = to } } else null,
+            .rlc => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .rlc = .{ .dst = x.dst, .src = to } } else null,
+            .rrc => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .rrc = .{ .dst = x.dst, .src = to } } else null,
+            .addc => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .addc = y };
+            },
+            .subb => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .subb = y };
+            },
             .shl => |x| if (isVregByte(x.lhs, from)) mcsmir.Op{ .shl = .{ .dst = x.dst, .lhs = to, .n = x.n } } else null,
             .shr => |x| if (isVregByte(x.lhs, from)) mcsmir.Op{ .shr = .{ .dst = x.dst, .lhs = to, .n = x.n } } else null,
             .cmp_br => |x| blk: {
@@ -1271,10 +1374,10 @@ const Lower = struct {
 
             .arg => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                if (!self.typeIsU8(ty)) {
+                if (self.wideBytes(ty) == null or ty.isSignedInt(self.zcu)) {
                     return self.zcu.codegenFail(
                         self.nav,
-                        "mcs2: 参数类型 {s} 尚未实现（M1 只支持 u8）",
+                        "mcs2: 参数类型 {s} 尚未实现（目前只支持无符号 8/16/32 位）",
                         .{@tagName(ty.zigTypeTag(self.zcu))},
                     );
                 }
@@ -1285,7 +1388,31 @@ const Lower = struct {
                         .{mcsmir.abi.max_arg_bytes},
                     );
                 }
-                // ADR-001 边界 ABI：arg0 → DPL；arg1+ → 静态 `_名_PARM_n`（SDCC 同款）。
+                // ADR-001 边界 ABI：按**字节**摆放（arg0 → DPL，之后 → PARM_n）；
+                // u16 占两个字节（DPL/DPH 或 PARM_n/PARM_{n+1}）。
+                const nlat = self.wideBytes(ty) orelse 1;
+                if (nlat > 1) {
+                    const base = try self.allocWide(nlat);
+                    var k: u8 = 0;
+                    while (k < nlat) : (k += 1) {
+                        const pos = self.abi_byte + k;
+                        const src: mcsmir.Byte = if (pos == 0)
+                            .{ .dir = mcsmir.abi.dpl }
+                        else if (pos == 1)
+                            .{ .dir = mcsmir.abi.dph }
+                        else blk: {
+                            const psym = try std.fmt.allocPrint(self.gpa, "_{s}_PARM_{d}", .{ self.short_name, pos + 1 });
+                            try self.parms.append(self.gpa, psym);
+                            break :blk .{ .sym = psym };
+                        };
+                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(base + k), .src = src } });
+                    }
+                    self.abi_byte += nlat;
+                    self.arg_cursor += 1;
+                    self.vals[@backingInt(inst)] = mcsmir.v(base);
+                    self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, nlat) << 8);
+                    continue;
+                }
                 if (self.arg_cursor == 0) {
                     if (self.needs_dptr) {
                         // DPL 会被地址计算覆盖：先落到 vreg（3 字节，换正确性）。
@@ -1308,6 +1435,7 @@ const Lower = struct {
                     if (self.arg_cursor + 1 == 3) self.b_is_arg = true;
                     self.vals[@backingInt(inst)] = .{ .sym = psym };
                 }
+                self.abi_byte += 1;
                 self.arg_cursor += 1;
             },
 
@@ -1332,6 +1460,28 @@ const Lower = struct {
 
             .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap => {
                 const bin = data.bin_op;
+                const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                const n = self.wideBytes(ty) orelse 1;
+                // 多字节：固定模板 = clr c + addc/subb 逐字节（低字节在前）。
+                if (n > 1) {
+                    const a = try self.wideOperand(bin.lhs, n);
+                    const b = try self.wideOperand(bin.rhs, n);
+                    const d = try self.allocWide(n);
+                    const is_add = switch (tag) {
+                        .add, .add_safe, .add_wrap => true,
+                        else => false,
+                    };
+                    try self.ops.append(self.gpa, .{ .clr_c = {} });
+                    var k: u8 = 0;
+                    while (k < n) : (k += 1) {
+                        try self.ops.append(self.gpa, if (is_add)
+                            .{ .addc = .{ .dst = mcsmir.v(d + k), .lhs = mcsmir.v(a + k), .rhs = mcsmir.v(b + k) } }
+                        else .{ .subb = .{ .dst = mcsmir.v(d + k), .lhs = mcsmir.v(a + k), .rhs = mcsmir.v(b + k) } });
+                    }
+                    self.vals[@backingInt(inst)] = mcsmir.v(d);
+                    self.wide[@backingInt(inst)] = @as(u16, d) | (@as(u16, n) << 8);
+                    continue;
+                }
                 const lhs = try self.refLoc(bin.lhs);
                 const rhs = try self.refLoc(bin.rhs);
                 // 「ret 前看一眼」：下一非调试指令若是 ret 且操作数是本指令，
@@ -1430,10 +1580,40 @@ const Lower = struct {
                 self.vals[@backingInt(inst)] = d;
             },
 
-            // 移位：只支持 u8 + 编译期常量次数（8051 用 rlc/rrc 逐位做）。
+            // 移位：u8 用 rlc/rrc 逐位；多字节用逐字节模板（低→高 / 高→低）。
             .shl, .shl_exact, .shr, .shr_exact => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                if (!self.typeIsU8(ty)) return self.fail("移位只支持 u8（暂不实现其它宽度）", .{});
+                const nw = self.wideBytes(ty) orelse 0;
+                if (nw == 0) return self.fail("移位只支持 8/16/32 位无符号", .{});
+                if (nw > 1) {
+                    const bin = data.bin_op;
+                    const cnt = self.constU8(bin.rhs) orelse
+                        return self.fail("移位次数必须是编译期常量", .{});
+                    const a = try self.wideOperand(bin.lhs, nw);
+                    const d = try self.allocWide(nw);
+                    const left = switch (tag) { .shl, .shl_exact => true, else => false };
+                    // 先复制到目标（允许原地）
+                    var c0: u8 = 0;
+                    while (c0 < nw) : (c0 += 1) {
+                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(d + c0), .src = mcsmir.v(a + c0) } });
+                    }
+                    var step: u8 = 0;
+                    while (step < cnt) : (step += 1) {
+                        try self.ops.append(self.gpa, .{ .clr_c = {} });
+                        var k: u8 = 0;
+                        while (k < nw) : (k += 1) {
+                            // 左移从低字节到高字节；右移反过来
+                            const bidx = if (left) k else (nw - 1 - k);
+                            try self.ops.append(self.gpa, if (left)
+                                .{ .rlc = .{ .dst = mcsmir.v(d + bidx), .src = mcsmir.v(d + bidx) } }
+                            else .{ .rrc = .{ .dst = mcsmir.v(d + bidx), .src = mcsmir.v(d + bidx) } });
+                        }
+                    }
+                    self.vals[@backingInt(inst)] = mcsmir.v(d);
+                    self.wide[@backingInt(inst)] = @as(u16, d) | (@as(u16, nw) << 8);
+                    continue;
+                }
+                if (!self.typeIsU8(ty)) return self.fail("移位只支持 u8", .{});
                 const bin = data.bin_op;
                 const n = self.constU8(bin.rhs) orelse
                     return self.fail("移位次数必须是编译期常量（运行期移位暂不支持）", .{});
@@ -1454,23 +1634,67 @@ const Lower = struct {
                 const dst_ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 // 只跟踪 8 位：放宽（源 ≤8 位）与截断（目标 ≤8 位）都不改低字节，
                 // 可以原样透传；两侧都更宽时语义不可丢失，直接拒绝。
-                const src_bits = src_ty.bitSize(self.zcu);
-                const dst_bits = dst_ty.bitSize(self.zcu);
-                if (src_bits > 8 and dst_bits > 8)
-                    return self.fail("整数转换两侧都超过 8 位（M1 只跟踪低字节）", .{});
-                self.vals[@backingInt(inst)] = try self.refLoc(ty_op.operand);
+                const dn = self.wideBytes(dst_ty) orelse 1;
+                const sn = self.wideBytes(src_ty) orelse 1;
+                if (dn == 1 and sn == 1) {
+                    self.vals[@backingInt(inst)] = try self.refLoc(ty_op.operand);
+                } else if (dn == 1) {
+                    // 收窄到 8 位：取低字节
+                    const base = try self.wideOperand(ty_op.operand, sn);
+                    self.vals[@backingInt(inst)] = mcsmir.v(base);
+                } else {
+                    // 放大或等宽：准备 dn 个槽位（高位补零）
+                    const base = try self.wideOperand(ty_op.operand, dn);
+                    self.vals[@backingInt(inst)] = mcsmir.v(base);
+                    self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, dn) << 8);
+                }
             },
 
             .alloc => {
                 // M1：每个局部槽一个 vreg（DSEG 直址）；活跃期优化留给后续 pass。
-                const r = try self.allocVreg();
-                self.vals[@backingInt(inst)] = mcsmir.v(r);
+                const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                const n = self.wideBytes(ty) orelse 1;
+                const base = try self.allocWide(n);
+                self.vals[@backingInt(inst)] = mcsmir.v(base);
+                if (n > 1) self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, n) << 8);
             },
 
             .store, .store_safe => {
                 // bin_op：lhs = 目标，rhs = 值。
+                // 多字节值写回局部槽：逐字节搬运（槽必须是连续的）。
+                const rty = self.air.typeOf(data.bin_op.rhs, &self.zcu.intern_pool);
+                const rn = self.wideBytes(rty) orelse 1;
+                if (rn > 1) {
+                    const sbase = try self.wideOperand(data.bin_op.rhs, rn);
+                    const wn = rn;
+                    const dest = try self.refLoc(data.bin_op.lhs);
+                    const dbase: u8 = switch (dest) {
+                        .vreg => |v| v,
+                        else => return self.fail("多字节写目前只支持局部槽目标", .{}),
+                    };
+                    var k2: u8 = 0;
+                    while (k2 < wn) : (k2 += 1) {
+                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dbase + k2), .src = mcsmir.v(sbase + k2) } });
+                    }
+                    continue;
+                }
                 // 目标为固定地址指针（@ptrFromInt）：≤0xFF → SFR/直址；>0xFF → xdata。
                 const bin = data.bin_op;
+                // 多字节写：目标槽位逐字节搬运（目标必须是连续 vreg 槽）。
+                if (self.wideOf(bin.rhs)) |w| {
+                    const wn: u8 = @truncate(w >> 8);
+                    const sbase: u8 = @truncate(w & 0xFF);
+                    const dest = try self.refLoc(bin.lhs);
+                    const dbase = switch (dest) {
+                        .vreg => |v| v,
+                        else => return self.fail("多字节写目前只支持局部槽目标", .{}),
+                    };
+                    var k2: u8 = 0;
+                    while (k2 < wn) : (k2 += 1) {
+                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dbase + k2), .src = mcsmir.v(sbase + k2) } });
+                    }
+                    continue;
+                }
                 if (self.ptrRefOf(bin.lhs)) |pr| {
                     const value = try self.refLoc(bin.rhs);
                     switch (pr) {
@@ -1531,6 +1755,21 @@ const Lower = struct {
             },
 
             .load => {
+                // 宽类型（u16/u32）读取：槽位直接当多字节值，记录宽信息。
+                const lty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                const ln_b = self.wideBytes(lty) orelse 1;
+                if (ln_b > 1) {
+                    if (self.ptrRefOf(data.ty_op.operand) != null)
+                        return self.fail("多字节 xdata 读取尚未实现（先支持局部槽）", .{});
+                    const src = try self.refLoc(data.ty_op.operand);
+                    const base: u8 = switch (src) {
+                        .vreg => |v| v,
+                        else => return self.fail("多字节读取需要局部槽", .{}),
+                    };
+                    self.vals[@backingInt(inst)] = mcsmir.v(base);
+                    self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, ln_b) << 8);
+                    continue;
+                }
                 // ty_op：operand = 指针。固定地址 → load_dir（≤0xFF）/ load_xdata（>0xFF）；
                 // 本地槽 → 直读。
                 const ty_op = data.ty_op;
@@ -1600,13 +1839,20 @@ const Lower = struct {
                     if (operand.toIndex() == null and operand.toInterned() == null) {
                         return self.zcu.codegenFail(self.nav, "mcs2: ret 操作数无效", .{});
                     }
-                    const loc = try self.refLoc(operand);
-                    const already = switch (loc) {
-                        .dir => |a| a == rb,
-                        else => false,
-                    };
-                    if (!already) {
-                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = rb, .src = loc } });
+                    if (self.ret_wide > 1) {
+                        // 多字节返回：模板 = 低字节→DPL，高字节→DPH。
+                        const base = try self.wideOperand(operand, self.ret_wide);
+                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = rb, .src = mcsmir.v(base) } });
+                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = mcsmir.abi.dph, .src = mcsmir.v(base + 1) } });
+                    } else {
+                        const loc = try self.refLoc(operand);
+                        const already = switch (loc) {
+                            .dir => |a| a == rb,
+                            else => false,
+                        };
+                        if (!already) {
+                            try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = rb, .src = loc } });
+                        }
                     }
                 }
                 try self.ops.append(self.gpa, .{ .ret = {} });
@@ -1703,15 +1949,24 @@ pub fn generate(
     const lower_ret_byte: ?u8 = if (ret_ty.zigTypeTag(zcu) == .void)
         null
     else blk: {
-        if (ret_ty.zigTypeTag(zcu) != .int or ret_ty.bitSize(zcu) != 8 or ret_ty.isSignedInt(zcu)) {
+        if (ret_ty.zigTypeTag(zcu) != .int or ret_ty.isSignedInt(zcu) or
+            (ret_ty.bitSize(zcu) != 8 and ret_ty.bitSize(zcu) != 16))
+        {
             return zcu.codegenFail(
                 func.owner_nav,
-                "mcs2: 返回类型 {s} 尚未实现（M1 只支持 void/u8）",
+                "mcs2: 返回类型 {s} 尚未实现（目前 void/u8/u16）",
                 .{@tagName(ret_ty.zigTypeTag(zcu))},
             );
         }
         break :blk mcsmir.abi.dpl;
     };
+    // 返回宽度：u16 走 DPL/DPH 两个字节。
+    const lower_ret_wide: u8 = if (lower_ret_byte == null)
+        1
+    else if (ret_ty.bitSize(zcu) == 16)
+        2
+    else
+        1;
 
     // 中断函数检测：callconv(.{ .mcs51_interrupt = .{ .vector = n } })（M1.5）。
     // 向量号 1-based（STC 手册口径），8051 向量地址 = 0x0003 + 8*(n-1)；
@@ -1763,6 +2018,11 @@ pub fn generate(
     @memset(lw.ptr_vals, null);
 
     lw.needs_dptr = lw.airNeedsDptr();
+    lw.ret_wide = lower_ret_wide;
+
+    lw.wide = try gpa.alloc(?u16, air.instructions.len);
+    defer gpa.free(lw.wide);
+    @memset(lw.wide, null);
     // 关键：ISR 的尾声（pop + reti）靠这个字段判定；漏赋值会让 ISR 以 `ret` 结束、
     // 且不恢复现场（栈上留下 4 字节，打断主程序后必错）。
     lw.is_isr = is_isr;
@@ -1822,7 +2082,11 @@ pub fn generate(
 
     // compile 之后 Op 序列与符号名都不再需要，就地释放（Debug SafeAllocator 门禁）。
     defer gpa.free(f.ops);
-    defer gpa.free(f.parms);
+    // 参数区的符号名是 allocPrint 出来的，逐个释放（SafeAllocator 会查泄漏）。
+    defer {
+        for (f.parms) |psym| gpa.free(psym);
+        gpa.free(f.parms);
+    }
     const text = try mcs51.compileEx(f, gpa, false);
     defer gpa.free(text);
 
