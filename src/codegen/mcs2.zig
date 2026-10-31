@@ -2071,6 +2071,21 @@ const Lower = struct {
                 const rn = try self.storageBytes(rty, "写回");
                 if (rn > 1) {
                     const sbase = try self.wideOperand(data.bin_op.rhs, rn);
+                    // ① 固定地址目标（@ptrFromInt）：逐字节写（≤0xFF 直址，否则 xdata）。
+                    //    这是 u32 全局/外设寄存器块的最短路径，不经过 vreg 槽。
+                    if (self.ptrRefOf(data.bin_op.lhs)) |pr| if (pr == .fixed) {
+                        const faddr = pr.fixed;
+                        var k3: u8 = 0;
+                        while (k3 < rn) : (k3 += 1) {
+                            const a3 = faddr + k3;
+                            if (a3 <= 0xFF) {
+                                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(a3), .src = mcsmir.v(sbase + k3) } });
+                            } else if (a3 <= 0xFFFF) {
+                                try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = @intCast(a3), .src = mcsmir.v(sbase + k3) } });
+                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{a3});
+                        }
+                        continue;
+                    };
                     const wn = rn;
                     const dest = try self.refLoc(data.bin_op.lhs);
                     const dbase: u8 = switch (dest) {
@@ -2164,6 +2179,23 @@ const Lower = struct {
                 const lty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 const ln_b = try self.storageBytes(lty, "读取");
                 if (ln_b > 1) {
+                    // ① 固定地址源（@ptrFromInt）：逐字节读，直接拼成 n 字节槽。
+                    if (self.ptrRefOf(data.ty_op.operand)) |pr| if (pr == .fixed) {
+                        const faddr = pr.fixed;
+                        const wbase = try self.allocWide(ln_b);
+                        var k4: u8 = 0;
+                        while (k4 < ln_b) : (k4 += 1) {
+                            const a4 = faddr + k4;
+                            if (a4 <= 0xFF) {
+                                try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(wbase + k4), .addr = @intCast(a4) } });
+                            } else if (a4 <= 0xFFFF) {
+                                try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(wbase + k4), .addr = @intCast(a4) } });
+                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{a4});
+                        }
+                        self.vals[@backingInt(inst)] = mcsmir.v(wbase);
+                        self.wide[@backingInt(inst)] = @as(u16, wbase) | (@as(u16, ln_b) << 8);
+                        continue;
+                    };
                     if (self.ptrRefOf(data.ty_op.operand) != null)
                         return self.fail("多字节 xdata 读取尚未实现（先支持局部槽）", .{});
                     const src = try self.refLoc(data.ty_op.operand);

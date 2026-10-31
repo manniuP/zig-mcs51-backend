@@ -406,6 +406,19 @@ CASES: dict[str, dict] = {
     "call_addr": dict(kind="call", src="indcall.zig", fn="call_addr", args=[("DPL", 9)], want=10),
     # 命令分发（语句形态 switch）：enum 选分支 + 统一参数/返回
     "dispatch": dict(kind="call", src="switchd.zig", fn="dispatch", args=[("DPL", 2)], want=0x22),
+    # 固定地址的多字节读写（u32 @ 0x8000）
+    "wstore": dict(kind="call", src="xdata32.zig", fn="wstore",
+                   args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
+                   want=None, expect_mem={0x8100: 0x78, 0x8101: 0x56, 0x8102: 0x34, 0x8103: 0x12}),
+    "wround": dict(kind="call", src="xdata32.zig", fn="wround",
+                   args=[("DPL", 0xFE), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF)],
+                   want32=0xFFFFFFFF),   # v = 0xFFFFFFFE，+1 → 0xFFFFFFFF
+    "wround2": dict(kind="call", src="xdata32.zig", fn="wround2",
+                    args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
+                    want32=0x12345678),
+    "addone": dict(kind="call", src="xdata32.zig", fn="addone",
+                   args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
+                   want32=0x12345679),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -423,6 +436,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "lt32", "lt32b", "ge8t", "ge8f",
          "chain", "chain32", "mix32",
          "call_ind", "twice_ind", "call_addr", "dispatch",
+         "wstore", "wround", "wround2", "addone",
          "ringdemo"]
 
 
@@ -474,7 +488,7 @@ def check_call(name: str, spec: dict) -> bool:
     extra = [(min(expect_mem), len(expect_mem))] if expect_mem else None
     got = sim(ihx, steps=steps, slots=1, extra=extra)
     ok = True
-    if want_wide is None:
+    if want_wide is None and spec.get("want") is not None:
         val = got.get(0x8000)
         ok = val == spec["want"]
         print(f"  {'PASS' if ok else 'FAIL'}: {name} = {val}（期望 {spec['want']}）")
