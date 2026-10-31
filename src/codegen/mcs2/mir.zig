@@ -113,6 +113,8 @@ pub const Op = union(enum) {
     subb: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs * rhs（8 位回绕）。发射：`mov a,lhs; mov b,rhs; mul ab; mov dst,a`。
     mul: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// 8×8→16：一次 MUL AB 同时拿两个字节（lo=A 低字节，hi=B 高字节）。
+    mul16: struct { lo: Byte, hi: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs / rhs（无符号整除）。发射：`mov a,lhs; mov b,rhs; div ab; mov dst,a`。
     div_: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs % rhs。发射：`mov a,lhs; mov b,rhs; div ab; mov dst,b`。
@@ -166,6 +168,8 @@ pub const Op = union(enum) {
     /// 位置值非零则跳转（发射为 `mov a,src` + `jnz rel` 两步；
     /// 8051 的 JZ/JNZ 只测 A，不测 direct）。
     br_ifnz: struct { cond: Byte, target: u32 },
+    /// 进位/借位条件跳转（`jc`/`jnc`）。多字节除法试减、32 位乘法的移位加法用。
+    br_c: struct { target: u32, on_set: bool },
     /// 位置值为零则跳转（`mov a,src` + `jz rel`）；cond_br 的 else 分支用。
     br_ifz: struct { cond: Byte, target: u32 },
     /// 位测试跳转（8051 `jb`/`jnb`）：`bit` 是位地址（SFR 区按 (A-0x80)*8+n 算）。

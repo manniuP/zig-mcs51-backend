@@ -171,7 +171,7 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .pop => |x| if (touchesDplDph(x.dst)) null else prev,
         .dec => prev,
         .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .ret, .reti, .halt,
-        .sex, .cmp_wide_br => null,
+        .sex, .cmp_wide_br, .mul16, .br_c => null,
     };
 }
 
@@ -272,6 +272,12 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             } },
             .and_ => |x| .{ .and_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .mul => |x| .{ .mul = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .mul16 => |x| .{ .mul16 = .{
+                .lo = byteOf(x.lo, f.vreg_base),
+                .hi = byteOf(x.hi, f.vreg_base),
+                .lhs = byteOf(x.lhs, f.vreg_base),
+                .rhs = byteOf(x.rhs, f.vreg_base),
+            } },
             .div_ => |x| .{ .div_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .rem_ => |x| .{ .rem_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .not_ => |x| .{ .not_ = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
@@ -291,7 +297,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
-            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c => op,
+            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c => op,
         };
         // 这次 xdata 访问想要的 DPTR 内容；与当前一致就不重建。
         const want_dptr: ?DptrState = switch (m_op) {
@@ -671,6 +677,13 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     .{ mnemonic, x.bit },
                 ), .jump = x.target } });
             },
+            .br_c => |x| {
+                if (x.on_set) {
+                    try items.append(gpa, .{ .line = .{ .text = "jc", .jump = x.target } });
+                } else {
+                    try items.append(gpa, .{ .line = .{ .text = "jnc", .jump = x.target } });
+                }
+            },
             .br_ifz => |x| {
                 const c = try byteText(gpa, x.cond);
                 try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
@@ -733,6 +746,16 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                         }
                     },
                 }
+            },
+            .mul16 => |x| {
+                // 一次 MUL AB：A = 积低字节，B = 积高字节。
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{try byteText(gpa, x.lhs)}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,{s}", .{try byteText(gpa, x.rhs)}), .jump = null } },
+                    .{ .line = .{ .text = "    mul ab", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{try byteText(gpa, x.lo)}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},b", .{try byteText(gpa, x.hi)}), .jump = null } },
+                });
             },
             .sex => |x| {
                 const s = try byteText(gpa, x.src);

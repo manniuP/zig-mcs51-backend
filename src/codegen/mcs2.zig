@@ -269,6 +269,58 @@ const Lower = struct {
         }
     }
 
+    /// 多字节乘法（固定模板）：
+    ///   n=2（16×16→16，3 次 MUL，展开）：结果的低 16 位
+    ///     = lo(a0*b0) | ((hi(a0*b0) + lo(a0*b1) + lo(a1*b0)) << 8)。
+    ///     交叉项只取**低**字节——它乘的是 256 的权重。
+    ///   n=4（32×32→32 低半，移位加法循环，代码 ~55B）：
+    ///     逐位取 a 的 MSB：dst <<= 1；位为 1 则 dst += b。
+    ///     展开的 10 次 MUL 版本要 ~200B，51 上代码比周期贵，选循环。
+    fn mulWide(self: *Lower, dst: u8, a: u8, b: u8, n: u8) !void {
+        if (n == 2) {
+            const t0 = try self.allocVreg();
+            const t1 = try self.allocVreg();
+            const t2 = try self.allocVreg();
+            try self.ops.append(self.gpa, .{ .mul16 = .{ .lo = mcsmir.v(dst), .hi = mcsmir.v(t0), .lhs = mcsmir.v(a), .rhs = mcsmir.v(b) } });
+            try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(t1), .lhs = mcsmir.v(a), .rhs = mcsmir.v(b + 1) } });
+            try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(t2), .lhs = mcsmir.v(a + 1), .rhs = mcsmir.v(b) } });
+            try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(dst + 1), .lhs = mcsmir.v(t0), .rhs = mcsmir.v(t1) } });
+            try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(dst + 1), .lhs = mcsmir.v(dst + 1), .rhs = mcsmir.v(t2) } });
+            return;
+        }
+        const t = try self.allocWide(n);
+        const ctr = try self.allocVreg();
+        var k: u8 = 0;
+        while (k < n) : (k += 1) {
+            try self.immTo(dst + k, 0);
+            try self.movTo(t + k, mcsmir.v(a + k));
+        }
+        try self.immTo(ctr, n * 8);
+        const l_loop = self.tempLabel();
+        const l_skip = self.tempLabel();
+        try self.ops.append(self.gpa, .{ .label = l_loop });
+        // dst <<= 1（移出的最高位丢弃）
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(dst + k), .src = mcsmir.v(dst + k) } });
+        }
+        // t <<= 1，C = a 的下一位（从最高位开始）
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(t + k), .src = mcsmir.v(t + k) } });
+        }
+        try self.ops.append(self.gpa, .{ .br_c = .{ .target = l_skip, .on_set = false } });
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .addc = .{ .dst = mcsmir.v(dst + k), .lhs = mcsmir.v(dst + k), .rhs = mcsmir.v(b + k) } });
+        }
+        try self.ops.append(self.gpa, .{ .label = l_skip });
+        try self.ops.append(self.gpa, .{ .dec_br_nz = .{ .dst = mcsmir.v(ctr), .target = l_loop } });
+    }
+
     /// 把一个操作数准备成 n 个连续槽位，返回基址。
     /// 变宽时按来源类型的符号性补位：无符号补 0，有符号补符号位——
     /// 这就是 i8→i16→i32 的符号扩展，也是负数常量变宽的位模式来源。
@@ -727,6 +779,12 @@ const Lower = struct {
             .or_ => |x| .{ .or_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .mul => |x| .{ .mul = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .mul16 => |x| .{ .mul16 = .{
+                .lo = mapByteVreg(x.lo, map),
+                .hi = mapByteVreg(x.hi, map),
+                .lhs = mapByteVreg(x.lhs, map),
+                .rhs = mapByteVreg(x.rhs, map),
+            } },
             .div_ => |x| .{ .div_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .rem_ => |x| .{ .rem_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .not_ => |x| .{ .not_ = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
@@ -758,6 +816,7 @@ const Lower = struct {
             .br_ifz => |x| .{ .br_ifz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
             .cmp_br => |x| .{ .cmp_br = .{ .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map), .cc = x.cc, .target = x.target } },
             .dec_br_nz => |x| .{ .dec_br_nz = .{ .dst = mapByteVreg(x.dst, map), .target = x.target } },
+            .br_c => op,
             .push => |x| .{ .push = .{ .src = mapByteVreg(x.src, map) } },
             .pop => |x| .{ .pop = .{ .dst = mapByteVreg(x.dst, map) } },
             .dec => op, // 载荷是裸 vreg 下标；对应 vreg 已被禁用映射
@@ -1668,7 +1727,27 @@ const Lower = struct {
                     self.vals[@backingInt(inst)] = d;
                     continue;
                 }
-                if (info.bytes != 1) return self.fail("乘除的多字节模板尚未实现", .{});
+                if (info.bytes > 1) {
+                    if (tag != .mul and tag != .mul_wrap)
+                        return self.fail("多字节除法/取余尚未实现（乘法已有模板）", .{});
+                    const n = info.bytes;
+                    const binw = data.bin_op;
+                    const a = try self.wideOperand(binw.lhs, n);
+                    const b2 = try self.wideOperand(binw.rhs, n);
+                    const dw = try self.allocWide(n);
+                    var saved_bw: ?u8 = null;
+                    if (self.b_is_arg) {
+                        saved_bw = try self.allocVreg();
+                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(saved_bw.?), .src = .{ .dir = 0xF0 } } });
+                    }
+                    try self.mulWide(dw, a, b2, n);
+                    if (saved_bw) |sv| {
+                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = .{ .dir = 0xF0 }, .src = mcsmir.v(sv) } });
+                    }
+                    self.vals[@backingInt(inst)] = mcsmir.v(dw);
+                    self.wide[@backingInt(inst)] = @as(u16, dw) | (@as(u16, n) << 8);
+                    continue;
+                }
                 const d = mcsmir.v(try self.allocVreg());
                 const bin = data.bin_op;
                 const lhs = try self.refLoc(bin.lhs);

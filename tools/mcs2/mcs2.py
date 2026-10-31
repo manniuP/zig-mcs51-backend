@@ -320,6 +320,20 @@ CASES: dict[str, dict] = {
     "wbits":    dict(kind="call", src="wide.zig", fn="wbits",
                      args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
                      want32=0xEDFFA90F),
+    # 多字节乘法（固定模板）：16×16→16 走 3 次 MUL，32 位走 10 次 MUL
+    "u16mul":  dict(kind="call", src="mul.zig", fn="u16mul",
+                    args=[("DPL", 0x02), ("DPH", 0x01), ("PARM_2", 0x04), ("PARM_3", 0x03)],
+                    want16=0x0A08),
+    "u16mul2": dict(kind="call", src="mul.zig", fn="u16mul",
+                    args=[("DPL", 0xFF), ("DPH", 0xFF), ("PARM_2", 0xFF), ("PARM_3", 0xFF)],
+                    want16=0x0001),
+    "i16mul":  dict(kind="call", src="mul.zig", fn="i16mul",
+                    args=[("DPL", 0xFD), ("DPH", 0xFF), ("PARM_2", 0x05), ("PARM_3", 0x00)],
+                    want16=0xFFF1),
+    "u32mul":  dict(kind="call", src="mul32.zig", fn="u32mul",
+                    args=[("DPL", 0x01), ("DPH", 0x00), ("B", 0x01), ("ACC", 0x00),
+                          ("PARM_2", 0x01), ("PARM_3", 0x00), ("PARM_4", 0x01), ("PARM_5", 0x00)],
+                    want32=0x00020001, steps=20000),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -330,7 +344,8 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "mul8", "div8", "rem8", "not8", "xnor8",
          "u16add", "u16sub", "u16carry", "u16shl", "u16shr", "u32add", "u32carry",
          "sexcmp", "sexcmp2", "sex16", "i32add", "sar32", "sar8",
-         "ucmp_eq", "ucmp_gt", "ucmp_lt", "wbits", "ringdemo"]
+         "ucmp_eq", "ucmp_gt", "ucmp_lt", "wbits",
+         "u16mul", "u16mul2", "i16mul", "u32mul", "ringdemo"]
 
 
 def check_selftest() -> bool:
