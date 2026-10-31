@@ -84,13 +84,21 @@ def harness_lib(wait_ti: bool) -> str:
     """打印子程序。wait_ti=True 给真机（等 TI 再发下一个字符）；
     False 给 ucsim（ucsim 的 SBUF/TI 时序不可靠，等它会卡死——只求把字符吐出来）。
     两种模式只有 _putw 不同，算术部分的 .ihx 完全一致。"""
+    # 真机版：等 TI，但**有上限**（r4/r5 两级计数器，~2.5 ms/字符）——
+    # 万一 UART 没配对，宁可丢字符也不能把固件挂死在这里。
     putw = ("_putw:\n"
+            "    mov r5,#0xC8\n"
+            "_pw_outer:\n"
+            "    mov r4,#0x00\n"
             "_pw_loop:\n"
-            "    jnb 0x99,_pw_loop\n"
+            "    jb 0x99,_pw_done\n"
+            "    djnz r4,_pw_loop\n"
+            "    djnz r5,_pw_outer\n"
+            "_pw_done:\n"
             "    clr 0x99\n"
             "    ret\n") if wait_ti else "_putw:\n    ret\n"
     return """
-    sjmp _fin
+    ljmp _again
 _phd:
     mov r6,a
     add a,#0x30
@@ -170,9 +178,11 @@ def build_group(cases: list[str], idx: int, board: str, fosc: float, baud: int,
     suffix = "" if wait_ti else "_sim"
     _, body = mcs2.emit_asm(HERE / "tests" / src, f"real_g{idx}{suffix}")
     harness = harness_head(board, fosc, baud)
+    # 整组结果**反复打印**：烧完随时接串口都能收到（接线/烧录占着串口的顺序不再冲突）。
+    harness += "_again:\n"
     for i, c in enumerate(cases):
         harness += case_asm(c, mcs2.CASES[c], 0x8000 + i * 4)
-    harness += harness_lib(wait_ti) + "_fin:\n    sjmp .\n"
+    harness += harness_lib(wait_ti)
     tag = f"real_g{idx}{suffix}_{src.split('.')[0]}"
     merged = mcs2.merge(tag, harness, body)
     ihx = mcs2.assemble(merged, tag, dseg=0x30, cseg=0x0000)
