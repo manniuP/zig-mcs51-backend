@@ -34,8 +34,7 @@ export fn main() void {
     TCON.* = 0x40;
     SCON.* = 0x40;
 
-    var n: u8 = 0;
-    while (n < 255) : (n += 1) {
+    while (true) {
         SBUF.* = 'H';
         delay1ms();
         SBUF.* = 'E';

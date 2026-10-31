@@ -142,6 +142,18 @@ const Lower = struct {
 
     // ==== M2：控制流 ====
 
+    fn labelReferenced(self: *Lower, id: u32) bool {
+        for (self.ops.items) |op| switch (op) {
+            .br => |t| if (t == id) return true,
+            .br_ifnz => |x| if (x.target == id) return true,
+            .br_ifz => |x| if (x.target == id) return true,
+            .cmp_br => |x| if (x.target == id) return true,
+            .dec_br_nz => |x| if (x.target == id) return true,
+            else => {},
+        };
+        return false;
+    }
+
     fn blockHead(self: *Lower, inst: Air.Inst.Index) u32 {
         return self.label_base + @as(u32, @backingInt(inst)) * 2;
     }
@@ -869,13 +881,19 @@ const Lower = struct {
             .loop => {
                 const blk = self.air.unwrapBlock(inst);
                 try self.ops.append(self.gpa, .{ .label = self.blockHead(inst) });
-                _ = try self.emitBody(blk.body);
-                try self.ops.append(self.gpa, .{ .label = self.blockEnd(inst) });
+                const inner = try self.emitBody(blk.body);
+                const end_l = self.blockEnd(inst);
+                // while(true)：body 终结且无人 break 到块尾 → 整个循环不会落空
+                if (inner and !self.labelReferenced(end_l)) return true;
+                try self.ops.append(self.gpa, .{ .label = end_l });
             },
             .block => {
                 const blk = self.air.unwrapBlock(inst);
-                _ = try self.emitBody(blk.body);
-                try self.ops.append(self.gpa, .{ .label = self.blockEnd(inst) });
+                const inner = try self.emitBody(blk.body);
+                const end_l = self.blockEnd(inst);
+                // 块内已终结且没人 break 到块尾 → 整个块也不会落空（while(true) 的常见形态）
+                if (inner and !self.labelReferenced(end_l)) return true;
+                try self.ops.append(self.gpa, .{ .label = end_l });
             },
             .cmp_lt, .cmp_lt_optimized, .cmp_lte, .cmp_lte_optimized,
             .cmp_gt, .cmp_gt_optimized, .cmp_gte, .cmp_gte_optimized,
