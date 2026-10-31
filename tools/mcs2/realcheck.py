@@ -212,6 +212,9 @@ def main() -> int:
     ap.add_argument("--read", metavar="PORT", help="读串口逐项比对（例 COM8）")
     ap.add_argument("--dl", metavar="PORT",
                     help="只发一次触发字节让固件软复位进 ISP（AiCube 点下载前/后都行）")
+    ap.add_argument("--watch", metavar="PORT",
+                    help="边烧边收：轮询串口累积各组结果，直到 48 项收齐或超时")
+    ap.add_argument("--seconds", type=float, default=600.0, help="--watch 最长秒数")
     ap.add_argument("--board", choices=("ai8051u", "stc8h"), default="ai8051u",
                     help="ai8051u：UART1 → P3.0/P3.1 + Timer2（默认）；stc8h：P3.6/P3.7 + Timer1")
     ap.add_argument("--baud", type=int, default=115200)
@@ -221,6 +224,8 @@ def main() -> int:
     args = ap.parse_args()
     if args.dl:
         return send_download(args.dl, args.baud)
+    if args.watch:
+        return watch(args.watch, args.baud, args.seconds)
     if not (args.sim or args.build or args.read):
         ap.print_help()
         return 2
@@ -283,6 +288,63 @@ def main() -> int:
         return read_serial(args.read, args.baud, order, by_src)
     print("PASS: 仿真自检全部通过" if ok_all else "FAIL: 有组不一致")
     return 0 if ok_all else 1
+
+
+def watch(port: str, baud: int, seconds: float) -> int:
+    """边烧边收：短暂开门（1.2 s）+ 关门的轮询读法。
+
+    为什么不是一直开着：AiCube 下载要**独占**串口，一直占着它就下不了；
+    而固件是循环重复打印的，所以「开 1.2 s 关 2 s」也能把每组的结果都收齐。
+    """
+    try:
+        import serial
+    except ImportError:
+        print("缺 pyserial：pip install pyserial")
+        return 2
+    import time
+
+    want: dict[str, tuple[int, int]] = {}
+    for c in REAL_CASES:
+        spec = mcs2.CASES[c]
+        want[c] = (spec.get("want32", spec.get("want16", spec.get("want"))), ret_bytes(spec))
+    seen: dict[str, int] = {}
+    buf = b""
+    deadline = time.time() + seconds
+    print(f"== 轮询 {port}@{baud}，最长 {seconds:.0f} s：每烧一组会自动收进来")
+    while len(seen) < len(want) and time.time() < deadline:
+        try:
+            with serial.Serial(port, baud, timeout=0.2) as sp:
+                sp.reset_input_buffer()
+                t_end = time.time() + 1.2
+                while time.time() < t_end and len(seen) < len(want):
+                    chunk = sp.read(256)
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\r\n" in buf:
+                        line, buf = buf.split(b"\r\n", 1)
+                        m = re.match(rb"^([a-z0-9_]+)=([0-9A-Fa-f]+)$", line.strip())
+                        if not m:
+                            continue
+                        name = m.group(1).decode()
+                        if name in seen or name not in want:
+                            continue
+                        raw = bytes.fromhex(m.group(2).decode())
+                        val = sum(b << (8 * k) for k, b in enumerate(raw))
+                        seen[name] = val
+                        w, rb = want[name]
+                        ok = val == w
+                        print(f"  {'PASS' if ok else 'FAIL'} {name} = 0x{val:0{rb * 2}X}"
+                              f"（期望 0x{w:0{rb * 2}X}）  [{len(seen)}/{len(want)}]")
+            time.sleep(2.0)
+        except Exception:
+            time.sleep(0.8)   # 端口被 AiCube 占着，等它下完
+    missing = [c for c in want if c not in seen]
+    if missing:
+        print(f"还缺 {len(missing)} 项：{', '.join(missing)}")
+        return 1
+    print(f"PASS: 真机 {len(want)} 项全部一致")
+    return 0
 
 
 def send_download(port: str, baud: int) -> int:
