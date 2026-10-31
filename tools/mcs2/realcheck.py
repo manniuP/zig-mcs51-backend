@@ -226,6 +226,8 @@ def main() -> int:
     ap.add_argument("--tries", type=int, default=3, help="--auto 每组最多重试次数")
     ap.add_argument("--watch", metavar="PORT",
                     help="边烧边收：轮询串口累积各组结果，直到 48 项收齐或超时")
+    ap.add_argument("--open", type=float, default=0.6, help="--watch 每次开串口读多久")
+    ap.add_argument("--close", type=float, default=5.4, help="--watch 两次读之间关多久（让 AiCube 下载）")
     ap.add_argument("--seconds", type=float, default=20.0,
                     help="--watch/--read 最长秒数（--read 收齐即退）")
     ap.add_argument("--isp", action="store_true",
@@ -240,7 +242,7 @@ def main() -> int:
     if args.dl:
         return send_download(args.dl, args.baud)
     if args.watch:
-        return watch(args.watch, args.baud, args.seconds)
+        return watch(args.watch, args.baud, args.seconds, args.open, args.close)
     if args.auto:
         by_src2: dict[str, list[str]] = {}
         order2: list[str] = []
@@ -317,7 +319,8 @@ def main() -> int:
     return 0 if ok_all else 1
 
 
-def watch(port: str, baud: int, seconds: float) -> int:
+def watch(port: str, baud: int, seconds: float, open_s: float = 0.6,
+          close_s: float = 5.4) -> int:
     """边烧边收：短暂开门（1.2 s）+ 关门的轮询读法。
 
     为什么不是一直开着：AiCube 下载要**独占**串口，一直占着它就下不了；
@@ -343,7 +346,7 @@ def watch(port: str, baud: int, seconds: float) -> int:
         try:
             with serial.Serial(port, baud, timeout=0.2) as sp:
                 sp.reset_input_buffer()
-                t_end = time.time() + 1.2
+                t_end = time.time() + open_s
                 while time.time() < t_end and len(seen) < len(want):
                     chunk = sp.read(256)
                     if not chunk:
@@ -367,6 +370,7 @@ def watch(port: str, baud: int, seconds: float) -> int:
             time.sleep(2.0)
         except Exception:
             time.sleep(0.8)   # 端口被 AiCube 占着，等它下完
+        time.sleep(close_s)
     missing = [c for c in want if c not in seen]
     if missing:
         print(f"还缺 {len(missing)} 项：{', '.join(missing)}")
@@ -376,7 +380,7 @@ def watch(port: str, baud: int, seconds: float) -> int:
 
 
 def _collect(port: str, baud: int, results: dict[str, int], want: set[str],
-             seconds: float) -> None:
+             seconds: float, open_s: float = 0.6, close_s: float = 5.4) -> None:
     """开短窗轮询收集：开 1.2 s / 关 2 s（AiCube 下载要独占串口）。"""
     import serial
     import time
@@ -387,7 +391,7 @@ def _collect(port: str, baud: int, results: dict[str, int], want: set[str],
         try:
             with serial.Serial(port, baud, timeout=0.2) as sp:
                 sp.reset_input_buffer()
-                t_end = min(time.time() + 1.2, deadline)
+                t_end = min(time.time() + open_s, deadline)
                 while time.time() < t_end and not want.issubset(results):
                     chunk = sp.read(256)
                     if not chunk:
@@ -410,7 +414,7 @@ def _collect(port: str, baud: int, results: dict[str, int], want: set[str],
                               f"0x{results[name]:0{rb * 2}X}（期望 0x{w:0{rb * 2}X}）")
         except Exception:
             time.sleep(0.8)
-        time.sleep(2.0)
+        time.sleep(close_s)
 
 
 def auto(live: Path, port: str, baud: int, order: list[str],
