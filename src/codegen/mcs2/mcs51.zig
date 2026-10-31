@@ -284,7 +284,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const d = try byteText(gpa, x.dst);
                 try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
                     gpa,
-                    "    djnz {s}",
+                    "    djnz {s},",
                     .{d},
                 ), .jump = x.target } });
             },
@@ -297,38 +297,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
         }
     }
 
-    // M2.2：删掉「跳到紧邻的下一个标签」——布局期的 fallthrough 优化。
-    // 只处理 sjmp/ljmp 且目标就是下一条 label 的情形（保守，不动其它跳转）。
-    var w: usize = 0;
-    var r: usize = 0;
-    while (r < items.items.len) : (r += 1) {
-        const it = items.items[r];
-        var drop = false;
-        switch (it) {
-            .line => |l| {
-                const t = std.mem.trimStart(u8, l.text, " \t");
-                const is_jump = std.mem.startsWith(u8, t, "sjmp") or std.mem.startsWith(u8, t, "ljmp");
-                if (is_jump) {
-                    if (l.jump) |target| {
-                        if (r + 1 < items.items.len) {
-                            switch (items.items[r + 1]) {
-                                .label => |n| if (n == target) {
-                                    drop = true;
-                                },
-                                else => {},
-                            }
-                        }
-                    }
-                }
-            },
-            else => {},
-        }
-        if (!drop) {
-            items.items[w] = it;
-            w += 1;
-        }
-    }
-    items.shrinkRetainingCapacity(w);
+    compactJumpToNext(&items);
 
     try relaxJumps(gpa, &items);
 
@@ -368,6 +337,42 @@ fn instrBytes(text: []const u8) usize {
     if (std.mem.startsWith(u8, t, "add") or std.mem.startsWith(u8, t, "subb")) return 2;
     if (std.mem.startsWith(u8, t, "xrl") or std.mem.startsWith(u8, t, "anl") or std.mem.startsWith(u8, t, "orl")) return 2;
     return 3;
+}
+
+
+/// M2.2：删掉「跳到紧邻的下一个标签」的跳转（布局期 fallthrough 优化）。
+/// 只处理 sjmp/ljmp 且目标就是下一条 label 的情形。
+fn compactJumpToNext(items: *std.ArrayListUnmanaged(Item)) void {
+    var w: usize = 0;
+    var r: usize = 0;
+    while (r < items.items.len) : (r += 1) {
+        const it = items.items[r];
+        var drop = false;
+        switch (it) {
+            .line => |l| {
+                const t = std.mem.trimStart(u8, l.text, " \t");
+                const is_jump = std.mem.startsWith(u8, t, "sjmp") or std.mem.startsWith(u8, t, "ljmp");
+                if (is_jump) {
+                    if (l.jump) |target| {
+                        if (r + 1 < items.items.len) {
+                            switch (items.items[r + 1]) {
+                                .label => |n| if (n == target) {
+                                    drop = true;
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+        if (!drop) {
+            items.items[w] = it;
+            w += 1;
+        }
+    }
+    items.shrinkRetainingCapacity(w);
 }
 
 /// 条件跳转取反（长距离展开用）。
@@ -496,6 +501,7 @@ pub fn compileEx(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) ![]
     const aa = arena.allocator();
     var items = try lower(f, aa, with_header);
     optimize(aa, &items);
+    compactJumpToNext(&items);
     return render(gpa, items.items);
 }
 

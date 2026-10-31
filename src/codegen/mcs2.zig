@@ -173,6 +173,39 @@ const Lower = struct {
     /// 否则按字节测零（br_ifz）。条件为编译期常量时直接发单边。
 
 
+
+    /// P1：数一数某条指令的值在 body 里被用了几次（跳过 skip 位置）。
+    fn useCount(self: *Lower, body: []const Air.Inst.Index, target: Air.Inst.Index, skip: usize) usize {
+        var n: usize = 0;
+        for (body, 0..) |ins, k| {
+            if (k == skip) continue;
+            const tag = self.air.instructions.items(.tag)[@backingInt(ins)];
+            const d = self.air.instructions.items(.data)[@backingInt(ins)];
+            var hit = false;
+            switch (tag) {
+                .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap, .store, .store_safe => {
+                    if (d.bin_op.lhs.toIndex()) |x| {
+                        if (@backingInt(x) == @backingInt(target)) hit = true;
+                    }
+                    if (d.bin_op.rhs.toIndex()) |x| {
+                        if (@backingInt(x) == @backingInt(target)) hit = true;
+                    }
+                },
+                .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq => {
+                    if (d.bin_op.lhs.toIndex()) |x| {
+                        if (@backingInt(x) == @backingInt(target)) hit = true;
+                    }
+                    if (d.bin_op.rhs.toIndex()) |x| {
+                        if (@backingInt(x) == @backingInt(target)) hit = true;
+                    }
+                },
+                else => {},
+            }
+            if (hit) n += 1;
+        }
+        return n;
+    }
+
     // ==== M2.4：循环旋转 → djnz ====
     //
     // 目标形态：
@@ -600,7 +633,14 @@ const Lower = struct {
     }
 
     fn emitBody(self: *Lower, body: []const Air.Inst.Index) codegen.Error!bool {
+    var skip_idx: ?usize = null;
     for (body, 0..) |inst, idx| {
+        if (skip_idx) |s| {
+            if (s == idx) {
+                skip_idx = null;
+                continue;
+            }
+        }
         const tag = self.air.instructions.items(.tag)[@backingInt(inst)];
         const data = self.air.instructions.items(.data)[@backingInt(inst)];
         switch (tag) {
@@ -656,10 +696,28 @@ const Lower = struct {
                         }
                     }
                 }
-                const dst: Loc = if (consumed_by_ret)
+                var dst: Loc = if (consumed_by_ret)
                     .{ .dir = self.ret_byte.? }
                 else
                     mcsmir.v(try self.allocVreg());
+
+                // P1：结果紧接着写回某个本地槽 → 直接写那个槽，store 整条省掉。
+                if (!consumed_by_ret and idx + 1 < body.len) {
+                    const nxt = body[idx + 1];
+                    const ntag = self.air.instructions.items(.tag)[@backingInt(nxt)];
+                    if (ntag == .store or ntag == .store_safe) {
+                        const nd = self.air.instructions.items(.data)[@backingInt(nxt)].bin_op;
+                        const rhs_is_me = if (nd.rhs.toIndex()) |x| @backingInt(x) == @backingInt(inst) else false;
+                        if (rhs_is_me and self.constPtrAddr(nd.lhs) == null) {
+                            if (nd.lhs.toIndex()) |pi| {
+                                if (self.vals[@backingInt(pi)]) |slot| {
+                                    dst = slot;
+                                    skip_idx = idx + 1;
+                                }
+                            }
+                        }
+                    }
+                }
                 const is_add = switch (tag) {
                     .add, .add_safe, .add_wrap => true,
                     else => false,
@@ -711,6 +769,19 @@ const Lower = struct {
                     continue;
                 }
                 const src = try self.refLoc(ty_op.operand);
+                // P1：值只被紧接的一条指令消费 → 直接把槽位置当值，省掉一次 mov。
+                if (idx + 1 < body.len and self.useCount(body, inst, idx) == 1) {
+                    const ntag = self.air.instructions.items(.tag)[@backingInt(body[idx + 1])];
+                    const consumes = switch (ntag) {
+                        .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap, .store, .store_safe => true,
+                        .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq => true,
+                        else => false,
+                    };
+                    if (consumes) {
+                        self.vals[@backingInt(inst)] = src;
+                        continue;
+                    }
+                }
                 const r = try self.allocVreg();
                 try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(r), .src = src } });
                 self.vals[@backingInt(inst)] = mcsmir.v(r);
