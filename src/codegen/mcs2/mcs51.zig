@@ -33,10 +33,22 @@ pub const Item = union(enum) {
 fn byteText(gpa: std.mem.Allocator, b: Byte) ![]const u8 {
     return switch (b) {
         .vreg => |n| std.fmt.allocPrint(gpa, "_mcs_v{d}", .{n}),
-        .dir => |a| std.fmt.allocPrint(gpa, "0x{X:0>2}", .{a}),
+        // 0x00-0x07 = bank0 的工作寄存器：渲染成 rN 才能拿到 1 字节编码
+        // （mov a,r6 是 1B，mov a,0x06 是 2B）。DSEG 从 0x30 起，不会与数据冲突。
+        .dir => |a| if (a < 8)
+            std.fmt.allocPrint(gpa, "r{d}", .{a})
+        else
+            std.fmt.allocPrint(gpa, "0x{X:0>2}", .{a}),
         .sym => |s| s,
         .imm => |v| std.fmt.allocPrint(gpa, "#0x{X:0>2}", .{v}),
     };
+}
+
+/// 操作数文本是不是工作寄存器（r0-r7）。
+fn isRegText(s: []const u8) bool {
+    if (s.len != 2) return false;
+    if (s[0] != 'r' and s[0] != 'R') return false;
+    return s[1] >= '0' and s[1] <= '7';
 }
 
 /// Op 序列 → 条目流（不做窥孔）。
@@ -599,24 +611,46 @@ fn instrBytes(text: []const u8) usize {
     if (std.mem.startsWith(u8, t, "clr")) return 2; // clr a / clr c 实为 1，取保守值
     if (std.mem.startsWith(u8, t, "movx")) return 1;
     if (std.mem.startsWith(u8, t, "mov")) {
-        // mov a,#imm / mov a,dir / mov dir,a / mov dir,#imm / mov dir,dir
+        // mov a,#imm / mov a,dir / mov dir,a / mov dir,#imm / mov dir,dir / mov rN,...
         const comma = std.mem.indexOfScalar(u8, t, ',') orelse return 3;
         const dst = t[4..comma];
         const src = t[comma + 1 ..];
         const dst_is_a = std.mem.eql(u8, dst, "a");
         const src_is_a = std.mem.eql(u8, src, "a");
+        const dst_reg = isRegText(dst);
+        const src_reg = isRegText(src);
         if (src.len > 0 and src[0] == '#') {
-            return if (dst_is_a) 2 else 3;
+            if (dst_is_a) return 2;
+            if (dst_reg) return 2; // mov rN,#imm
+            return 3;
         }
-        if (dst_is_a or src_is_a) return 2;
+        if (dst_is_a or src_is_a) {
+            // mov a,rN / mov rN,a 都是 1 字节
+            if ((dst_is_a and src_reg) or (src_is_a and dst_reg)) return 1;
+            return 2;
+        }
         if (std.mem.startsWith(u8, src, "dptr")) return 3;
         return 3;
     }
     if (std.mem.startsWith(u8, t, "push") or std.mem.startsWith(u8, t, "pop")) return 2;
-    if (std.mem.startsWith(u8, t, "djnz")) return 3;
-    if (std.mem.startsWith(u8, t, "inc") or std.mem.startsWith(u8, t, "dec")) return 2;
-    if (std.mem.startsWith(u8, t, "add") or std.mem.startsWith(u8, t, "subb")) return 2;
-    if (std.mem.startsWith(u8, t, "xrl") or std.mem.startsWith(u8, t, "anl") or std.mem.startsWith(u8, t, "orl")) return 2;
+    if (std.mem.startsWith(u8, t, "djnz")) {
+        // djnz rN,rel = 2 字节；djnz dir,rel = 3 字节
+        const comma = std.mem.indexOfScalar(u8, t, ',') orelse return 3;
+        const op = std.mem.trim(u8, t[4..comma], " ");
+        return if (isRegText(op)) 2 else 3;
+    }
+    if (std.mem.startsWith(u8, t, "inc") or std.mem.startsWith(u8, t, "dec")) {
+        const op = std.mem.trim(u8, t[3..], " ");
+        return if (isRegText(op)) 1 else 2;
+    }
+    if (std.mem.startsWith(u8, t, "add") or std.mem.startsWith(u8, t, "subb") or
+        std.mem.startsWith(u8, t, "xrl") or std.mem.startsWith(u8, t, "anl") or std.mem.startsWith(u8, t, "orl"))
+    {
+        // add a,rN 之类是 1 字节
+        const comma = std.mem.indexOfScalar(u8, t, ',') orelse return 2;
+        const op = std.mem.trim(u8, t[comma + 1 ..], " ");
+        return if (isRegText(op)) 1 else 2;
+    }
     return 3;
 }
 

@@ -353,6 +353,136 @@ const Lower = struct {
         return false;
     }
 
+    // ==== M2.13：寄存器分配（切片 1）====
+    //
+    // 只挑「自更新的热点值」（dst == lhs 的累加器/计数器）放进 R5/R6/R7。
+    // 每个 vreg 独占一个寄存器，非映射值仍走 DSEG 槽 —— 因此不需要活跃期分析。
+    // 前提：函数内没有 push/pop（ISR 现场保存），且不是中断函数本身
+    //（ISR 只保存 A/PSW/DPL/DPH，不碰 R5-R7，所以主程序用寄存器是安全的）。
+
+    fn sameVregByte(b: mcsmir.Byte, r: u8) bool {
+        return switch (b) {
+            .vreg => |v| v == r,
+            else => false,
+        };
+    }
+
+    fn vregOfByte(b: mcsmir.Byte) ?u8 {
+        return switch (b) {
+            .vreg => |v| v,
+            else => null,
+        };
+    }
+
+    fn isSelfUpdate(op: mcsmir.Op) ?u8 {
+        return switch (op) {
+            .add => |x| blk: {
+                const v = vregOfByte(x.dst) orelse break :blk null;
+                break :blk if (sameVregByte(x.lhs, v)) v else null;
+            },
+            .sub => |x| blk: {
+                const v = vregOfByte(x.dst) orelse break :blk null;
+                break :blk if (sameVregByte(x.lhs, v)) v else null;
+            },
+            .and_ => |x| blk: {
+                const v = vregOfByte(x.dst) orelse break :blk null;
+                break :blk if (sameVregByte(x.lhs, v)) v else null;
+            },
+            .or_ => |x| blk: {
+                const v = vregOfByte(x.dst) orelse break :blk null;
+                break :blk if (sameVregByte(x.lhs, v)) v else null;
+            },
+            .xor_ => |x| blk: {
+                const v = vregOfByte(x.dst) orelse break :blk null;
+                break :blk if (sameVregByte(x.lhs, v)) v else null;
+            },
+            .dec_br_nz => |x| vregOfByte(x.dst),
+            else => null,
+        };
+    }
+
+    fn mapByteVreg(b: mcsmir.Byte, map: *const [256]?u8) mcsmir.Byte {
+        return switch (b) {
+            .vreg => |v| if (map[v]) |reg| .{ .dir = reg } else b,
+            else => b,
+        };
+    }
+
+    fn mapOpVregs(op: mcsmir.Op, map: *const [256]?u8) mcsmir.Op {
+        return switch (op) {
+            .imm => |x| .{ .imm = .{ .dst = mapByteVreg(x.dst, map), .value = x.value } },
+            .add => |x| .{ .add = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .sub => |x| .{ .sub = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .and_ => |x| .{ .and_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .or_ => |x| .{ .or_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .xor_ => |x| .{ .xor_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .mov => |x| .{ .mov = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
+            .load_dir => |x| .{ .load_dir = .{ .dst = mapByteVreg(x.dst, map), .addr = x.addr } },
+            .store_dir => |x| .{ .store_dir = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
+            .load_xdata => |x| .{ .load_xdata = .{ .dst = mapByteVreg(x.dst, map), .addr = x.addr } },
+            .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
+            .load_xdata_idx => |x| .{ .load_xdata_idx = .{ .dst = mapByteVreg(x.dst, map), .base = x.base, .idx = mapByteVreg(x.idx, map) } },
+            .store_xdata_idx => |x| .{ .store_xdata_idx = .{ .base = x.base, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map) } },
+            .br_ifnz => |x| .{ .br_ifnz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
+            .br_ifz => |x| .{ .br_ifz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
+            .cmp_br => |x| .{ .cmp_br = .{ .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map), .cc = x.cc, .target = x.target } },
+            .dec_br_nz => |x| .{ .dec_br_nz = .{ .dst = mapByteVreg(x.dst, map), .target = x.target } },
+            .push => |x| .{ .push = .{ .src = mapByteVreg(x.src, map) } },
+            .pop => |x| .{ .pop = .{ .dst = mapByteVreg(x.dst, map) } },
+            .dec => op, // 载荷是裸 vreg 下标；对应 vreg 已被禁用映射
+            .label, .br, .ret, .reti, .halt => op,
+        };
+    }
+
+    fn assignRegisters(self: *Lower) void {
+        if (self.is_isr) return;
+        for (self.ops.items) |op| switch (op) {
+            .push, .pop => return,
+            else => {},
+        };
+
+        var score: [256]u16 = undefined;
+        @memset(&score, 0);
+        var banned: [256]bool = undefined;
+        @memset(&banned, false);
+        for (self.ops.items) |op| switch (op) {
+            .dec => |r| banned[r] = true,
+            else => if (isSelfUpdate(op)) |v| {
+                score[v] +|= 1;
+            },
+        };
+
+        var picked: [3]u8 = undefined;
+        var np: usize = 0;
+        const regs = [3]u8{ 0x07, 0x06, 0x05 }; // R7 / R6 / R5
+        while (np < 3) {
+            var best: ?u8 = null;
+            var best_score: u16 = 0;
+            for (0..256) |vi| {
+                const v: u8 = @intCast(vi);
+                if (banned[v] or score[v] == 0) continue;
+                var dup = false;
+                for (picked[0..np]) |q| {
+                    if (q == v) dup = true;
+                }
+                if (dup) continue;
+                if (score[v] > best_score) {
+                    best_score = score[v];
+                    best = v;
+                }
+            }
+            const b = best orelse break;
+            picked[np] = b;
+            np += 1;
+        }
+        if (np == 0) return;
+
+        var map: [256]?u8 = undefined;
+        @memset(&map, null);
+        for (picked[0..np], 0..) |v, i| map[v] = regs[i];
+        for (self.ops.items) |*op| op.* = mapOpVregs(op.*, &map);
+    }
+
     // ==== M2.12：相邻拷贝折叠 ====
     //
     // `mov vd,vs` 后紧跟唯一一次读 vd 的指令 → 把该操作数换成 vs，删掉 mov。
@@ -1355,6 +1485,9 @@ pub fn generate(
     if (!is_isr and lw.arg_cursor == 0 and fold_opt_in) {
         if (try lw.foldPure()) lw.saw_ret = true;
     }
+
+    // M2.13：寄存器分配（PE 折叠成功时不必——常量写回没有热点值）。
+    lw.assignRegisters();
 
     // 没有 ret 也允许：只要 body 以 br 终结（如 while(true)），控制流不会落空。
     if (!lw.saw_ret and !body_terminated) {
