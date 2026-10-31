@@ -49,6 +49,8 @@ CASES: list[tuple[str, str]] = [
     ("u16_shl",   "export fn f(a: u16) u16 { return a << 1; }"),
     ("u16_cmp",   "export fn f(a: u16, b: u16) u8 { return if (a < b) 1 else 0; }"),
     ("u32_add",   "export fn f() u8 { var a: u32 = 0x12345678; a +%= 1; return @truncate(a); }"),
+    ("u32_args",  "export fn f(a: u32, b: u32) u32 { return a +% b; }"),
+    ("u32_carry", "export fn f(x: u8) u32 { var a: u32 = 0x0000FFFF; a +%= x; return a; }"),
     # ---- 有符号（Q15/Q31 都是带符号）----
     ("i8_add",    "export fn f(a: i8, b: i8) i8 { return a +% b; }"),
     ("i8_shr",    "export fn f(a: i8) i8 { return a >> 1; }"),

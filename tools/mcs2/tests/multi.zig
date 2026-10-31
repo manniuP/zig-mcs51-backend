@@ -29,3 +29,14 @@ export fn u16shr(x: u8) u16 {
     a +%= x;
     return a;
 }
+// u32（4 字节）：参数/返回按 SDCC 约定走 DPL/DPH/B/A，第 2 个参数进 PARM_2 起
+export fn u32add(a: u32, b: u32) u32 {
+    return a +% b;
+}
+
+// 4 字节进位链：0x0000FFFF + x（x=1 → 0x00010000）
+export fn u32carry(x: u8) u32 {
+    var a: u32 = 0x0000FFFF;
+    a +%= x;
+    return a;
+}

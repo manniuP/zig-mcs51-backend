@@ -102,8 +102,8 @@ const Lower = struct {
     is_isr: bool = false,
     /// 多字节值（u16/u32）：低字节 = 首槽 vreg 号，高字节 = 字节数。
     wide: []?u16 = &.{},
-    /// ABI 字节游标（u16 参数占 2 字节，arg0 起算）。
-    abi_byte: usize = 0,
+    /// 溢出参数区的字节游标：第 2 个参数起，从 `_名_PARM_2` 开始连续编号。
+    spill_off: usize = 2,
     /// 返回宽度：1 = u8（DPL）；2 = u16（DPL/DPH）。
     ret_wide: u8 = 1,
     ret_byte: ?u8, // u8 返回的 ABI 地址；void 时为 null
@@ -1398,13 +1398,9 @@ const Lower = struct {
                         .{@tagName(ty.zigTypeTag(self.zcu))},
                     );
                 }
-                if (self.arg_cursor >= mcsmir.abi.max_arg_bytes) {
-                    return self.zcu.codegenFail(
-                        self.nav,
-                        "mcs2: 参数超过 {d} 字节寄存器 ABI（M1）",
-                        .{mcsmir.abi.max_arg_bytes},
-                    );
-                }
+                // SDCC mcs51 实测约定（--model-small）：**第 1 个参数**按低字节序进
+                // DPL/DPH/B/A（最多 4 字节），**第 2 个起**进 `_名_PARM_2` 起的连续字节。
+                // 对齐它 = u16/u32 的 C 互操作免费，不需要 thunk。
                 // ADR-001 边界 ABI：按**字节**摆放（arg0 → DPL，之后 → PARM_n）；
                 // u16 占两个字节（DPL/DPH 或 PARM_n/PARM_{n+1}）。
                 const nlat = self.wideBytes(ty) orelse 1;
@@ -1412,19 +1408,20 @@ const Lower = struct {
                     const base = try self.allocWide(nlat);
                     var k: u8 = 0;
                     while (k < nlat) : (k += 1) {
-                        const pos = self.abi_byte + k;
-                        const src: mcsmir.Byte = if (pos == 0)
-                            .{ .dir = mcsmir.abi.dpl }
-                        else if (pos == 1)
-                            .{ .dir = mcsmir.abi.dph }
+                        const src: mcsmir.Byte = if (self.arg_cursor == 0)
+                            .{ .dir = mcsmir.abi.arg_regs[k] }
                         else blk: {
-                            const psym = try std.fmt.allocPrint(self.gpa, "_{s}_PARM_{d}", .{ self.short_name, pos + 1 });
+                            const psym = try std.fmt.allocPrint(self.gpa, "_{s}_PARM_{d}", .{ self.short_name, self.spill_off + k });
                             try self.parms.append(self.gpa, psym);
                             break :blk .{ .sym = psym };
                         };
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(base + k), .src = src } });
                     }
-                    self.abi_byte += nlat;
+                    if (self.arg_cursor == 0) {
+                        if (nlat >= 3) self.b_is_arg = true; // B 是第 3 个字节
+                    } else {
+                        self.spill_off += nlat;
+                    }
                     self.arg_cursor += 1;
                     self.vals[@backingInt(inst)] = mcsmir.v(base);
                     self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, nlat) << 8);
@@ -1446,13 +1443,12 @@ const Lower = struct {
                     const psym = try std.fmt.allocPrint(
                         self.gpa,
                         "_{s}_PARM_{d}",
-                        .{ self.short_name, self.arg_cursor + 1 },
+                        .{ self.short_name, self.spill_off },
                     );
                     try self.parms.append(self.gpa, psym);
-                    if (self.arg_cursor + 1 == 3) self.b_is_arg = true;
+                    self.spill_off += 1;
                     self.vals[@backingInt(inst)] = .{ .sym = psym };
                 }
-                self.abi_byte += 1;
                 self.arg_cursor += 1;
             },
 
@@ -1867,10 +1863,12 @@ const Lower = struct {
                         return self.zcu.codegenFail(self.nav, "mcs2: ret 操作数无效", .{});
                     }
                     if (self.ret_wide > 1) {
-                        // 多字节返回：模板 = 低字节→DPL，高字节→DPH。
+                        // 多字节返回（SDCC 同款）：低字节序依次进 DPL/DPH/B/A。
                         const base = try self.wideOperand(operand, self.ret_wide);
-                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = rb, .src = mcsmir.v(base) } });
-                        try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = mcsmir.abi.dph, .src = mcsmir.v(base + 1) } });
+                        var k: u8 = 0;
+                        while (k < self.ret_wide) : (k += 1) {
+                            try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = mcsmir.abi.arg_regs[k], .src = mcsmir.v(base + k) } });
+                        }
                     } else {
                         const loc = try self.refLoc(operand);
                         const already = switch (loc) {
@@ -1976,12 +1974,13 @@ pub fn generate(
     const lower_ret_byte: ?u8 = if (ret_ty.zigTypeTag(zcu) == .void)
         null
     else blk: {
+        const rbits = if (ret_ty.zigTypeTag(zcu) == .int) ret_ty.bitSize(zcu) else 0;
         if (ret_ty.zigTypeTag(zcu) != .int or ret_ty.isSignedInt(zcu) or
-            (ret_ty.bitSize(zcu) != 8 and ret_ty.bitSize(zcu) != 16))
+            (rbits != 8 and rbits != 16 and rbits != 32))
         {
             return zcu.codegenFail(
                 func.owner_nav,
-                "mcs2: 返回类型 {s} 尚未实现（目前 void/u8/u16）",
+                "mcs2: 返回类型 {s} 尚未实现（目前 void/u8/u16/u32）",
                 .{@tagName(ret_ty.zigTypeTag(zcu))},
             );
         }
@@ -1990,10 +1989,11 @@ pub fn generate(
     // 返回宽度：u16 走 DPL/DPH 两个字节。
     const lower_ret_wide: u8 = if (lower_ret_byte == null)
         1
-    else if (ret_ty.bitSize(zcu) == 16)
-        2
-    else
-        1;
+    else switch (ret_ty.bitSize(zcu)) {
+        16 => 2,
+        32 => 4,
+        else => 1,
+    };
 
     // 中断函数检测：callconv(.{ .mcs51_interrupt = .{ .vector = n } })（M1.5）。
     // 向量号 1-based（STC 手册口径），8051 向量地址 = 0x0003 + 8*(n-1)；
