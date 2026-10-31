@@ -61,7 +61,7 @@ fn isRegText(s: []const u8) bool {
 /// DPTR 当前内容：固定地址，或「基址 + 下标」。相邻同址访问可以省掉重建。
 const DptrState = union(enum) {
     fixed: u16,
-    idx: struct { base: u16, idx: Byte },
+    idx: struct { base: u16, idx: Byte, scale: u8 = 1 },
 };
 
 fn sameByte(a: Byte, b: Byte) bool {
@@ -93,7 +93,7 @@ fn sameDptr(st: ?DptrState, want: DptrState) bool {
             else => false,
         },
         .idx => |a| switch (want) {
-            .idx => |b| a.base == b.base and sameByte(a.idx, b.idx),
+            .idx => |b| a.base == b.base and a.scale == b.scale and sameByte(a.idx, b.idx),
             else => false,
         },
     };
@@ -148,8 +148,8 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
     return switch (op) {
         .load_xdata => |x| .{ .fixed = x.addr },
         .store_xdata => |x| .{ .fixed = x.addr },
-        .load_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx } },
-        .store_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx } },
+        .load_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
+        .store_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
         .imm => |x| if (touchesDplDph(x.dst)) null else prev,
         .mov => |x| if (touchesDplDph(x.dst)) null else prev,
         .add => |x| if (touchesDplDph(x.dst)) null else prev,
@@ -311,8 +311,8 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
         const want_dptr: ?DptrState = switch (m_op) {
             .load_xdata => |x| .{ .fixed = x.addr },
             .store_xdata => |x| .{ .fixed = x.addr },
-            .load_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx } },
-            .store_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx } },
+            .load_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
+            .store_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
             else => null,
         };
         const reuse_dptr = if (want_dptr) |w| sameDptr(dptr, w) else false;
@@ -570,7 +570,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .load_xdata_idx => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it);
+                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
@@ -579,7 +579,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata_idx => |x| {
                 const s = try byteText(gpa, x.src);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it);
+                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
                     .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
@@ -926,15 +926,18 @@ fn sfrBitAddr(addr: u8, mask: u8) ?u8 {
 
 /// dptr = base + idx（16 位常量基址 + 8 位运行期下标）。
 /// lo == 0 时不可能进位，直接 `mov dpl,idx`；否则用 add/addc 传播进位。
+/// dptr = base + idx*scale。scale > 1 时把「16 位加 idx」重复 scale 次
+/// （idx 是 8 位、base 是 16 位常量，逐次加不会溢出 16 位加法链）。
 fn emitDptrIndex(
     gpa: std.mem.Allocator,
     items: *std.ArrayListUnmanaged(Item),
     base: u16,
     idx_text: []const u8,
+    scale: u8,
 ) !void {
     const lo: u8 = @truncate(base);
     const hi: u8 = @truncate(base >> 8);
-    if (lo == 0) {
+    if (lo == 0 and scale == 1) {
         try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
             gpa,
             "    mov dpl,{s}",
@@ -947,6 +950,7 @@ fn emitDptrIndex(
         ), .jump = null } });
         return;
     }
+    // 第一遍：dptr = base + idx（含 base 低字节的进位）
     try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
         gpa,
         "    mov a,{s}",
@@ -965,6 +969,16 @@ fn emitDptrIndex(
     ), .jump = null } });
     try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
     try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
+    // 其余 scale-1 遍：dptr += idx（16 位加法，进位往 dph 传）
+    var pass: u8 = 1;
+    while (pass < scale) : (pass += 1) {
+        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{idx_text}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    add a,dpl", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov dpl,a", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov a,dph", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
+    }
 }
 
 /// 指令字节数（M2.3 松弛用）。只覆盖本后端会发出的形态；

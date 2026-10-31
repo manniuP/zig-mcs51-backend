@@ -80,7 +80,8 @@ const Loc = mcsmir.Byte;
 /// 指针值：固定地址（`@ptrFromInt` 常量），或「常量基址 + 运行期下标」。
 const PtrRef = union(enum) {
     fixed: u64,
-    elem: struct { base: u64, idx: Loc },
+    /// scale = 元素字节数：地址 = base + idx*scale（2 = u16/函数指针，4 = u32）
+    elem: struct { base: u64, idx: Loc, scale: u8 = 1 },
 };
 
 /// M1 的线性降级器。不做活跃分析：`.arg` 原地用 ABI 寄存器（零序言），
@@ -1736,13 +1737,19 @@ const Lower = struct {
                     return self.fail("指针下标的基址必须是固定地址（暂不支持运行期指针）", .{});
                 switch (pr) {
                     .fixed => |base| {
-                        // 常量下标直接折进固定地址，保持原有常量地址路径。
+                        // 元素字节数 = 结果指针的子类型宽度（u8=1 / u16=2 / u32=4）
+                        const pty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                        // 指针子类型可能是**数组**（T16[i] 的 lhs 是 *[8]u16）→ 再取元素类型
+                        var ety = pty.childType(self.zcu);
+                        while (ety.zigTypeTag(self.zcu) == .array) ety = ety.childType(self.zcu);
+                        const sc = try self.storageBytes(ety, "下标元素");
+                        // 常量下标直接折进固定地址（**乘上元素大小**）
                         if (self.constU8(bin.rhs)) |k| {
-                            self.ptr_vals[@backingInt(inst)] = .{ .fixed = base + k };
+                            self.ptr_vals[@backingInt(inst)] = .{ .fixed = base + @as(u64, k) * sc };
                             continue;
                         }
                         const idx_loc = try self.refLoc(bin.rhs);
-                        self.ptr_vals[@backingInt(inst)] = .{ .elem = .{ .base = base, .idx = idx_loc } };
+                        self.ptr_vals[@backingInt(inst)] = .{ .elem = .{ .base = base, .idx = idx_loc, .scale = sc } };
                     },
                     .elem => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
                 }
@@ -2073,6 +2080,22 @@ const Lower = struct {
                     const sbase = try self.wideOperand(data.bin_op.rhs, rn);
                     // ① 固定地址目标（@ptrFromInt）：逐字节写（≤0xFF 直址，否则 xdata）。
                     //    这是 u32 全局/外设寄存器块的最短路径，不经过 vreg 槽。
+                    // ② 运行期下标目标：逐字节 store_xdata_idx（base+k 加在同一元素上）
+                    if (self.ptrRefOf(data.bin_op.lhs)) |pr| if (pr == .elem) {
+                        const e2 = pr.elem;
+                        if (e2.base > 0xFF) {
+                            var k5: u8 = 0;
+                            while (k5 < rn) : (k5 += 1) {
+                                try self.ops.append(self.gpa, .{ .store_xdata_idx = .{
+                                    .base = @intCast(e2.base + k5),
+                                    .idx = e2.idx,
+                                    .src = mcsmir.v(sbase + k5),
+                                    .scale = e2.scale,
+                                } });
+                            }
+                            continue;
+                        }
+                    };
                     if (self.ptrRefOf(data.bin_op.lhs)) |pr| if (pr == .fixed) {
                         const faddr = pr.fixed;
                         var k3: u8 = 0;
@@ -2132,6 +2155,7 @@ const Lower = struct {
                                 .base = @intCast(e.base),
                                 .idx = e.idx,
                                 .src = value,
+                                .scale = e.scale,
                             } });
                         },
                     }
@@ -2180,6 +2204,25 @@ const Lower = struct {
                 const ln_b = try self.storageBytes(lty, "读取");
                 if (ln_b > 1) {
                     // ① 固定地址源（@ptrFromInt）：逐字节读，直接拼成 n 字节槽。
+                    // ② 运行期下标源：逐字节 load_xdata_idx
+                    if (self.ptrRefOf(data.ty_op.operand)) |pr| if (pr == .elem) {
+                        const e3 = pr.elem;
+                        if (e3.base > 0xFF) {
+                            const wb2 = try self.allocWide(ln_b);
+                            var k6: u8 = 0;
+                            while (k6 < ln_b) : (k6 += 1) {
+                                try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
+                                    .dst = mcsmir.v(wb2 + k6),
+                                    .base = @intCast(e3.base + k6),
+                                    .idx = e3.idx,
+                                    .scale = e3.scale,
+                                } });
+                            }
+                            self.vals[@backingInt(inst)] = mcsmir.v(wb2);
+                            self.wide[@backingInt(inst)] = @as(u16, wb2) | (@as(u16, ln_b) << 8);
+                            continue;
+                        }
+                    };
                     if (self.ptrRefOf(data.ty_op.operand)) |pr| if (pr == .fixed) {
                         const faddr = pr.fixed;
                         const wbase = try self.allocWide(ln_b);

@@ -419,6 +419,7 @@ CASES: dict[str, dict] = {
     "addone": dict(kind="call", src="xdata32.zig", fn="addone",
                    args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
                    want32=0x12345679),
+    # 运行期下标 + 多字节元素（u16 表）；u8 表作对照
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }

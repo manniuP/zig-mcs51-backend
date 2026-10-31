@@ -151,9 +151,10 @@ pub const Op = union(enum) {
     /// 把源位置写入 xdata 的 16 位绝对地址。
     store_xdata: struct { addr: u16, src: Byte },
     /// dst <- xdata mem[base + idx]（运行期下标：dptr = base + idx，base 须为常量）。
-    load_xdata_idx: struct { dst: Byte, base: u16, idx: Byte },
+    /// scale = 元素字节数（1/2/4）：地址 = base + idx*scale。
+    load_xdata_idx: struct { dst: Byte, base: u16, idx: Byte, scale: u8 = 1 },
     /// xdata mem[base + idx] <- src（运行期下标）。
-    store_xdata_idx: struct { base: u16, idx: Byte, src: Byte },
+    store_xdata_idx: struct { base: u16, idx: Byte, src: Byte, scale: u8 = 1 },
     /// 局部标签定义，供 br/br_ifnz 引用。
     label: u32,
     /// 无条件跳转到标签。
