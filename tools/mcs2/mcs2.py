@@ -364,6 +364,19 @@ CASES: dict[str, dict] = {
     "i16div":  dict(kind="call", src="sdiv8.zig", fn="i16div",
                     args=[("DPL", 0x18), ("DPH", 0xFC), ("PARM_2", 0x07), ("PARM_3", 0x00)],
                     want16=0xFF72, steps=20000),
+    # 运行期移位次数（循环模板）：左移 / 逻辑右移 / 算术右移
+    "shlv":   dict(kind="call", src="shiftv.zig", fn="shlv",
+                   args=[("DPL", 0x01), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x00), ("PARM2", 0x08)],
+                   want32=0x00000100, steps=20000),
+    "shrv":   dict(kind="call", src="shiftv.zig", fn="shrv",
+                   args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x80), ("PARM2", 0x04)],
+                   want32=0x08000000, steps=20000),
+    "shrv0":  dict(kind="call", src="shiftv.zig", fn="shrv",
+                   args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12), ("PARM2", 0x00)],
+                   want32=0x12345678, steps=20000),
+    "sarv":   dict(kind="call", src="shiftv.zig", fn="sarv",
+                   args=[("DPL", 0x00), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF), ("PARM2", 0x04)],
+                   want32=0xFFFFFFF0, steps=20000),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -377,6 +390,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "ucmp_eq", "ucmp_gt", "ucmp_lt", "wbits",
          "u16mul", "u16mul2", "i16mul", "u32mul",
          "u16div", "u16rem", "u32div", "u32rem", "i32div", "i32rem", "i8div", "i8rem", "i16div",
+         "shlv", "shrv", "shrv0", "sarv",
          "ringdemo"]
 
 

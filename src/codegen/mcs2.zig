@@ -119,6 +119,18 @@ const Lower = struct {
     /// 0x82 同时是 DPTR 低字节，地址计算会把它踩掉。
     needs_dptr: bool = false,
 
+    /// 存储宽度（**不是**算术宽度）：≤8 位一律 1 字节容器（u1/u5 这类只能当值存放），
+    /// 16/32 按宽度。算术闸门仍然是 requireIntWidth（只认 8/16/32），
+    /// 所以「能存」不会变成「能静默错算」。
+    fn storageBytes(self: *Lower, ty: Type, comptime what: []const u8) codegen.Error!u8 {
+        if (ty.zigTypeTag(self.zcu) != .int) return 1;
+        const bits = ty.bitSize(self.zcu);
+        if (bits <= 8) return 1;
+        if (bits == 16) return 2;
+        if (bits == 32) return 4;
+        return self.fail(what ++ "：只支持 ≤32 位整数，当前 {d} 位", .{bits});
+    }
+
     /// 固定地址解引用：interned ptr（base=.int）→ 字节地址；非固定地址 → null。
     fn constPtrAddr(self: *Lower, ref: Air.Inst.Ref) ?u64 {
         const ip_index = ref.toInterned() orelse return null;
@@ -267,6 +279,43 @@ const Lower = struct {
         } else {
             while (i < n) : (i += 1) try self.immTo(dst + i, 0);
         }
+    }
+
+    /// 运行期移位次数：复制源到 dst，再按「每轮 1 位」循环 cnt 次。
+    /// cnt 要复制一份（dec_br_nz 会改写）；算术右移每轮把最高位补成符号
+    /// ——单轮填充掩码恒为 0x80，比常量移位的「余位掩码」还简单。
+    fn shiftRuntime(self: *Lower, dst: u8, a: u8, n: u8, cnt: mcsmir.Byte, left: bool, arith: bool) !void {
+        var k: u8 = 0;
+        while (k < n) : (k += 1) try self.movTo(dst + k, mcsmir.v(a + k));
+        var sign_ext: ?u8 = null;
+        if (!left and arith) {
+            const e = try self.allocVreg();
+            try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(e), .src = mcsmir.v(a + (n - 1)) } });
+            sign_ext = e;
+        }
+        const c = try self.allocVreg();
+        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(c), .src = cnt } });
+        const l_done = self.tempLabel();
+        const l_loop = self.tempLabel();
+        try self.ops.append(self.gpa, .{ .br_ifz = .{ .cond = mcsmir.v(c), .target = l_done } });
+        try self.ops.append(self.gpa, .{ .label = l_loop });
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            const bidx = if (left) k else (n - 1 - k);
+            try self.ops.append(self.gpa, if (left)
+                .{ .rlc = .{ .dst = mcsmir.v(dst + bidx), .src = mcsmir.v(dst + bidx) } }
+            else .{ .rrc = .{ .dst = mcsmir.v(dst + bidx), .src = mcsmir.v(dst + bidx) } });
+        }
+        if (sign_ext) |e| {
+            const l_skip = self.tempLabel();
+            try self.ops.append(self.gpa, .{ .br_ifz = .{ .cond = mcsmir.v(e), .target = l_skip } });
+            const top = dst + (n - 1);
+            try self.ops.append(self.gpa, .{ .or_ = .{ .dst = mcsmir.v(top), .lhs = mcsmir.v(top), .rhs = .{ .imm = 0x80 } } });
+            try self.ops.append(self.gpa, .{ .label = l_skip });
+        }
+        try self.ops.append(self.gpa, .{ .dec_br_nz = .{ .dst = mcsmir.v(c), .target = l_loop } });
+        try self.ops.append(self.gpa, .{ .label = l_done });
     }
 
     /// 多字节乘法（固定模板）：
@@ -1874,9 +1923,19 @@ const Lower = struct {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 const info = try self.requireIntWidth(ty, "移位");
                 const bin = data.bin_op;
-                const cnt = self.constU8(bin.rhs) orelse
-                    return self.fail("移位次数必须是编译期常量（运行期移位暂不支持）", .{});
                 const left = switch (tag) { .shl, .shl_exact => true, else => false };
+                // 运行期移位次数：按「每轮 1 位」循环（次数 0 直接跳过），
+                // 8 位也走同一条模板——省一套专用发射路径。
+                const cnt = self.constU8(bin.rhs) orelse {
+                    const nw = info.bytes;
+                    const a_rt = try self.wideOperand(bin.lhs, nw);
+                    const d_rt = try self.allocWide(nw);
+                    const cloc = try self.refLoc(bin.rhs);
+                    try self.shiftRuntime(d_rt, a_rt, nw, cloc, left, !left and info.signed);
+                    self.vals[@backingInt(inst)] = mcsmir.v(d_rt);
+                    self.wide[@backingInt(inst)] = @as(u16, d_rt) | (@as(u16, nw) << 8);
+                    continue;
+                };
                 if (info.bytes == 1 and (left or !info.signed)) {
                     const lhs = try self.refLoc(bin.lhs);
                     const d = mcsmir.v(try self.allocVreg());
@@ -1960,10 +2019,7 @@ const Lower = struct {
             .alloc => {
                 // M1：每个局部槽一个 vreg（DSEG 直址）；活跃期优化留给后续 pass。
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                const n: u8 = if (ty.zigTypeTag(self.zcu) == .int)
-                    (try self.requireIntWidth(ty, "局部量")).bytes
-                else
-                    1;
+                const n = try self.storageBytes(ty, "局部量");
                 const base = try self.allocWide(n);
                 self.vals[@backingInt(inst)] = mcsmir.v(base);
                 if (n > 1) self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, n) << 8);
@@ -1973,10 +2029,7 @@ const Lower = struct {
                 // bin_op：lhs = 目标，rhs = 值。
                 // 多字节值写回局部槽：逐字节搬运（槽必须是连续的）。
                 const rty = self.air.typeOf(data.bin_op.rhs, &self.zcu.intern_pool);
-                const rn: u8 = if (rty.zigTypeTag(self.zcu) == .int)
-                    (try self.requireIntWidth(rty, "写回")).bytes
-                else
-                    1;
+                const rn = try self.storageBytes(rty, "写回");
                 if (rn > 1) {
                     const sbase = try self.wideOperand(data.bin_op.rhs, rn);
                     const wn = rn;
@@ -2070,10 +2123,7 @@ const Lower = struct {
             .load => {
                 // 宽类型（u16/u32）读取：槽位直接当多字节值，记录宽信息。
                 const lty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                const ln_b: u8 = if (lty.zigTypeTag(self.zcu) == .int)
-                    (try self.requireIntWidth(lty, "读取")).bytes
-                else
-                    1;
+                const ln_b = try self.storageBytes(lty, "读取");
                 if (ln_b > 1) {
                     if (self.ptrRefOf(data.ty_op.operand) != null)
                         return self.fail("多字节 xdata 读取尚未实现（先支持局部槽）", .{});
@@ -2268,12 +2318,10 @@ pub fn generate(
         null
     else blk: {
         const rbits = if (ret_ty.zigTypeTag(zcu) == .int) ret_ty.bitSize(zcu) else 0;
-        if (ret_ty.zigTypeTag(zcu) != .int or
-            (rbits != 8 and rbits != 16 and rbits != 32))
-        {
+        if (ret_ty.zigTypeTag(zcu) != .int or rbits == 0 or rbits > 32) {
             return zcu.codegenFail(
                 func.owner_nav,
-                "mcs2: 返回类型 {s} 尚未实现（目前 void/u8/u16/u32/i8/i16/i32）",
+                "mcs2: 返回类型 {s} 尚未实现（目前 void/≤32 位整数）",
                 .{@tagName(ret_ty.zigTypeTag(zcu))},
             );
         }
