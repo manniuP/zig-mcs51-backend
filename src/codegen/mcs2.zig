@@ -1570,6 +1570,9 @@ pub fn generate(
     @memset(lw.ptr_vals, null);
 
     lw.needs_dptr = lw.airNeedsDptr();
+    // 关键：ISR 的尾声（pop + reti）靠这个字段判定；漏赋值会让 ISR 以 `ret` 结束、
+    // 且不恢复现场（栈上留下 4 字节，打断主程序后必错）。
+    lw.is_isr = is_isr;
 
     if (is_isr and !no_isr_save) {
         // 现场保存：A/PSW/DPTR（M1 指令集用到的全部硬件寄存器；B 未用）。

@@ -337,6 +337,11 @@ loop:
 
 def check_interrupt(name: str) -> bool:
     _, text = emit_asm(HERE / "tests" / "interrupt.zig", name)
+    # ISR 必须真的保存/恢复现场并以 reti 结束（曾因 Lower.is_isr 漏赋值退化成 ret）。
+    pushes = text.count("    push ")
+    pops = text.count("    pop ")
+    shape_ok = pushes > 0 and pushes == pops and "    reti" in text
+    print(f"  {'PASS' if shape_ok else 'FAIL'}: ISR 现场保存/恢复（push {pushes} / pop {pops} / reti）")
     merged = merge(name, INTERRUPT_DRIVER + "\n", text)
     ihx = assemble(merged, name, dseg=0x30, cseg=0x0030)
     count = sim(ihx, steps=2000, slots=1)[0x8000]
@@ -344,7 +349,7 @@ def check_interrupt(name: str) -> bool:
     # 连续中断交给 QEMU(251)/实机。
     ok = count >= 1
     print(f"  {'PASS' if ok else 'FAIL'}: timer0 中断计数 = {count}（阈值 ≥1）")
-    return ok
+    return ok and shape_ok
 
 
 def size_gate() -> bool:
