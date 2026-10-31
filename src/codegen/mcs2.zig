@@ -190,6 +190,23 @@ const Lower = struct {
         return null;
     }
 
+    /// 整数宽度闸门：只认 u8/u16/u32，其余一律明确拒绝。
+    /// 以前的 `wideBytes(ty) orelse 1` 会把 u1/u64/i8 静默当 1 字节算——
+    /// 实测 u1 的 1+1 得到 2（正确应为 0），属于静默算错。
+    fn requireIntWidth(self: *Lower, ty: Type, comptime what: []const u8) codegen.Error!u8 {
+        if (ty.zigTypeTag(self.zcu) != .int) {
+            return self.fail(what ++ "：只支持整数类型", .{});
+        }
+        const w = self.wideBytes(ty);
+        if (w == null or ty.isSignedInt(self.zcu)) {
+            return self.fail(what ++ "：只支持 u8/u16/u32，当前位宽 {d} 位（{s}）", .{
+                ty.bitSize(self.zcu),
+                if (ty.isSignedInt(self.zcu)) "有符号" else "无符号",
+            });
+        }
+        return w.?;
+    }
+
     fn wideOf(self: *Lower, ref: Air.Inst.Ref) ?u16 {
         const idx = ref.toIndex() orelse return null;
         return self.wide[@backingInt(idx)];
@@ -1461,7 +1478,7 @@ const Lower = struct {
             .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap => {
                 const bin = data.bin_op;
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                const n = self.wideBytes(ty) orelse 1;
+                const n = try self.requireIntWidth(ty, "加减法");
                 // 多字节：固定模板 = clr c + addc/subb 逐字节（低字节在前）。
                 if (n > 1) {
                     const a = try self.wideOperand(bin.lhs, n);
@@ -1583,8 +1600,7 @@ const Lower = struct {
             // 移位：u8 用 rlc/rrc 逐位；多字节用逐字节模板（低→高 / 高→低）。
             .shl, .shl_exact, .shr, .shr_exact => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                const nw = self.wideBytes(ty) orelse 0;
-                if (nw == 0) return self.fail("移位只支持 8/16/32 位无符号", .{});
+                const nw = try self.requireIntWidth(ty, "移位");
                 if (nw > 1) {
                     const bin = data.bin_op;
                     const cnt = self.constU8(bin.rhs) orelse
@@ -1634,6 +1650,8 @@ const Lower = struct {
                 const dst_ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 // 只跟踪 8 位：放宽（源 ≤8 位）与截断（目标 ≤8 位）都不改低字节，
                 // 可以原样透传；两侧都更宽时语义不可丢失，直接拒绝。
+                // 转换是「通道」：宽度未知的整数（如 usize 24 位、u64）按 1 字节透传，
+                // 真正的安全闸门在算术/局部量/写回处——那里会明确拒绝奇异宽度。
                 const dn = self.wideBytes(dst_ty) orelse 1;
                 const sn = self.wideBytes(src_ty) orelse 1;
                 if (dn == 1 and sn == 1) {
@@ -1653,7 +1671,10 @@ const Lower = struct {
             .alloc => {
                 // M1：每个局部槽一个 vreg（DSEG 直址）；活跃期优化留给后续 pass。
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                const n = self.wideBytes(ty) orelse 1;
+                const n: u8 = if (ty.zigTypeTag(self.zcu) == .int)
+                    try self.requireIntWidth(ty, "局部量")
+                else
+                    1;
                 const base = try self.allocWide(n);
                 self.vals[@backingInt(inst)] = mcsmir.v(base);
                 if (n > 1) self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, n) << 8);
@@ -1663,7 +1684,10 @@ const Lower = struct {
                 // bin_op：lhs = 目标，rhs = 值。
                 // 多字节值写回局部槽：逐字节搬运（槽必须是连续的）。
                 const rty = self.air.typeOf(data.bin_op.rhs, &self.zcu.intern_pool);
-                const rn = self.wideBytes(rty) orelse 1;
+                const rn: u8 = if (rty.zigTypeTag(self.zcu) == .int)
+                    try self.requireIntWidth(rty, "写回")
+                else
+                    1;
                 if (rn > 1) {
                     const sbase = try self.wideOperand(data.bin_op.rhs, rn);
                     const wn = rn;
@@ -1757,7 +1781,10 @@ const Lower = struct {
             .load => {
                 // 宽类型（u16/u32）读取：槽位直接当多字节值，记录宽信息。
                 const lty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                const ln_b = self.wideBytes(lty) orelse 1;
+                const ln_b: u8 = if (lty.zigTypeTag(self.zcu) == .int)
+                    try self.requireIntWidth(lty, "读取")
+                else
+                    1;
                 if (ln_b > 1) {
                     if (self.ptrRefOf(data.ty_op.operand) != null)
                         return self.fail("多字节 xdata 读取尚未实现（先支持局部槽）", .{});
