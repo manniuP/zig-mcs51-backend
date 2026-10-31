@@ -321,6 +321,97 @@ const Lower = struct {
         try self.ops.append(self.gpa, .{ .dec_br_nz = .{ .dst = mcsmir.v(ctr), .target = l_loop } });
     }
 
+    /// dst = -src（n 字节二补码取负）。调用方保证 C 已清；链内 mov a,#0 不动 C。
+    fn negInto(self: *Lower, dst: u8, src: u8, n: u8) !void {
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        var k: u8 = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .subb = .{
+                .dst = mcsmir.v(dst + k),
+                .lhs = .{ .imm = 0 },
+                .rhs = mcsmir.v(src + k),
+            } });
+        }
+    }
+
+    /// dst = |src|：先整体搬运；有符号时看最高字节符号位（sex → 0x00/0xFF），
+    /// 非零才取负。dst 允许与 src 相同（逐字节读在前写在后）。
+    fn absInto(self: *Lower, dst: u8, src: u8, n: u8, signed: bool) !void {
+        var k: u8 = 0;
+        while (k < n) : (k += 1) try self.movTo(dst + k, mcsmir.v(src + k));
+        if (!signed) return;
+        const sgn = try self.allocVreg();
+        try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(sgn), .src = mcsmir.v(src + (n - 1)) } });
+        const skip = self.tempLabel();
+        try self.ops.append(self.gpa, .{ .br_ifz = .{ .cond = mcsmir.v(sgn), .target = skip } });
+        try self.negInto(dst, dst, n);
+        try self.ops.append(self.gpa, .{ .label = skip });
+    }
+
+    /// 多字节除法（恢复法，8n 轮循环，代码 ~40n+40 B）：
+    /// 每轮把 (r:q) 左移一位（C 是被除数的下一位）→ 试减 y；够减置商位，
+    /// 不够减把 y 加回来（恢复法比重存法少一份 n 字节暂存）。
+    /// 有符号：先取绝对值，最后按「商异或、余数随被除数」定符号（C 的截断语义）。
+    fn divmodWide(self: *Lower, lhs: u8, rhs: u8, n: u8, signed: bool, want_quot: bool) !u8 {
+        const q = try self.allocWide(n);
+        const r = try self.allocWide(n);
+        const y = try self.allocWide(n);
+        try self.absInto(q, lhs, n, signed);
+        try self.absInto(y, rhs, n, signed);
+        var k: u8 = 0;
+        while (k < n) : (k += 1) try self.immTo(r + k, 0);
+        const ctr = try self.allocVreg();
+        try self.immTo(ctr, n * 8);
+        const l_loop = self.tempLabel();
+        const l_restore = self.tempLabel();
+        const l_next = self.tempLabel();
+        try self.ops.append(self.gpa, .{ .label = l_loop });
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(q + k), .src = mcsmir.v(q + k) } });
+        }
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(r + k), .src = mcsmir.v(r + k) } });
+        }
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .subb = .{ .dst = mcsmir.v(r + k), .lhs = mcsmir.v(r + k), .rhs = mcsmir.v(y + k) } });
+        }
+        try self.ops.append(self.gpa, .{ .br_c = .{ .target = l_restore, .on_set = true } });
+        try self.ops.append(self.gpa, .{ .or_ = .{ .dst = mcsmir.v(q), .lhs = mcsmir.v(q), .rhs = .{ .imm = 1 } } });
+        try self.ops.append(self.gpa, .{ .br = l_next });
+        try self.ops.append(self.gpa, .{ .label = l_restore });
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .addc = .{ .dst = mcsmir.v(r + k), .lhs = mcsmir.v(r + k), .rhs = mcsmir.v(y + k) } });
+        }
+        try self.ops.append(self.gpa, .{ .label = l_next });
+        try self.ops.append(self.gpa, .{ .dec_br_nz = .{ .dst = mcsmir.v(ctr), .target = l_loop } });
+        if (signed) {
+            const sa = try self.allocVreg();
+            const sb = try self.allocVreg();
+            try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(sa), .src = mcsmir.v(lhs + (n - 1)) } });
+            try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(sb), .src = mcsmir.v(rhs + (n - 1)) } });
+            const skip = self.tempLabel();
+            if (want_quot) {
+                // 商 = -(q) 当且仅当两侧符号不同
+                try self.ops.append(self.gpa, .{ .xor_ = .{ .dst = mcsmir.v(sa), .lhs = mcsmir.v(sa), .rhs = mcsmir.v(sb) } });
+                try self.ops.append(self.gpa, .{ .br_ifz = .{ .cond = mcsmir.v(sa), .target = skip } });
+                try self.negInto(q, q, n);
+            } else {
+                // 余数符号跟着被除数
+                try self.ops.append(self.gpa, .{ .br_ifz = .{ .cond = mcsmir.v(sa), .target = skip } });
+                try self.negInto(r, r, n);
+            }
+            try self.ops.append(self.gpa, .{ .label = skip });
+        }
+        return if (want_quot) q else r;
+    }
+
     /// 把一个操作数准备成 n 个连续槽位，返回基址。
     /// 变宽时按来源类型的符号性补位：无符号补 0，有符号补符号位——
     /// 这就是 i8→i16→i32 的符号扩展，也是负数常量变宽的位模式来源。
@@ -1727,20 +1818,25 @@ const Lower = struct {
                     self.vals[@backingInt(inst)] = d;
                     continue;
                 }
-                if (info.bytes > 1) {
-                    if (tag != .mul and tag != .mul_wrap)
-                        return self.fail("多字节除法/取余尚未实现（乘法已有模板）", .{});
+                // 多字节，或 8 位有符号（DIV AB/MUL AB 都是无符号 8 位）→ 固定模板。
+                if (info.bytes > 1 or info.signed) {
                     const n = info.bytes;
                     const binw = data.bin_op;
                     const a = try self.wideOperand(binw.lhs, n);
                     const b2 = try self.wideOperand(binw.rhs, n);
-                    const dw = try self.allocWide(n);
                     var saved_bw: ?u8 = null;
                     if (self.b_is_arg) {
                         saved_bw = try self.allocVreg();
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(saved_bw.?), .src = .{ .dir = 0xF0 } } });
                     }
-                    try self.mulWide(dw, a, b2, n);
+                    const dw = blk2: {
+                        if (tag == .mul or tag == .mul_wrap) {
+                            const t = try self.allocWide(n);
+                            try self.mulWide(t, a, b2, n);
+                            break :blk2 t;
+                        }
+                        break :blk2 try self.divmodWide(a, b2, n, info.signed, tag == .div_trunc);
+                    };
                     if (saved_bw) |sv| {
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = .{ .dir = 0xF0 }, .src = mcsmir.v(sv) } });
                     }

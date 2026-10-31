@@ -334,6 +334,36 @@ CASES: dict[str, dict] = {
                     args=[("DPL", 0x01), ("DPH", 0x00), ("B", 0x01), ("ACC", 0x00),
                           ("PARM_2", 0x01), ("PARM_3", 0x00), ("PARM_4", 0x01), ("PARM_5", 0x00)],
                     want32=0x00020001, steps=20000),
+    # 多字节除法（恢复法循环）：u16/u32 商与余数、有符号商与余数
+    "u16div":  dict(kind="call", src="div.zig", fn="u16div",
+                    args=[("DPL", 0xE8), ("DPH", 0x03), ("PARM_2", 0x07), ("PARM_3", 0x00)],
+                    want16=0x008E, steps=20000),
+    "u16rem":  dict(kind="call", src="div.zig", fn="u16rem",
+                    args=[("DPL", 0xE8), ("DPH", 0x03), ("PARM_2", 0x07), ("PARM_3", 0x00)],
+                    want16=0x0006, steps=20000),
+    "u32div":  dict(kind="call", src="div32.zig", fn="u32div",
+                    args=[("DPL", 0x45), ("DPH", 0x23), ("B", 0x01), ("ACC", 0x00),
+                          ("PARM_2", 0x00), ("PARM_3", 0x01), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                    want32=0x00000123, steps=60000),
+    "u32rem":  dict(kind="call", src="div32.zig", fn="u32rem",
+                    args=[("DPL", 0x45), ("DPH", 0x23), ("B", 0x01), ("ACC", 0x00),
+                          ("PARM_2", 0x00), ("PARM_3", 0x01), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                    want32=0x00000045, steps=60000),
+    "i32div":  dict(kind="call", src="sdiv.zig", fn="i32div",
+                    args=[("DPL", 0x9C), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF),
+                          ("PARM_2", 0x07), ("PARM_3", 0x00), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                    want32=0xFFFFFFF2, steps=60000),
+    "i32rem":  dict(kind="call", src="sdiv.zig", fn="i32rem",
+                    args=[("DPL", 0x9C), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF),
+                          ("PARM_2", 0x07), ("PARM_3", 0x00), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                    want32=0xFFFFFFFE, steps=60000),
+    "i8div":   dict(kind="call", src="sdiv8.zig", fn="i8div",
+                    args=[("DPL", 0x9C), ("PARM2", 0x07)], want=0xF2, steps=5000),
+    "i8rem":   dict(kind="call", src="sdiv8.zig", fn="i8rem",
+                    args=[("DPL", 0x9C), ("PARM2", 0x07)], want=0xFE, steps=5000),
+    "i16div":  dict(kind="call", src="sdiv8.zig", fn="i16div",
+                    args=[("DPL", 0x18), ("DPH", 0xFC), ("PARM_2", 0x07), ("PARM_3", 0x00)],
+                    want16=0xFF72, steps=20000),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -345,7 +375,9 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "u16add", "u16sub", "u16carry", "u16shl", "u16shr", "u32add", "u32carry",
          "sexcmp", "sexcmp2", "sex16", "i32add", "sar32", "sar8",
          "ucmp_eq", "ucmp_gt", "ucmp_lt", "wbits",
-         "u16mul", "u16mul2", "i16mul", "u32mul", "ringdemo"]
+         "u16mul", "u16mul2", "i16mul", "u32mul",
+         "u16div", "u16rem", "u32div", "u32rem", "i32div", "i32rem", "i8div", "i8rem", "i16div",
+         "ringdemo"]
 
 
 def check_selftest() -> bool:
