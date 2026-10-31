@@ -216,8 +216,11 @@ def main() -> int:
                     help="全自动：逐组写 AiCube 监视的 .ihx（文件一变它自己烧）+ 轮询收数")
     ap.add_argument("--live", default=str(FW_DIR / "real_live_ai8051u_115200.ihx"),
                     help="--auto 用的「被监视」文件路径（要与 AiCube 里选的同一个）")
-    ap.add_argument("--per-group", type=float, default=30.0,
-                    help="--auto 每组等多久（秒），含烧录+出数")
+    ap.add_argument("--per-group", type=float, default=8.0,
+                    help="--auto 每次读窗口（秒）")
+    ap.add_argument("--flash-wait", type=float, default=14.0,
+                    help="--auto 写文件后**关着串口**等 AiCube 烧完的秒数（这段时间别碰串口！）")
+    ap.add_argument("--tries", type=int, default=3, help="--auto 每组最多重试次数")
     ap.add_argument("--watch", metavar="PORT",
                     help="边烧边收：轮询串口累积各组结果，直到 48 项收齐或超时")
     ap.add_argument("--seconds", type=float, default=600.0, help="--watch 最长秒数")
@@ -241,7 +244,8 @@ def main() -> int:
                 by_src2[s] = []
                 order2.append(s)
             by_src2[s].append(c)
-        return auto(Path(args.live), args.auto, args.baud, order2, by_src2, args.per_group)
+        return auto(Path(args.live), args.auto, args.baud, order2, by_src2,
+                    args.per_group, args.flash_wait, args.tries)
     if not (args.sim or args.build or args.read):
         ap.print_help()
         return 2
@@ -402,7 +406,8 @@ def _collect(port: str, baud: int, results: dict[str, int], want: set[str],
 
 
 def auto(live: Path, port: str, baud: int, order: list[str],
-         by_src: dict[str, list[str]], per_group: float = 30.0) -> int:
+         by_src: dict[str, list[str]], per_group: float = 30.0,
+         flash_wait: float = 14.0, tries: int = 3) -> int:
     """真的全自动：把每组的 .ihx 写到 AiCube 监视的那个路径上，
     AiCube 一看到文件变化就烧，固件跑起来我们轮询收数——不用点任何按钮。"""
     import time
@@ -427,14 +432,22 @@ def auto(live: Path, port: str, baud: int, order: list[str],
         if not src_ihx.exists():
             print(f"缺固件 {src_ihx}：先跑 python realcheck.py --build --baud {baud}")
             return 2
-        live.write_bytes(src_ihx.read_bytes())
+        payload = src_ihx.read_bytes()
         print(f"[组{gi}/{len(order) - 1}] 写 {live.name} ← {src_ihx.name}"
               f"（{len(cases)} 项：{', '.join(cases)}）")
-        _collect(port, baud, results, set(cases), per_group)
-        got = [c for c in cases if c in results]
-        if len(got) < len(cases):
+        for attempt in range(tries):
+            live.write_bytes(payload)          # 每次重写都会更新 mtime → 触发「文件变化就下载」
+            # 关键：烧录窗口内**完全不碰串口**，让 AiCube 独占。
+            time.sleep(flash_wait)
+            _collect(port, baud, results, set(cases), per_group)
+            if all(c in results for c in cases):
+                break
+            if attempt + 1 < tries:
+                miss = [c for c in cases if c not in results]
+                print(f"  组{gi} 第 {attempt + 1} 次没收全（缺 {', '.join(miss)}），重试…")
+        if not all(c in results for c in cases):
             miss = [c for c in cases if c not in results]
-            print(f"  组{gi} 没收全（缺 {', '.join(miss)}）——如果 AiCube 没烧，重跑本命令即可")
+            print(f"  组{gi} 放弃（缺 {', '.join(miss)}）——检查 AiCube 的自动下载开关")
     all_cases = [c for src in order for c in by_src[src]]
     missing = [c for c in all_cases if c not in results]
     print(f"== 收齐 {len(results)}/{len(all_cases)}")
