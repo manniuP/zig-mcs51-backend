@@ -2370,20 +2370,33 @@ const Lower = struct {
                 const key = ip.indexToKey(callee_ip.?);
                 var sym: []const u8 = undefined;
                 var short: []const u8 = undefined;
-                switch (key) {
-                    .func => {
-                        const fi_info = self.zcu.funcInfo(callee_ip.?);
-                        const nav = fi_info.owner_nav;
-                        sym = try mangleNavSymbol(self.gpa, ip, nav);
-                        short = try self.gpa.dupe(u8, ip.getNav(nav).name.toSlice(ip));
-                    },
-                    .@"extern" => |ex| {
-                        // C 函数：SDCC 的符号就是 _名字
-                        const nm = ex.name.toSlice(ip);
-                        sym = try std.fmt.allocPrint(self.gpa, "_{s}", .{nm});
-                        short = try self.gpa.dupe(u8, nm);
-                    },
-                    else => return self.fail("调用目标不是函数（{s}）", .{@tagName(key)}),
+                // 取函数地址再调用（callee 是 .ptr 指向具名函数）→ 解出符号走直调，
+                // 比物化 2 字节地址再间接调更省。
+                var resolved = false;
+                if (key == .ptr) {
+                    const nav = switch (key.ptr.base_addr) {
+                        .nav => |n| n,
+                        else => return self.fail("取地址调用的目标不是具名函数", .{}),
+                    };
+                    sym = try mangleNavSymbol(self.gpa, ip, nav);
+                    short = try self.gpa.dupe(u8, ip.getNav(nav).name.toSlice(ip));
+                    resolved = true;
+                }
+                if (!resolved) {
+                    switch (key) {
+                        .func => |fi| {
+                            const nav = fi.owner_nav;
+                            sym = try mangleNavSymbol(self.gpa, ip, nav);
+                            short = try self.gpa.dupe(u8, ip.getNav(nav).name.toSlice(ip));
+                        },
+                        .@"extern" => |ex| {
+                            // C 函数：SDCC 的符号就是 _名字
+                            const nm = ex.name.toSlice(ip);
+                            sym = try std.fmt.allocPrint(self.gpa, "_{s}", .{nm});
+                            short = try self.gpa.dupe(u8, nm);
+                        },
+                        else => return self.fail("调用目标不是函数（{s}）", .{@tagName(key)}),
+                    }
                 }
                 const callee_ty = self.air.typeOf(ci.callee, ip);
                 const ret2 = callee_ty.fnReturnType(self.zcu);

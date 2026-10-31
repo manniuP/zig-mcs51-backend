@@ -21,3 +21,8 @@ export fn twice_ind(a: u16, x: u8) u8 {
     const f: Fn = @ptrFromInt(a);
     return f(f(x));
 }
+// Zig 里直接取函数地址（不经过 u16）
+export fn call_addr(x: u8) u8 {
+    const f: *const fn (u8) callconv(.c) u8 = &inc8;
+    return f(x);
+}
