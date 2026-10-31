@@ -377,6 +377,17 @@ CASES: dict[str, dict] = {
     "sarv":   dict(kind="call", src="shiftv.zig", fn="sarv",
                    args=[("DPL", 0x00), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF), ("PARM2", 0x04)],
                    want32=0xFFFFFFF0, steps=20000),
+    # 比较当值用（bool 返回 0/1）
+    "lt32":   dict(kind="call", src="cmpval.zig", fn="lt32",
+                   args=[("DPL", 0xFF), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF),
+                         ("PARM_2", 0x00), ("PARM_3", 0x00), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                   want=1),
+    "lt32b":  dict(kind="call", src="cmpval.zig", fn="lt32",
+                   args=[("DPL", 0x01), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x00),
+                         ("PARM_2", 0x00), ("PARM_3", 0x00), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                   want=0),
+    "ge8t":   dict(kind="call", src="cmpval.zig", fn="ge8", args=[("DPL", 5), ("PARM2", 5)], want=1),
+    "ge8f":   dict(kind="call", src="cmpval.zig", fn="ge8", args=[("DPL", 4), ("PARM2", 5)], want=0),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -391,6 +402,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "u16mul", "u16mul2", "i16mul", "u32mul",
          "u16div", "u16rem", "u32div", "u32rem", "i32div", "i32rem", "i8div", "i8rem", "i16div",
          "shlv", "shrv", "shrv0", "sarv",
+         "lt32", "lt32b", "ge8t", "ge8f",
          "ringdemo"]
 
 

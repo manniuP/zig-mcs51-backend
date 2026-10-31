@@ -609,6 +609,17 @@ const Lower = struct {
                         if (@backingInt(x) == @backingInt(target)) hit = true;
                     }
                 },
+                // 单操作数消费者：比较结果被 return / 转换 / 取反直接吃掉时也算「当值用」。
+                .ret, .ret_safe => {
+                    if (d.un_op.toIndex()) |x| {
+                        if (@backingInt(x) == @backingInt(target)) hit = true;
+                    }
+                },
+                .int_cast, .int_cast_safe, .trunc, .not => {
+                    if (d.ty_op.operand.toIndex()) |x| {
+                        if (@backingInt(x) == @backingInt(target)) hit = true;
+                    }
+                },
                 else => {},
             }
             if (hit) n += 1;
@@ -1656,10 +1667,10 @@ const Lower = struct {
 
             .arg => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                if (self.wideBytes(ty) == null) {
+                if (self.wideBytes(ty) == null and ty.zigTypeTag(self.zcu) != .bool) {
                     return self.zcu.codegenFail(
                         self.nav,
-                        "mcs2: 参数类型 {s} 尚未实现（目前只支持 8/16/32 位整数）",
+                        "mcs2: 参数类型 {s} 尚未实现（目前只支持 8/16/32 位整数与 bool）",
                         .{@tagName(ty.zigTypeTag(self.zcu))},
                     );
                 }
@@ -2269,8 +2280,45 @@ const Lower = struct {
             .cmp_lt, .cmp_lt_optimized, .cmp_lte, .cmp_lte_optimized,
             .cmp_gt, .cmp_gt_optimized, .cmp_gte, .cmp_gte_optimized,
             .cmp_eq, .cmp_eq_optimized, .cmp_neq, .cmp_neq_optimized => {
-                // M2 第一刀：比较指令本身不发码——它只作为 cond_br 的条件，
-                // 由 emitCondBr 融合成 cmp_br。若结果被当值使用，refLoc 会报错。
+                // 比较当 cond_br 的条件时不发码（emitCondBr 融合成 cmp_br / cmp_wide_br）。
+                // 被当值用（return / 赋值形式）时物化成 0/1 字节：
+                // 先置 0，条件成立就跳到「写 1」——用取反条件 + 一个落地标签。
+                if (self.useCount(body, inst, idx) > 0) {
+                    const cc = ccOf(tag).?;
+                    const bin = data.bin_op;
+                    const d = mcsmir.v(try self.allocVreg());
+                    const l_true = self.tempLabel();
+                    try self.ops.append(self.gpa, .{ .imm = .{ .dst = d, .value = 0 } });
+                    const oty = self.air.typeOf(bin.lhs, &self.zcu.intern_pool);
+                    const wide_cmp = if (self.intInfo(oty)) |oi| (oi.bytes > 1 or oi.signed) else false;
+                    if (wide_cmp) {
+                        const oi = self.intInfo(oty).?;
+                        const lhs = try self.wideOperand(bin.lhs, oi.bytes);
+                        const rhs = try self.wideOperand(bin.rhs, oi.bytes);
+                        const tmp = try self.allocVreg();
+                        try self.ops.append(self.gpa, .{ .cmp_wide_br = .{
+                            .lhs = lhs,
+                            .rhs = rhs,
+                            .n = oi.bytes,
+                            .tmp = mcsmir.v(tmp),
+                            .cc = cc.invert(),
+                            .signed = oi.signed,
+                            .target = l_true,
+                        } });
+                    } else {
+                        const lhs = try self.refLoc(bin.lhs);
+                        const rhs = try self.refLoc(bin.rhs);
+                        try self.ops.append(self.gpa, .{ .cmp_br = .{
+                            .lhs = lhs,
+                            .rhs = rhs,
+                            .cc = cc.invert(),
+                            .target = l_true,
+                        } });
+                    }
+                    try self.ops.append(self.gpa, .{ .imm = .{ .dst = d, .value = 1 } });
+                    try self.ops.append(self.gpa, .{ .label = l_true });
+                    self.vals[@backingInt(inst)] = d;
+                }
             },
 
             else => return self.zcu.codegenFail(
@@ -2317,8 +2365,9 @@ pub fn generate(
     const lower_ret_byte: ?u8 = if (ret_ty.zigTypeTag(zcu) == .void)
         null
     else blk: {
-        const rbits = if (ret_ty.zigTypeTag(zcu) == .int) ret_ty.bitSize(zcu) else 0;
-        if (ret_ty.zigTypeTag(zcu) != .int or rbits == 0 or rbits > 32) {
+        const rtt = ret_ty.zigTypeTag(zcu);
+        const rbits: u64 = if (rtt == .int) ret_ty.bitSize(zcu) else if (rtt == .bool) 8 else 0;
+        if ((rtt != .int and rtt != .bool) or rbits == 0 or rbits > 32) {
             return zcu.codegenFail(
                 func.owner_nav,
                 "mcs2: 返回类型 {s} 尚未实现（目前 void/≤32 位整数）",
