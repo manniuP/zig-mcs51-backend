@@ -9,7 +9,7 @@ export fn sum(n: u8) u8 {
 }
 
 // 无参 + 纯 u8 计算：部分求值（切片 A）应把它折成常量。
-export fn sum_to() u8 {
+export fn sum_to_fold() u8 {
     var s: u8 = 0;
     var i: u8 = 0;
     while (i < 25) : (i += 1) {

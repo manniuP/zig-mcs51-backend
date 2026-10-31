@@ -479,9 +479,11 @@ const Lower = struct {
         const ops = self.ops.items;
         if (ops.len == 0) return false;
         for (ops) |op| switch (op) {
-            .load_dir, .load_xdata, .push, .pop, .reti, .halt => return false,
-            .store_dir => |x| if (x.src == .sym) return false,
-            .store_xdata => |x| if (x.src == .sym) return false,
+            // 硬件访问一律不折：SFR/xdata 的读写带时序与副作用，折了会丢时序。
+            // 唯一例外是 DPL(0x82)——那是 u8 返回值的 ABI 出口，不是硬件副作用。
+            .load_dir, .load_xdata, .store_xdata,
+            .push, .pop, .reti, .halt => return false,
+            .store_dir => |x| if (x.addr != 0x82) return false,
             else => {},
         };
 
@@ -989,17 +991,20 @@ pub fn generate(
         });
     }
 
-    _ = try lw.emitBody(body);
+    const body_terminated = try lw.emitBody(body);
 
     // M2.4：循环旋转（top-test + 底部递减 → djnz）。
     try lw.rotateDjnz();
 
     // 部分求值（切片 A）：无参 + 纯内部计算 → 编译期算完，只留常量写回。
-    if (!is_isr and lw.arg_cursor == 0) {
+    // 激进优化必须显式开启：函数名以 `_fold` 结尾（如 fact_fold / sum_to_fold）。
+    const fold_opt_in = std.mem.endsWith(u8, short_name, "_fold");
+    if (!is_isr and lw.arg_cursor == 0 and fold_opt_in) {
         if (try lw.foldPure()) lw.saw_ret = true;
     }
 
-    if (!lw.saw_ret) {
+    // 没有 ret 也允许：只要 body 以 br 终结（如 while(true)），控制流不会落空。
+    if (!lw.saw_ret and !body_terminated) {
         return zcu.codegenFail(func.owner_nav, "mcs2: 函数体缺少 ret", .{});
     }
 

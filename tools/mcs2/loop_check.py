@@ -60,7 +60,7 @@ def main() -> int:
     cases = [
         ("sum", 5, 10),
         ("cnt", 7, 7),
-        ("sum_to", None, 44),   # 0+1+...+24 = 300 -> u8 回绕 44；PE 应折叠
+        ("sum_to_fold", None, 44),   # 0+1+...+24 = 300 -> u8 回绕 44；PE 应折叠
     ]
     fail = False
     for fn, arg, want in cases:

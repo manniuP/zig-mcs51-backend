@@ -10,38 +10,45 @@ const TCON: *volatile u8 = @ptrFromInt(0x88);
 const AUXR: *volatile u8 = @ptrFromInt(0x8E);
 const P3M0: *volatile u8 = @ptrFromInt(0xB2);
 const P3M1: *volatile u8 = @ptrFromInt(0xB1);
+const P_SW1: *volatile u8 = @ptrFromInt(0xA2);
 
 inline fn delay1ms() void {
     var i: u8 = 0;
-    while (i < 200) : (i += 1) {
+    while (i < 255) : (i += 1) {
         var j: u8 = 0;
-        while (j < 200) : (j += 1) {}
+        while (j < 255) : (j += 1) {}
     }
 }
 
 export fn main() void {
+    // UART1 切到 P3.6(RXD)/P3.7(TXD)：P_SW1 的 S1_S = 01（STC 官方 PortSwitch）
+    P_SW1.* = 0x40;
     P3M1.* = 0x00;
-    P3M0.* = 0x02;
+    P3M0.* = 0x80;   // P3.7(TXD) 推挽输出
     TMOD.* = 0x20;
     AUXR.* = 0x40;
-    // 9600 @ 24MHz: 65536 - 24000000/4/9600 = 65411 = 0xFF83
-    TH1.* = 0xFF;
-    TL1.* = 0x83;
+    // STC8H 是 8051 核：Timer1 模式2 = 8 位自动重载，baud = FOSC/(32*(256-TH1))（1T）
+    // 9600 @45.1584MHz: 256 - 45158400/(32*9600) = 109 = 0x6D
+    TH1.* = 0x6D;
+    TL1.* = 0x6D;
     TCON.* = 0x40;
     SCON.* = 0x40;
 
-    SBUF.* = 'H';
-    delay1ms();
-    SBUF.* = 'E';
-    delay1ms();
-    SBUF.* = 'L';
-    delay1ms();
-    SBUF.* = 'L';
-    delay1ms();
-    SBUF.* = 'O';
-    delay1ms();
-    SBUF.* = 0x0D;
-    delay1ms();
-    SBUF.* = 0x0A;
-    delay1ms();
+    var n: u8 = 0;
+    while (n < 255) : (n += 1) {
+        SBUF.* = 'H';
+        delay1ms();
+        SBUF.* = 'E';
+        delay1ms();
+        SBUF.* = 'L';
+        delay1ms();
+        SBUF.* = 'L';
+        delay1ms();
+        SBUF.* = 'O';
+        delay1ms();
+        SBUF.* = 0x0D;
+        delay1ms();
+        SBUF.* = 0x0A;
+        delay1ms();
+    }
 }
