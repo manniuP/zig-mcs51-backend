@@ -18,6 +18,9 @@ const peephole = @import("peephole.zig");
 
 const Byte = mir.Byte;
 
+/// 间接调用要自己造「返回地址」标签：模块级序列，保证跨函数唯一。
+var ind_label_seq: u32 = 0;
+
 /// 条目流元素：窥孔操作的最小结构。
 /// `line.jump` 非空表示这是跳转指令，文本 = `{text} L{jump}`。
 pub const Item = union(enum) {
@@ -171,8 +174,8 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .pop => |x| if (touchesDplDph(x.dst)) null else prev,
         .dec => prev,
         .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .ret, .reti, .halt,
-        // lcall 会踩 DPL/DPH（被调方的 arg0 就在那儿）→ 之后的 xdata 访问必须重建 DPTR。
-        .sex, .cmp_wide_br, .mul16, .br_c, .lcall => null,
+        // lcall / 间接调用都会踩 DPL/DPH（被调方的 arg0 就在那儿）→ 之后的 xdata 访问必须重建 DPTR。
+        .sex, .cmp_wide_br, .mul16, .br_c, .lcall, .lcall_ind => null,
     };
 }
 
@@ -299,6 +302,10 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c, .lcall => op,
+            .lcall_ind => |x| .{ .lcall_ind = .{
+                .target = f.vreg_base + x.target,
+                .save = byteOf(x.save, f.vreg_base),
+            } },
         };
         // 这次 xdata 访问想要的 DPTR 内容；与当前一致就不重建。
         const want_dptr: ?DptrState = switch (m_op) {
@@ -782,6 +789,34 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 "    lcall {s}",
                 .{x.sym},
             ), .jump = null } }),
+            .lcall_ind => |x| {
+                // 8051 没有 "lcall @a+dptr"：压一个假返回地址 + 压目标地址，再 ret 跳过去。
+                // **RET 先弹高字节**（实测：先弹 (SP)，当高字节用）→ 所以每个 16 位值必须
+                // 「先压低、后压高」，使高字节在栈顶。顺序反了会跳到 0x0D00 之类的地方（踩过）。
+                // 栈序（低→高）：r1_lo, r1_hi, tgt_lo, tgt_hi → ret 弹 tgt ✓，目标返回时弹 r1 ✓。
+                // A 是 arg0 的第 4 字节，压栈要借 A，先存后恢复。
+                // 标签必须**跨函数唯一**（同一个 .asm 里两个函数都造 L0 会重定义）：
+                // 用模块级序列 + 高位前缀，避开 AIR 的标签域。
+                ind_label_seq +%= 1;
+                const ret_lbl: u32 = 0x4000_0000 +% ind_label_seq;
+                const lo = try byteText(gpa, .{ .vreg = x.target });
+                const hi = try byteText(gpa, .{ .vreg = x.target + 1 });
+                const sv = try byteText(gpa, x.save);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{sv}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,#<(L{d})", .{ret_lbl}), .jump = null } },
+                    .{ .line = .{ .text = "    push 0xE0", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,#>(L{d})", .{ret_lbl}), .jump = null } },
+                    .{ .line = .{ .text = "    push 0xE0", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{lo}), .jump = null } },
+                    .{ .line = .{ .text = "    push 0xE0", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{hi}), .jump = null } },
+                    .{ .line = .{ .text = "    push 0xE0", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{sv}), .jump = null } },
+                    .{ .line = .{ .text = "    ret", .jump = null } },
+                    .{ .label = ret_lbl },
+                });
+            },
             .ret => try items.append(gpa, .{ .line = .{ .text = "    ret", .jump = null } }),
             .halt => {
                 // `sjmp .`：跳转到自身死循环。目标不是局部标签（jump=null），

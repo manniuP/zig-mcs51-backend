@@ -968,6 +968,7 @@ const Lower = struct {
             .cmp_br => |x| .{ .cmp_br = .{ .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map), .cc = x.cc, .target = x.target } },
             .dec_br_nz => |x| .{ .dec_br_nz = .{ .dst = mapByteVreg(x.dst, map), .target = x.target } },
             .br_c, .lcall => op,
+            .lcall_ind => op,
             .push => |x| .{ .push = .{ .src = mapByteVreg(x.src, map) } },
             .pop => |x| .{ .pop = .{ .dst = mapByteVreg(x.dst, map) } },
             .dec => op, // 载荷是裸 vreg 下标；对应 vreg 已被禁用映射
@@ -2005,6 +2006,8 @@ const Lower = struct {
             // 目的：让 `buf[i]`（i: u8 → usize 下标）不再被拒绝。
             // bit_cast 也走这条：同宽整数是纯透传；`@intFromBool`（bool→u8）是
             // 1 位零扩展（源是 bool，不是有符号整数，所以不会误做符号扩展）。
+            // int_to_ptr / ptr_to_int 也走这条：把「地址装在 u16 里」的宽度信息带过去，
+            // 间接调用要靠它拿到 2 字节目标地址。
             .int_cast, .int_cast_safe, .trunc, .bit_cast => {
                 const ty_op = data.ty_op;
                 const src_ty = self.air.typeOf(ty_op.operand, &self.zcu.intern_pool);
@@ -2013,8 +2016,18 @@ const Lower = struct {
                 // 可以原样透传；两侧都更宽时语义不可丢失，直接拒绝。
                 // 转换是「通道」：宽度未知的整数（如 usize 24 位、u64）按 1 字节透传，
                 // 真正的安全闸门在算术/局部量/写回处——那里会明确拒绝奇异宽度。
-                const dn = self.wideBytes(dst_ty) orelse 1;
-                const sn = self.wideBytes(src_ty) orelse 1;
+                // 目标位宽「未知」（如 usize 在本目标是 24 位）：值不变，
+                // 但**宽度信息必须按来源保留**——否则 u16 地址转 usize 再转指针就丢了高字节。
+                const dst_w = self.wideBytes(dst_ty);
+                const src_w = self.wideBytes(src_ty);
+                if (dst_w == null and src_w != null) {
+                    const base = try self.wideOperand(ty_op.operand, src_w.?);
+                    self.vals[@backingInt(inst)] = mcsmir.v(base);
+                    self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, src_w.?) << 8);
+                    continue;
+                }
+                const dn = dst_w orelse 1;
+                const sn = src_w orelse 1;
                 if (dn == 1 and sn == 1) {
                     self.vals[@backingInt(inst)] = try self.refLoc(ty_op.operand);
                 } else if (dn == 1) {
@@ -2027,6 +2040,19 @@ const Lower = struct {
                     self.vals[@backingInt(inst)] = mcsmir.v(base);
                     self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, dn) << 8);
                 }
+            },
+
+            // 地址装进整数再转指针（@ptrFromInt）：位模式不变，只把宽度信息带过去，
+            // 间接调用靠它拿到 2 字节目标地址。
+            .ptr_from_int => {
+                const ty_op = data.ty_op;
+                const src_ty = self.air.typeOf(ty_op.operand, &self.zcu.intern_pool);
+                // 源可能是 usize（这个目标里 24 位）→ 只取低 2 字节当地址。
+                if (src_ty.zigTypeTag(self.zcu) != .int or src_ty.bitSize(self.zcu) < 16)
+                    return self.fail("指针必须来自 ≥16 位整数（51 上地址是 2 字节）", .{});
+                const base = try self.wideOperand(ty_op.operand, 2);
+                self.vals[@backingInt(inst)] = mcsmir.v(base);
+                self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, 2) << 8);
             },
 
             .alloc => {
@@ -2288,14 +2314,65 @@ const Lower = struct {
             .call, .call_always_tail, .call_never_tail, .call_never_inline => {
                 const ci = self.air.unwrapCall(inst);
                 const ip = &self.zcu.intern_pool;
-                const callee_ip = ci.callee.toInterned() orelse
-                    return self.fail("间接调用（函数指针）尚未支持", .{});
-                const key = ip.indexToKey(callee_ip);
+                const callee_ip = ci.callee.toInterned();
+                if (callee_ip == null) {
+                    // ---- 间接调用：函数指针 / 把地址装进 u16 再强转 ----
+                    var cty = self.air.typeOf(ci.callee, ip);
+                    if (cty.zigTypeTag(self.zcu) == .pointer) cty = cty.childType(self.zcu);
+                    const rty2 = cty.fnReturnType(self.zcu);
+                    const rn2: u8 = if (rty2.zigTypeTag(self.zcu) == .void)
+                        0
+                    else
+                        try self.storageBytes(rty2, "调用返回值");
+                    // ① 目标地址先快照成 2 字节（后面摆参会踩 DPL/DPH）
+                    const tgt = try self.wideOperand(ci.callee, 2);
+                    const sv = try self.allocVreg();
+                    // ② 实参快照（间接调用拿不到被调方的 PARM 符号 → 只能走 ABI 寄存器）
+                    var total: usize = 0;
+                    for (ci.args) |arg_ref| {
+                        total += try self.storageBytes(self.air.typeOf(arg_ref, ip), "调用参数");
+                    }
+                    if (total > 4) return self.fail(
+                        "间接调用（函数指针）只支持 ≤4 字节参数（合计），当前 {d} 字节——间接调用拿不到被调方的 PARM 区",
+                        .{total},
+                    );
+                    // ③ 摆参：所有实参按字节顺序灌进 ABI 寄存器（合计 ≤4 字节，前面已校验）
+                    var off: u8 = 0;
+                    for (ci.args) |arg_ref| {
+                        const aty = self.air.typeOf(arg_ref, ip);
+                        const an = try self.storageBytes(aty, "调用参数");
+                        const base = try self.wideOperand(arg_ref, an);
+                        var k: u8 = 0;
+                        while (k < an) : (k += 1) {
+                            try self.ops.append(self.gpa, .{ .mov = .{
+                                .dst = .{ .dir = mcsmir.abi.arg_regs[off + k] },
+                                .src = mcsmir.v(base + k),
+                            } });
+                        }
+                        off += an;
+                    }
+                    try self.ops.append(self.gpa, .{ .lcall_ind = .{ .target = tgt, .save = mcsmir.v(sv) } });
+                    if (rn2 > 0) {
+                        const dbase2 = try self.allocWide(rn2);
+                        var kk: u8 = rn2;
+                        while (kk > 0) {
+                            kk -= 1;
+                            try self.ops.append(self.gpa, .{ .load_dir = .{
+                                .dst = mcsmir.v(dbase2 + kk),
+                                .addr = mcsmir.abi.arg_regs[kk],
+                            } });
+                        }
+                        self.vals[@backingInt(inst)] = mcsmir.v(dbase2);
+                        if (rn2 > 1) self.wide[@backingInt(inst)] = @as(u16, dbase2) | (@as(u16, rn2) << 8);
+                    }
+                    continue;
+                }
+                const key = ip.indexToKey(callee_ip.?);
                 var sym: []const u8 = undefined;
                 var short: []const u8 = undefined;
                 switch (key) {
                     .func => {
-                        const fi_info = self.zcu.funcInfo(callee_ip);
+                        const fi_info = self.zcu.funcInfo(callee_ip.?);
                         const nav = fi_info.owner_nav;
                         sym = try mangleNavSymbol(self.gpa, ip, nav);
                         short = try self.gpa.dupe(u8, ip.getNav(nav).name.toSlice(ip));

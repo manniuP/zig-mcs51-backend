@@ -228,6 +228,9 @@ def driver_call(fn: str, args: list[tuple[str, int]], slot: int = 0x8000,
     for pos, val in args:
         if pos in ("DPL", "DPH", "B", "ACC"):
             out += f"    mov {pos.lower()},#0x{val:02X}\n"
+        elif pos == "SYM16":
+            # 传一个符号的 16 位地址（拆低/高字节）——间接调用测试用
+            out += f"    mov dpl,#<{val}\n    mov dph,#>{val}\n"
         elif pos == "PARM2":
             out += f"    mov _{fn}_PARM_2,#0x{val:02X}\n"
         elif pos.startswith("PARM_"):
@@ -395,6 +398,11 @@ CASES: dict[str, dict] = {
     "mix32":   dict(kind="call", src="calls.zig", fn="wide_mix",
                     args=[("DPL", 0x00), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12), ("PARM2", 0x21)],
                     want32=0x12345621),
+    # 间接调用（函数指针）：地址装 u16 → @ptrFromInt → f(x)
+    "call_ind": dict(kind="call", src="indcall.zig", fn="call_ind",
+                     args=[("SYM16", "_inc8"), ("PARM2", 5)], want=6),
+    "twice_ind": dict(kind="call", src="indcall.zig", fn="twice_ind",
+                      args=[("SYM16", "_inc8"), ("PARM2", 5)], want=7),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -411,6 +419,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "shlv", "shrv", "shrv0", "sarv",
          "lt32", "lt32b", "ge8t", "ge8f",
          "chain", "chain32", "mix32",
+         "call_ind", "twice_ind",
          "ringdemo"]
 
 

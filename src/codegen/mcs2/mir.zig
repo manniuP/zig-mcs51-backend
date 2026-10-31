@@ -175,6 +175,12 @@ pub const Op = union(enum) {
     /// 位测试跳转（8051 `jb`/`jnb`）：`bit` 是位地址（SFR 区按 (A-0x80)*8+n 算）。
     /// on_set=true → 置位时跳（jb）；false → 清零时跳（jnb）。
     bit_br: struct { bit: u8, target: u32, on_set: bool },
+    /// **间接调用**：target 是 2 字节地址所在槽的基址（低字节在前）。
+    /// 8051 没有 "lcall @a+dptr"，发射层自己搭返回地址：
+    /// push 低字节/高字节 → jmp @a+dptr（A=0）。
+    /// 参数仍走 ABI 寄存器（DPL/DPH/B/A，≤4 字节）——间接调用时拿不到被调方的
+    /// PARM 符号，所以**多参数（>4 字节）不能走指针调用**。
+    lcall_ind: struct { target: u8, save: Byte },
     /// 长调用（lcall）。内部 ABI 与 SDCC 边界 ABI 相同：
     /// arg0 → DPL/DPH/B/A（≤4 字节），其余 → 被调方 _短名_PARM_2+ 静态区；
     /// 返回值同样走 DPL/DPH/B/A。因为所有值都住在 DSEG 静态槽，调用不需要保存现场。
