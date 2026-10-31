@@ -80,6 +80,22 @@ _crt_main:
     mov 0x98,#0x40
 """
 
+# 收到任何一个串口字节 → 软复位进 ISP（STC 的 bootloader），免掉每组都要断电/按 RST。
+# AI8051U 的 IAP_CONTR = 0xC7（官方 AI8051U.h 第 82 行），SWBS=bit6、SWRST=bit5 → 写 0x60。
+# 用「任何字节」而不是魔法字：AiCube 的下载握手最早发出的是 0x7F，
+# 但它按自己的下载波特率发（可能 2400），在 115200 下收到的是乱码——只认同一个值会漏。
+ISP_WATCH = """
+    ; ---- 串口收到字节就软复位进 ISP（下载模式），不需要按 RST/断电 ----
+    ; 注意 jb/jnb 只有 ±127 的射程，_again 在整块用例之前（几百字节外）→ 落到 ljmp。
+    jb 0x98,_isp_hit       ; SCON.RI（位地址 0x98）= 1 → 收到字节
+    ljmp _again            ; 没收到 → 继续循环打印
+_isp_hit:
+    mov a,0x99             ; 读 SBUF，硬件自动清 RI
+    mov 0xC7,#0x60         ; IAP_CONTR：SWBS=1 从 ISP 区启动 + SWRST=1 软复位
+    sjmp .                 ; 等芯片复位（复位后由 ISP 等下载）
+"""
+
+
 def harness_lib(wait_ti: bool) -> str:
     """打印子程序。wait_ti=True 给真机（等 TI 再发下一个字符）；
     False 给 ucsim（ucsim 的 SBUF/TI 时序不可靠，等它会卡死——只求把字符吐出来）。
@@ -182,7 +198,7 @@ def build_group(cases: list[str], idx: int, board: str, fosc: float, baud: int,
     harness += "_again:\n"
     for i, c in enumerate(cases):
         harness += case_asm(c, mcs2.CASES[c], 0x8000 + i * 4)
-    harness += harness_lib(wait_ti)
+    harness += ISP_WATCH + harness_lib(wait_ti)
     tag = f"real_g{idx}{suffix}_{src.split('.')[0]}"
     merged = mcs2.merge(tag, harness, body)
     ihx = mcs2.assemble(merged, tag, dseg=0x30, cseg=0x0000)
@@ -194,6 +210,8 @@ def main() -> int:
     ap.add_argument("--sim", action="store_true", help="构建并 ucsim 自检")
     ap.add_argument("--build", action="store_true", help="只出 .ihx 到 build/fw/")
     ap.add_argument("--read", metavar="PORT", help="读串口逐项比对（例 COM8）")
+    ap.add_argument("--dl", metavar="PORT",
+                    help="只发一次触发字节让固件软复位进 ISP（AiCube 点下载前/后都行）")
     ap.add_argument("--board", choices=("ai8051u", "stc8h"), default="ai8051u",
                     help="ai8051u：UART1 → P3.0/P3.1 + Timer2（默认）；stc8h：P3.6/P3.7 + Timer1")
     ap.add_argument("--baud", type=int, default=115200)
@@ -201,6 +219,8 @@ def main() -> int:
     ap.add_argument("--cases", nargs="*", default=None)
     ap.add_argument("--group", type=int, default=None, help="只跑某一组（序号）")
     args = ap.parse_args()
+    if args.dl:
+        return send_download(args.dl, args.baud)
     if not (args.sim or args.build or args.read):
         ap.print_help()
         return 2
@@ -263,6 +283,21 @@ def main() -> int:
         return read_serial(args.read, args.baud, order, by_src)
     print("PASS: 仿真自检全部通过" if ok_all else "FAIL: 有组不一致")
     return 0 if ok_all else 1
+
+
+def send_download(port: str, baud: int) -> int:
+    """给正在跑的固件发字节 → 它写 IAP_CONTR=0x60 软复位进 ISP。"""
+    try:
+        import serial
+    except ImportError:
+        print("缺 pyserial：pip install pyserial")
+        return 2
+    payload = bytes([0x7F, 0x7F, 0x7F, 0xA5, 0x7F])
+    with serial.Serial(port, baud, timeout=0.3) as sp:
+        sp.write(payload)
+        sp.flush()
+    print(f"已向 {port}@{baud} 发 {payload.hex(' ')}：固件应已软复位进 ISP（等着 AiCube 下载）")
+    return 0
 
 
 def read_serial(port: str, baud: int, order: list[str], by_src: dict[str, list[str]]) -> int:
