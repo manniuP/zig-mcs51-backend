@@ -404,6 +404,8 @@ CASES: dict[str, dict] = {
     "twice_ind": dict(kind="call", src="indcall.zig", fn="twice_ind",
                       args=[("SYM16", "_inc8"), ("PARM2", 5)], want=7),
     "call_addr": dict(kind="call", src="indcall.zig", fn="call_addr", args=[("DPL", 9)], want=10),
+    # 命令分发（语句形态 switch）：enum 选分支 + 统一参数/返回
+    "dispatch": dict(kind="call", src="switchd.zig", fn="dispatch", args=[("DPL", 2)], want=0x22),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -420,7 +422,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "shlv", "shrv", "shrv0", "sarv",
          "lt32", "lt32b", "ge8t", "ge8f",
          "chain", "chain32", "mix32",
-         "call_ind", "twice_ind", "call_addr",
+         "call_ind", "twice_ind", "call_addr", "dispatch",
          "ringdemo"]
 
 
