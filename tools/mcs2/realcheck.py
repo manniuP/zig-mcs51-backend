@@ -212,6 +212,12 @@ def main() -> int:
     ap.add_argument("--read", metavar="PORT", help="读串口逐项比对（例 COM8）")
     ap.add_argument("--dl", metavar="PORT",
                     help="只发一次触发字节让固件软复位进 ISP（AiCube 点下载前/后都行）")
+    ap.add_argument("--auto", metavar="PORT",
+                    help="全自动：逐组写 AiCube 监视的 .ihx（文件一变它自己烧）+ 轮询收数")
+    ap.add_argument("--live", default=str(FW_DIR / "real_live_ai8051u_115200.ihx"),
+                    help="--auto 用的「被监视」文件路径（要与 AiCube 里选的同一个）")
+    ap.add_argument("--per-group", type=float, default=30.0,
+                    help="--auto 每组等多久（秒），含烧录+出数")
     ap.add_argument("--watch", metavar="PORT",
                     help="边烧边收：轮询串口累积各组结果，直到 48 项收齐或超时")
     ap.add_argument("--seconds", type=float, default=600.0, help="--watch 最长秒数")
@@ -226,6 +232,16 @@ def main() -> int:
         return send_download(args.dl, args.baud)
     if args.watch:
         return watch(args.watch, args.baud, args.seconds)
+    if args.auto:
+        by_src2: dict[str, list[str]] = {}
+        order2: list[str] = []
+        for c in (args.cases or REAL_CASES):
+            s = mcs2.CASES[c]["src"]
+            if s not in by_src2:
+                by_src2[s] = []
+                order2.append(s)
+            by_src2[s].append(c)
+        return auto(Path(args.live), args.auto, args.baud, order2, by_src2, args.per_group)
     if not (args.sim or args.build or args.read):
         ap.print_help()
         return 2
@@ -345,6 +361,97 @@ def watch(port: str, baud: int, seconds: float) -> int:
         return 1
     print(f"PASS: 真机 {len(want)} 项全部一致")
     return 0
+
+
+def _collect(port: str, baud: int, results: dict[str, int], want: set[str],
+             seconds: float) -> None:
+    """开短窗轮询收集：开 1.2 s / 关 2 s（AiCube 下载要独占串口）。"""
+    import serial
+    import time
+
+    deadline = time.time() + seconds
+    buf = b""
+    while time.time() < deadline and not want.issubset(results):
+        try:
+            with serial.Serial(port, baud, timeout=0.2) as sp:
+                sp.reset_input_buffer()
+                t_end = min(time.time() + 1.2, deadline)
+                while time.time() < t_end and not want.issubset(results):
+                    chunk = sp.read(256)
+                    if not chunk:
+                        continue
+                    buf += chunk
+                    while b"\r\n" in buf:
+                        line, buf = buf.split(b"\r\n", 1)
+                        m = re.match(rb"^([a-z0-9_]+)=([0-9A-Fa-f]+)$", line.strip())
+                        if not m:
+                            continue
+                        name = m.group(1).decode()
+                        if name in results or name not in mcs2.CASES:
+                            continue
+                        raw = bytes.fromhex(m.group(2).decode())
+                        results[name] = sum(b << (8 * k) for k, b in enumerate(raw))
+                        w = _want(name)
+                        rb = _want_bytes(name)
+                        good = results[name] == w
+                        print(f"  {'PASS' if good else 'FAIL'} {name} = "
+                              f"0x{results[name]:0{rb * 2}X}（期望 0x{w:0{rb * 2}X}）")
+        except Exception:
+            time.sleep(0.8)
+        time.sleep(2.0)
+
+
+def auto(live: Path, port: str, baud: int, order: list[str],
+         by_src: dict[str, list[str]], per_group: float = 30.0) -> int:
+    """真的全自动：把每组的 .ihx 写到 AiCube 监视的那个路径上，
+    AiCube 一看到文件变化就烧，固件跑起来我们轮询收数——不用点任何按钮。"""
+    import time
+
+    FW_DIR.mkdir(parents=True, exist_ok=True)
+    live.parent.mkdir(parents=True, exist_ok=True)
+    results: dict[str, int] = {}
+    # 先听 3 s 看芯片上现在跑的是哪一组：已收齐的组直接跳过，重跑本命令不浪费烧录次数。
+    every: set[str] = set()
+    for s in order:
+        every.update(by_src[s])
+    print("== 先听 3 s 看当前跑的是哪组…")
+    _collect(port, baud, results, every, 3.0)
+    if results:
+        print(f"   已收到 {len(results)} 项：{', '.join(sorted(results))}")
+    for gi, src in enumerate(order):
+        cases = by_src[src]
+        if all(c in results for c in cases):
+            print(f"[组{gi}] 已在芯片上跑过，跳过")
+            continue
+        src_ihx = FW_DIR / f"real_g{gi}_{src.split('.')[0]}_ai8051u_{baud}.ihx"
+        if not src_ihx.exists():
+            print(f"缺固件 {src_ihx}：先跑 python realcheck.py --build --baud {baud}")
+            return 2
+        live.write_bytes(src_ihx.read_bytes())
+        print(f"[组{gi}/{len(order) - 1}] 写 {live.name} ← {src_ihx.name}"
+              f"（{len(cases)} 项：{', '.join(cases)}）")
+        _collect(port, baud, results, set(cases), per_group)
+        got = [c for c in cases if c in results]
+        if len(got) < len(cases):
+            miss = [c for c in cases if c not in results]
+            print(f"  组{gi} 没收全（缺 {', '.join(miss)}）——如果 AiCube 没烧，重跑本命令即可")
+    all_cases = [c for src in order for c in by_src[src]]
+    missing = [c for c in all_cases if c not in results]
+    print(f"== 收齐 {len(results)}/{len(all_cases)}")
+    if missing:
+        print(f"FAIL: 缺 {', '.join(missing)}")
+        return 1
+    print("PASS: 真机逐项全部一致")
+    return 0
+
+
+def _want(name: str) -> int:
+    spec = mcs2.CASES[name]
+    return spec.get("want32", spec.get("want16", spec.get("want")))
+
+
+def _want_bytes(name: str) -> int:
+    return ret_bytes(mcs2.CASES[name])
 
 
 def send_download(port: str, baud: int) -> int:
