@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -336,7 +337,8 @@ def watch(port: str, baud: int, seconds: float) -> int:
     seen: dict[str, int] = {}
     buf = b""
     deadline = time.time() + seconds
-    print(f"== 轮询 {port}@{baud}，最长 {seconds:.0f} s：每烧一组会自动收进来")
+    seconds = min(seconds, 300.0)   # 别留长命后台：被强杀时子进程会成孤儿（踩过）
+    print(f"== 轮询 {port}@{baud}，最长 {seconds:.0f} s（PID {os.getpid()}，强杀请按 PID）")
     while len(seen) < len(want) and time.time() < deadline:
         try:
             with serial.Serial(port, baud, timeout=0.2) as sp:
@@ -420,6 +422,7 @@ def auto(live: Path, port: str, baud: int, order: list[str],
 
     FW_DIR.mkdir(parents=True, exist_ok=True)
     live.parent.mkdir(parents=True, exist_ok=True)
+    print(f"PID {os.getpid()}（后台跑时强杀请按 PID，只杀 pwsh 会留下孤儿抢串口）")
     results: dict[str, int] = {}
     # 先听 3 s 看芯片上现在跑的是哪一组：已收齐的组直接跳过，重跑本命令不浪费烧录次数。
     every: set[str] = set()
