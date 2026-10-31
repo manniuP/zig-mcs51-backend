@@ -13,6 +13,16 @@ export fn zig_calls_c(x: u8) u8 {
     return c_scale(x) +% 1;
 }
 
+/// 无参无返回的 C 函数：连调两个不同实例（对应 C 里的 c_ping / c_ping2）。
+extern fn c_ping() void;
+extern fn c_ping2() void;
+
+export fn zig_two_void_calls(x: u8) u8 {
+    c_ping();
+    c_ping2();
+    return x +% 1;
+}
+
 /// 单字节：模拟 CDC 回调里的一步混音（被 C 直接调用）。
 export fn zig_cdc_mix(x: u8) u8 {
     var v: u8 = x ^ 0x5A;
