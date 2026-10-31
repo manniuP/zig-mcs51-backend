@@ -91,6 +91,14 @@ pub const Op = union(enum) {
     or_: struct { dst: Byte, lhs: Byte, rhs: Byte },
     /// dst = lhs ^ rhs（按位异或）。发射：`mov a,lhs; xrl a,rhs; mov dst,a`。
     xor_: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs * rhs（8 位回绕）。发射：`mov a,lhs; mov b,rhs; mul ab; mov dst,a`。
+    mul: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs / rhs（无符号整除）。发射：`mov a,lhs; mov b,rhs; div ab; mov dst,a`。
+    div_: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = lhs % rhs。发射：`mov a,lhs; mov b,rhs; div ab; mov dst,b`。
+    rem_: struct { dst: Byte, lhs: Byte, rhs: Byte },
+    /// dst = ~src（`cpl a`）。
+    not_: struct { dst: Byte, src: Byte },
     /// dst = lhs << n（8 位；n 必须是编译期常量）。发射：`mov a,lhs; clr c; rlc a` ×n。
     shl: struct { dst: Byte, lhs: Byte, n: u8 },
     /// dst = lhs >> n（逻辑右移）。发射：`mov a,lhs; clr c; rrc a` ×n。

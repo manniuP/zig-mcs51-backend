@@ -48,6 +48,21 @@ pub fn legalizeFeatures(_: *const std.Target) ?*const Air.Legalize.Features {
     return null;
 }
 
+/// Zig 会**并行**为不同函数做代码生成，而 vreg/标签/临时标签都是会话级计数器——
+/// 必须串行化，否则两个函数会拿到同一个 base（实测：not8 与 xnor8 都拿到 0，
+/// 结果 DSEG 槽重名、汇编器报 multiple definitions）。
+var codegen_lock = std.atomic.Value(bool).init(false);
+
+fn lockCodegen() void {
+    while (codegen_lock.cmpxchgWeak(false, true, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+fn unlockCodegen() void {
+    codegen_lock.store(false, .release);
+}
+
 /// 单次编译会话内的全局 vreg 基线：同模块多函数的 DSEG 槽不撞名。
 /// M1 简单累加（255 上限）；正式方案是 OVR 段覆盖或活跃期回收。
 var session_vreg_base: u8 = 0;
@@ -89,6 +104,8 @@ const Lower = struct {
     saw_ret: bool = false,
     /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
     label_base: u32 = 0,
+    /// arg2 是否落在 B 寄存器（0xF0）。MUL/DIV 会破坏 B，用到时要保存/恢复。
+    b_is_arg: bool = false,
     /// 本模块是否用到 dptr（取址/解引用）。用到时 arg0（DPL）必须先搬进 vreg：
     /// 0x82 同时是 DPTR 低字节，地址计算会把它踩掉。
     needs_dptr: bool = false,
@@ -577,6 +594,10 @@ const Lower = struct {
             .and_ => |x| .{ .and_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .or_ => |x| .{ .or_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .mul => |x| .{ .mul = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .div_ => |x| .{ .div_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .rem_ => |x| .{ .rem_ = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
+            .not_ => |x| .{ .not_ = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
             .shl => |x| .{ .shl = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
             .shr => |x| .{ .shr = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
             .mov => |x| .{ .mov = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
@@ -666,6 +687,10 @@ const Lower = struct {
             .and_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .or_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .xor_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .mul => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .div_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .rem_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .not_ => |x| isVregByte(x.src, r),
             .shl => |x| isVregByte(x.lhs, r),
             .shr => |x| isVregByte(x.lhs, r),
             .mov => |x| isVregByte(x.src, r),
@@ -719,6 +744,22 @@ const Lower = struct {
                 if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
                 break :blk mcsmir.Op{ .xor_ = y };
             },
+            .mul => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .mul = y };
+            },
+            .div_ => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .div_ = y };
+            },
+            .rem_ => |x| blk: {
+                var y = x;
+                if (isVregByte(y.lhs, from)) y.lhs = to else if (isVregByte(y.rhs, from)) y.rhs = to else break :blk null;
+                break :blk mcsmir.Op{ .rem_ = y };
+            },
+            .not_ => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .not_ = .{ .dst = x.dst, .src = to } } else null,
             .shl => |x| if (isVregByte(x.lhs, from)) mcsmir.Op{ .shl = .{ .dst = x.dst, .lhs = to, .n = x.n } } else null,
             .shr => |x| if (isVregByte(x.lhs, from)) mcsmir.Op{ .shr = .{ .dst = x.dst, .lhs = to, .n = x.n } } else null,
             .cmp_br => |x| blk: {
@@ -1045,6 +1086,31 @@ const Lower = struct {
                     if (!foldSet(x.dst, a ^ b, &regs, &dirs)) return false;
                     pc += 1;
                 },
+                .mul => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, a *% b, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .div_ => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (b == 0) return false; // 除零不折（保持运行期行为）
+                    if (!foldSet(x.dst, a / b, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .rem_ => |x| {
+                    const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
+                    const b = foldGet(x.rhs, &regs, &dirs) orelse return false;
+                    if (b == 0) return false;
+                    if (!foldSet(x.dst, a % b, &regs, &dirs)) return false;
+                    pc += 1;
+                },
+                .not_ => |x| {
+                    const a = foldGet(x.src, &regs, &dirs) orelse return false;
+                    if (!foldSet(x.dst, ~a, &regs, &dirs)) return false;
+                    pc += 1;
+                },
                 .shl => |x| {
                     const a = foldGet(x.lhs, &regs, &dirs) orelse return false;
                     const v: u8 = if (x.n >= 8) 0 else a << @intCast(x.n);
@@ -1239,6 +1305,7 @@ const Lower = struct {
                         .{ self.short_name, self.arg_cursor + 1 },
                     );
                     try self.parms.append(self.gpa, psym);
+                    if (self.arg_cursor + 1 == 3) self.b_is_arg = true;
                     self.vals[@backingInt(inst)] = .{ .sym = psym };
                 }
                 self.arg_cursor += 1;
@@ -1328,6 +1395,38 @@ const Lower = struct {
                     .bit_or => .{ .or_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                     else => .{ .xor_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                 });
+                self.vals[@backingInt(inst)] = d;
+            },
+
+            // 乘/除/取余/取反（u8）。8051 用 MUL AB / DIV AB，B 是结果高字节或余数，
+            // 而 B(0xF0) 同时是 arg2 的 ABI 位置 —— 用到了就保存/恢复。
+            .mul, .mul_wrap, .div_trunc, .rem, .not => {
+                const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                if (!self.typeIsU8(ty)) return self.fail("乘除只支持 u8（多字节待 addc/mul 扩展）", .{});
+                const d = mcsmir.v(try self.allocVreg());
+                if (tag == .not) {
+                    const src = try self.refLoc(data.ty_op.operand);
+                    try self.ops.append(self.gpa, .{ .not_ = .{ .dst = d, .src = src } });
+                    self.vals[@backingInt(inst)] = d;
+                    continue;
+                }
+                const bin = data.bin_op;
+                const lhs = try self.refLoc(bin.lhs);
+                const rhs = try self.refLoc(bin.rhs);
+                // B 被用作 arg2 → 先存起来，算完再放回。
+                var saved_b: ?u8 = null;
+                if (self.b_is_arg) {
+                    saved_b = try self.allocVreg();
+                    try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(saved_b.?), .src = .{ .dir = 0xF0 } } });
+                }
+                try self.ops.append(self.gpa, switch (tag) {
+                    .div_trunc => .{ .div_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
+                    .rem => .{ .rem_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
+                    else => .{ .mul = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
+                });
+                if (saved_b) |sv| {
+                    try self.ops.append(self.gpa, .{ .mov = .{ .dst = .{ .dir = 0xF0 }, .src = mcsmir.v(sv) } });
+                }
                 self.vals[@backingInt(inst)] = d;
             },
 
@@ -1540,6 +1639,12 @@ const Lower = struct {
                 try self.ops.append(self.gpa, .{ .label = end_l });
             },
             .block => {
+                // 带返回值的块（if (c) 1 else 0 这类表达式）需要 phi 语义，
+                // 目前不支持——明确拒绝，别让 refLoc 报「内部错误」。
+                const blk_ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                if (blk_ty.zigTypeTag(self.zcu) != .void) {
+                    return self.fail("if 表达式/块返回值尚未实现：改写成 var x: u8 加 if 语句形式", .{});
+                }
                 const blk = self.air.unwrapBlock(inst);
                 const inner = try self.emitBody(blk.body);
                 const end_l = self.blockEnd(inst);
@@ -1574,6 +1679,9 @@ pub fn generate(
     liveness: *const ?Air.Liveness,
 ) codegen.Error!Mir {
     _ = lf;
+    // 会话级计数器（vreg 基址、标签域、临时标签）串行化。
+    lockCodegen();
+    defer unlockCodegen();
     _ = liveness;
 
     const zcu = pt.zcu;

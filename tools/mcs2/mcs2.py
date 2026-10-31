@@ -259,13 +259,20 @@ CASES: dict[str, dict] = {
     "shr3":   dict(kind="call", src="shifts.zig", fn="shr3", args=[("DPL", 0xFF)], want=0x1F),
     "setbit": dict(kind="call", src="shifts.zig", fn="setbit", args=[], want=0x02),
     "clrbit": dict(kind="call", src="shifts.zig", fn="clrbit", args=[], want=0xFD),
+    # 乘/除/取余/取反（MUL AB / DIV AB / CPL A）；xnor 验取反参与表达式
+    "mul8":  dict(kind="call", src="math.zig", fn="mul8", args=[("DPL", 7), ("PARM2", 6)], want=42),
+    "div8":  dict(kind="call", src="math.zig", fn="div8", args=[("DPL", 47), ("PARM2", 6)], want=7),
+    "rem8":  dict(kind="call", src="math.zig", fn="rem8", args=[("DPL", 47), ("PARM2", 6)], want=5),
+    "not8":  dict(kind="call", src="math.zig", fn="not8", args=[("DPL", 0x0F)], want=0xF0),
+    "xnor8": dict(kind="call", src="math.zig", fn="xnor8", args=[("DPL", 0xF0), ("PARM2", 0x0F)], want=0x00),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
 
 ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big",
          "interrupt", "memrt", "bitfn", "xor2", "ne5", "ne_imm", "bitpoll", "bitclear",
-         "shl2", "shr3", "setbit", "clrbit", "ringdemo"]
+         "shl2", "shr3", "setbit", "clrbit",
+         "mul8", "div8", "rem8", "not8", "xnor8", "ringdemo"]
 
 
 def check_selftest() -> bool:

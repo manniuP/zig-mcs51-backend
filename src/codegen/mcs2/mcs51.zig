@@ -153,6 +153,10 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .sub => |x| if (touchesDplDph(x.dst)) null else prev,
         .and_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .or_ => |x| if (touchesDplDph(x.dst)) null else prev,
+        .mul => |x| if (touchesDplDph(x.dst)) null else prev,
+        .div_ => |x| if (touchesDplDph(x.dst)) null else prev,
+        .rem_ => |x| if (touchesDplDph(x.dst)) null else prev,
+        .not_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .shl => |x| if (touchesDplDph(x.dst)) null else prev,
         .shr => |x| if (touchesDplDph(x.dst)) null else prev,
         .xor_ => |x| if (touchesDplDph(x.dst)) null else prev,
@@ -259,6 +263,10 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 .src = byteOf(x.src, f.vreg_base),
             } },
             .and_ => |x| .{ .and_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .mul => |x| .{ .mul = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .div_ => |x| .{ .div_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .rem_ => |x| .{ .rem_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
+            .not_ => |x| .{ .not_ = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
             .shl => |x| .{ .shl = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
             .shr => |x| .{ .shr = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .n = x.n } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
@@ -339,6 +347,50 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     .{ .line = .{ .text = "    clr c", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    subb a,{s}", .{r}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .mul => |x| {
+                // 8051 MUL AB：A×B → B:A，低位在 A；高位丢弃（u8 回绕语义）。
+                const l = try byteText(gpa, x.lhs);
+                const rr = try byteText(gpa, x.rhs);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,{s}", .{rr}), .jump = null } },
+                    .{ .line = .{ .text = "    mul ab", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .div_ => |x| {
+                // DIV AB：A/B → 商在 A、余数在 B。
+                const l = try byteText(gpa, x.lhs);
+                const rr = try byteText(gpa, x.rhs);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,{s}", .{rr}), .jump = null } },
+                    .{ .line = .{ .text = "    div ab", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .rem_ => |x| {
+                const l = try byteText(gpa, x.lhs);
+                const rr = try byteText(gpa, x.rhs);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,{s}", .{rr}), .jump = null } },
+                    .{ .line = .{ .text = "    div ab", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},b", .{d}), .jump = null } },
+                });
+            },
+            .not_ => |x| {
+                const s = try byteText(gpa, x.src);
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
+                    .{ .line = .{ .text = "    cpl a", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
                 });
             },
@@ -711,6 +763,8 @@ fn instrBytes(text: []const u8) usize {
     if (std.mem.startsWith(u8, t, "j")) return 2; // jz/jnz/jc/jnc
     if (std.mem.startsWith(u8, t, "rlc") or std.mem.startsWith(u8, t, "rrc")) return 1;
     if (std.mem.startsWith(u8, t, "setb")) return 2; // setb bit
+    if (std.mem.startsWith(u8, t, "mul") or std.mem.startsWith(u8, t, "div")) return 1; // mul ab / div ab
+    if (std.mem.startsWith(u8, t, "cpl")) return 2; // cpl a 是 1，取保守值
     if (std.mem.startsWith(u8, t, "rl a") or std.mem.startsWith(u8, t, "rr a")) return 1;
     if (std.mem.startsWith(u8, t, "ret")) return 1;
     if (std.mem.startsWith(u8, t, "nop")) return 1;
