@@ -39,19 +39,43 @@ REAL_CASES = [
     "lt32", "lt32b", "ge8t", "ge8f",
 ]
 
-HARNESS_HEAD = """\
+def harness_head(board: str, fosc: float, baud: int) -> str:
+    """crt0 + UART1 初始化。两种板子引脚/定时器不同，参数都必须与实机验证过的例程一致：
+
+    * ai8051u（默认，本机唯一能下的板子）：UART1 → **P3.0/P3.1**，Timer2 1T 作波特率，
+      配置照抄 zig_t0print（真机 115200 通过）；40 MHz 时 T2H:T2L = 0xFFA9。
+    * stc8h：UART1 → P3.6/P3.7，Timer1 模式2（1T），照抄 uart_demo（45.1584 MHz @9600 → 0x6D）。
+    """
+    head = """\
     .area CSEG (CODE)
     ljmp _crt_main
 _crt_main:
     mov sp,#0x7F
-    ; UART1 走 P3.6/P3.7，Timer1 模式2（1T）：baud = FOSC/(32*(256-TH1))
+"""
+    if board == "ai8051u":
+        reload = 65536 - int((fosc / 4.0 + baud / 2.0) / baud)
+        return head + f"""\
+    ; UART1 -> P3.0(RxD)/P3.1(TxD)，Timer2 1T 作波特率（同 zig_t0print 的实机配置）
+    mov 0xB1,#0x00          ; P3M1：P3.1 不设高阻
+    mov 0xB2,#0x02          ; P3M0：P3.1 推挽输出（RxD 保持准双向）
+    anl 0xA2,#0x3F          ; P_SW1.S1_S = 00 -> P3.0/P3.1
+    mov 0x98,#0x50          ; SCON：模式1
+    orl 0x8E,#0x01          ; AUXR.S1BRT：串口1 选 Timer2
+    orl 0x8E,#0x04          ; AUXR.T2x12：Timer2 1T
+    mov 0xD6,#0x{(reload >> 8) & 0xFF:02X}   ; T2H
+    mov 0xD7,#0x{reload & 0xFF:02X}          ; T2L
+    orl 0x8E,#0x10          ; AUXR.T2R：启动 Timer2
+"""
+    th1 = (256 - int(round(fosc / (32.0 * baud)))) & 0xFF
+    return head + f"""\
+    ; STC8H：UART1 -> P3.6(RxD)/P3.7(TxD)，Timer1 模式2（1T）
     mov 0xA2,#0x40
     mov 0xB1,#0x00
     mov 0xB2,#0x80
     mov 0x89,#0x20
     mov 0x8E,#0x40
-    mov 0x8D,#{th1}
-    mov 0x8B,#{th1}
+    mov 0x8D,#0x{th1:02X}
+    mov 0x8B,#0x{th1:02X}
     mov 0x88,#0x40
     mov 0x98,#0x40
 """
@@ -139,12 +163,13 @@ def case_asm(name: str, spec: dict, slot: int) -> str:
     return "".join(out)
 
 
-def build_group(cases: list[str], idx: int, th1: int, wait_ti: bool = True) -> tuple[Path, Path]:
+def build_group(cases: list[str], idx: int, board: str, fosc: float, baud: int,
+                wait_ti: bool = True) -> tuple[Path, Path]:
     """一组（同一 src 文件）→ (ihx, 合并后的 asm)。"""
     src = mcs2.CASES[cases[0]]["src"]
     suffix = "" if wait_ti else "_sim"
     _, body = mcs2.emit_asm(HERE / "tests" / src, f"real_g{idx}{suffix}")
-    harness = HARNESS_HEAD.format(th1=f"0x{th1:02X}")
+    harness = harness_head(board, fosc, baud)
     for i, c in enumerate(cases):
         harness += case_asm(c, mcs2.CASES[c], 0x8000 + i * 4)
     harness += harness_lib(wait_ti) + "_fin:\n    sjmp .\n"
@@ -159,8 +184,10 @@ def main() -> int:
     ap.add_argument("--sim", action="store_true", help="构建并 ucsim 自检")
     ap.add_argument("--build", action="store_true", help="只出 .ihx 到 build/fw/")
     ap.add_argument("--read", metavar="PORT", help="读串口逐项比对（例 COM8）")
-    ap.add_argument("--baud", type=int, default=9600)
-    ap.add_argument("--fosc", type=float, default=45158400.0)
+    ap.add_argument("--board", choices=("ai8051u", "stc8h"), default="ai8051u",
+                    help="ai8051u：UART1 → P3.0/P3.1 + Timer2（默认）；stc8h：P3.6/P3.7 + Timer1")
+    ap.add_argument("--baud", type=int, default=115200)
+    ap.add_argument("--fosc", type=float, default=40000000.0)
     ap.add_argument("--cases", nargs="*", default=None)
     ap.add_argument("--group", type=int, default=None, help="只跑某一组（序号）")
     args = ap.parse_args()
@@ -168,9 +195,16 @@ def main() -> int:
         ap.print_help()
         return 2
 
-    th1 = (256 - int(round(args.fosc / (32.0 * args.baud)))) & 0xFF
-    if th1 == 0:
-        raise SystemExit(f"TH1 越界：检查 --fosc/--baud（当前 {args.fosc:.0f}/{args.baud}）")
+    if args.board == "ai8051u":
+        reload = 65536 - int((args.fosc / 4.0 + args.baud / 2.0) / args.baud)
+        if not 1 <= reload <= 0xFFFF:
+            raise SystemExit(f"Timer2 重载越界（{reload}）：检查 --fosc/--baud")
+        baud_note = f"T2H:T2L=0x{reload:04X}"
+    else:
+        th1 = (256 - int(round(args.fosc / (32.0 * args.baud)))) & 0xFF
+        if th1 == 0:
+            raise SystemExit(f"TH1 越界：检查 --fosc/--baud（当前 {args.fosc:.0f}/{args.baud}）")
+        baud_note = f"TH1=0x{th1:02X}"
     cases = args.cases or REAL_CASES
 
     by_src: dict[str, list[str]] = {}
@@ -182,21 +216,21 @@ def main() -> int:
             order.append(src)
         by_src[src].append(c)
 
-    print(f"== {len(cases)} 项 / {len(order)} 组（每组一个源文件；TH1=0x{th1:02X}），"
-          f"{args.fosc / 1e6:.3f} MHz @ {args.baud}")
+    print(f"== {len(cases)} 项 / {len(order)} 组（每组一个源文件），"
+          f"{args.board} {args.fosc / 1e6:.3f} MHz @ {args.baud}（{baud_note}）")
     if args.group is not None:
         order = [order[args.group]]
 
     ok_all = True
     for gi, src in enumerate(order):
         g = by_src[src]
-        ihx, merged = build_group(g, gi, th1, wait_ti=not args.sim)
+        ihx, merged = build_group(g, gi, args.board, args.fosc, args.baud, wait_ti=not args.sim)
         asm_text = merged.read_text(encoding="utf-8", errors="replace")
         nds = len(re.findall(r"^(_mcs_v\d+|_\w+_PARM_\d+): \.ds 1$", asm_text, re.M))
         print(f"  组{gi} {src}: {', '.join(g)}  ({nds} B DSEG)")
         if args.build or args.read:
             FW_DIR.mkdir(parents=True, exist_ok=True)
-            dst = FW_DIR / f"real_g{gi}_{src.split('.')[0]}.ihx"
+            dst = FW_DIR / f"real_g{gi}_{src.split('.')[0]}_{args.board}_{args.baud}.ihx"
             dst.write_bytes(ihx.read_bytes())
             print(f"    → {dst}")
         if args.sim:
