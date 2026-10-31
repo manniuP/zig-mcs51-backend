@@ -30,6 +30,8 @@ pub const Byte = union(enum) {
     vreg: u8,
     dir: u8,
     sym: []const u8,
+    /// 立即数（P1.5：常量不再先物化到 vreg，直接当操作数）。
+    imm: u8,
 };
 
 /// 虚拟寄存器位置的简写。

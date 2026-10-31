@@ -125,9 +125,8 @@ const Lower = struct {
                 .int => |int| switch (int.storage) {
                     .u64 => |v| {
                         if (v > 0xFF) return self.fail("M1 常量仅支持 u8", .{});
-                        const dst = try self.allocVreg();
-                        try self.ops.append(self.gpa, .{ .imm = .{ .dst = mcsmir.v(dst), .value = @intCast(v) } });
-                        return mcsmir.v(dst);
+                        // P1.5：常量直接当立即数操作数，不再物化到 vreg。
+                        return .{ .imm = @intCast(v) };
                     },
                     else => return self.fail("M1 常量仅支持 u8 立即数", .{}),
                 },
@@ -311,8 +310,20 @@ const Lower = struct {
 
             const lhs_r = vregOf(cb.lhs);
             const rhs_r = vregOf(cb.rhs);
+            const lhs_zero = switch (cb.lhs) {
+                .imm => |v| v == 0,
+                else => false,
+            };
+            const rhs_zero = switch (cb.rhs) {
+                .imm => |v| v == 0,
+                else => false,
+            };
             var counter: ?u8 = null;
-            if (lhs_r != null and self.isZeroAt(lhs_r.?, tp)) {
+            if (rhs_zero) {
+                if (lhs_r) |r| counter = r;
+            } else if (lhs_zero) {
+                if (rhs_r) |r| counter = r;
+            } else if (lhs_r != null and self.isZeroAt(lhs_r.?, tp)) {
                 if (rhs_r) |r| counter = r;
             } else if (rhs_r != null and self.isZeroAt(rhs_r.?, tp)) {
                 if (lhs_r) |r| counter = r;
@@ -356,7 +367,7 @@ const Lower = struct {
                 const op = ops[k2];
                 const is_sub = switch (op) {
                     .sub => |x| vregOf(x.dst) == @as(?u8, c) and vregOf(x.lhs) == @as(?u8, c) and switch (x.rhs) {
-                        .vreg => true,
+                        .vreg, .imm => true,
                         else => false,
                     },
                     else => false,
@@ -367,21 +378,32 @@ const Lower = struct {
                         break;
                     }
                     const x = op.sub;
-                    const rk = vregOf(x.rhs).?;
-                    if (k2 == 0) {
-                        bad = true;
-                        break;
-                    }
-                    const is_one = switch (ops[k2 - 1]) {
-                        .imm => |y| vregOf(y.dst) == @as(?u8, rk) and y.value == 1,
+                    // 形态 1：rhs 是立即数 1（P1.5 之后）
+                    var one_ok = switch (x.rhs) {
+                        .imm => |v| v == 1,
                         else => false,
                     };
-                    if (!is_one) {
+                    var prev_imm: ?usize = null;
+                    if (!one_ok) {
+                        // 形态 2：rhs 是装了 1 的 vreg，其定义紧挨着
+                        if (vregOf(x.rhs)) |rk| {
+                            if (k2 > 0) {
+                                switch (ops[k2 - 1]) {
+                                    .imm => |y| if (vregOf(y.dst) == @as(?u8, rk) and y.value == 1) {
+                                        one_ok = true;
+                                        prev_imm = k2 - 1;
+                                    },
+                                    else => {},
+                                }
+                            }
+                        }
+                    }
+                    if (!one_ok) {
                         bad = true;
                         break;
                     }
                     sub_pos = k2;
-                    imm_pos = k2 - 1;
+                    imm_pos = prev_imm;
                     continue;
                 }
                 if (refsVreg(op, c)) {
@@ -392,7 +414,7 @@ const Lower = struct {
             if (bad or sub_pos == null) continue;
 
             const sp = sub_pos.?;
-            const ip = imm_pos.?;
+            const ip = imm_pos; // .imm 形态没有独立 imm 指令
 
             // 组装新序列
             const body_lbl = self.tempLabel();
@@ -401,7 +423,10 @@ const Lower = struct {
             try out.appendSlice(self.gpa, ops[0 .. tp + 1]);
             try out.append(self.gpa, .{ .label = body_lbl });
             for (ops[tp + 1 .. bp], tp + 1..) |op, k| {
-                if (k == sp or k == ip) continue;
+                if (k == sp) continue;
+                if (ip) |ii| {
+                    if (k == ii) continue;
+                }
                 try out.append(self.gpa, op);
             }
             try out.append(self.gpa, .{ .dec_br_nz = .{ .dst = .{ .vreg = c }, .target = body_lbl } });
@@ -425,6 +450,7 @@ const Lower = struct {
             .vreg => |r| regs[r],
             .dir => |d| dirs[d],
             .sym => null,
+            .imm => |v| v,
         };
     }
 
@@ -433,6 +459,7 @@ const Lower = struct {
             .vreg => |r| regs[r] = val,
             .dir => |d| dirs[d] = val,
             .sym => return false,
+            .imm => return false,
         }
         return true;
     }

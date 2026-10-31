@@ -35,6 +35,7 @@ fn byteText(gpa: std.mem.Allocator, b: Byte) ![]const u8 {
         .vreg => |n| std.fmt.allocPrint(gpa, "_mcs_v{d}", .{n}),
         .dir => |a| std.fmt.allocPrint(gpa, "0x{X:0>2}", .{a}),
         .sym => |s| s,
+        .imm => |v| std.fmt.allocPrint(gpa, "#0x{X:0>2}", .{v}),
     };
 }
 
@@ -275,7 +276,14 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     },
                     .eq, .ne => {
                         try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{l}), .jump = null } });
-                        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    xrl a,{s}", .{r}), .jump = null } });
+                        // 与 0 比较：A 本身就是要测的值，xrl 可省（xrl a,#0 不改 A）。
+                        const cmp_zero = switch (x.rhs) {
+                            .imm => |v| v == 0,
+                            else => false,
+                        };
+                        if (!cmp_zero) {
+                            try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    xrl a,{s}", .{r}), .jump = null } });
+                        }
                         try items.append(gpa, .{ .line = .{ .text = if (x.cc == .eq) "jz" else "jnz", .jump = x.target } });
                     },
                 }
