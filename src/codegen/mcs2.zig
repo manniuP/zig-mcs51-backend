@@ -967,7 +967,7 @@ const Lower = struct {
             .br_ifz => |x| .{ .br_ifz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
             .cmp_br => |x| .{ .cmp_br = .{ .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map), .cc = x.cc, .target = x.target } },
             .dec_br_nz => |x| .{ .dec_br_nz = .{ .dst = mapByteVreg(x.dst, map), .target = x.target } },
-            .br_c => op,
+            .br_c, .lcall => op,
             .push => |x| .{ .push = .{ .src = mapByteVreg(x.src, map) } },
             .pop => |x| .{ .pop = .{ .dst = mapByteVreg(x.dst, map) } },
             .dec => op, // 载荷是裸 vreg 下标；对应 vreg 已被禁用映射
@@ -2279,6 +2279,103 @@ const Lower = struct {
                 if (inner and !self.labelReferenced(end_l)) return true;
                 try self.ops.append(self.gpa, .{ .label = end_l });
             },
+            // ---- M2.5：内部调用 ----
+            // 内部 ABI 与边界 ABI 完全一致（arg0 → DPL/DPH/B/A，其余 → 被调方 PARM 区，
+            // 返回值同），所以 Zig↔Zig 与 Zig↔C 共用一条约定，不需要 thunk。
+            // 又因为所有值都在 DSEG 静态槽，调用前**不用保存寄存器现场**，只处理两件事：
+            //   ① B 若是本函数的 arg2（0xF0）会被被调方踩掉 → 存一份；
+            //   ② 调用会踩 DPL/DPH → 之后用 dptr 的地方由 lower() 自己重建。
+            .call, .call_always_tail, .call_never_tail, .call_never_inline => {
+                const ci = self.air.unwrapCall(inst);
+                const ip = &self.zcu.intern_pool;
+                const callee_ip = ci.callee.toInterned() orelse
+                    return self.fail("间接调用（函数指针）尚未支持", .{});
+                const key = ip.indexToKey(callee_ip);
+                var sym: []const u8 = undefined;
+                var short: []const u8 = undefined;
+                switch (key) {
+                    .func => {
+                        const fi_info = self.zcu.funcInfo(callee_ip);
+                        const nav = fi_info.owner_nav;
+                        sym = try mangleNavSymbol(self.gpa, ip, nav);
+                        short = try self.gpa.dupe(u8, ip.getNav(nav).name.toSlice(ip));
+                    },
+                    .@"extern" => |ex| {
+                        // C 函数：SDCC 的符号就是 _名字
+                        const nm = ex.name.toSlice(ip);
+                        sym = try std.fmt.allocPrint(self.gpa, "_{s}", .{nm});
+                        short = try self.gpa.dupe(u8, nm);
+                    },
+                    else => return self.fail("调用目标不是函数（{s}）", .{@tagName(key)}),
+                }
+                const callee_ty = self.air.typeOf(ci.callee, ip);
+                const ret2 = callee_ty.fnReturnType(self.zcu);
+                const ret_n: u8 = if (ret2.zigTypeTag(self.zcu) == .void)
+                    0
+                else
+                    try self.storageBytes(ret2, "调用返回值");
+
+                var saved_b: ?u8 = null;
+                if (self.b_is_arg) {
+                    saved_b = try self.allocVreg();
+                    try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(saved_b.?), .src = .{ .dir = 0xF0 } } });
+                }
+                // ① 先把**所有实参快照进 vreg 槽**：实参此刻可能就住在 DPL/DPH/B/A 里
+                //   （本函数自己的参数，或被拷贝折叠映射过去），
+                //   若边摆边取，摆 arg0 就会把还没搬走的 arg1..N 踩掉（实测 chain32 就是这样错的）。
+                const nargs = ci.args.len;
+                const bases = try self.gpa.alloc(u8, nargs);
+                defer self.gpa.free(bases);
+                const widths = try self.gpa.alloc(u8, nargs);
+                defer self.gpa.free(widths);
+                for (ci.args, 0..) |arg_ref, ai| {
+                    const aty = self.air.typeOf(arg_ref, ip);
+                    const an = try self.storageBytes(aty, "调用参数");
+                    if (an > 4) return self.fail("参数超过 4 字节（多字节结构体）尚未支持", .{});
+                    widths[ai] = an;
+                    bases[ai] = try self.wideOperand(arg_ref, an);
+                }
+                // ② 再统一摆到 ABI 位置：arg0 进 ABI 寄存器，其余进 _被调短名_PARM_2 起的连续字节
+                var spill: usize = 2;
+                for (ci.args, 0..) |_, ai| {
+                    const an = widths[ai];
+                    const base = bases[ai];
+                    var k: u8 = 0;
+                    while (k < an) : (k += 1) {
+                        const dst: mcsmir.Byte = if (ai == 0)
+                            .{ .dir = mcsmir.abi.arg_regs[k] }
+                        else
+                            .{ .sym = try std.fmt.allocPrint(
+                                self.gpa,
+                                "_{s}_PARM_{d}",
+                                .{ short, spill + k },
+                            ) };
+                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = dst, .src = mcsmir.v(base + k) } });
+                    }
+                    if (ai > 0) spill += an;
+                }
+                try self.ops.append(self.gpa, .{ .lcall = .{ .sym = sym } });
+                // 取返回值：DPL/DPH/B/A（低字节序）→ 新槽。
+                // **必须从高字节往低读**：读 ACC 用的是 `mov a,0xE0`，而 ACC 就是 A 本身，
+                // 先读 DPL/DPH/B 会把它踩掉（实测 ACC 返回 0x34 —— 其实是 B 的值）。
+                if (ret_n > 0) {
+                    const dbase = try self.allocWide(ret_n);
+                    var kk: u8 = ret_n;
+                    while (kk > 0) {
+                        kk -= 1;
+                        try self.ops.append(self.gpa, .{ .load_dir = .{
+                            .dst = mcsmir.v(dbase + kk),
+                            .addr = mcsmir.abi.arg_regs[kk],
+                        } });
+                    }
+                    self.vals[@backingInt(inst)] = mcsmir.v(dbase);
+                    if (ret_n > 1) self.wide[@backingInt(inst)] = @as(u16, dbase) | (@as(u16, ret_n) << 8);
+                }
+                if (saved_b) |sv| {
+                    try self.ops.append(self.gpa, .{ .mov = .{ .dst = .{ .dir = 0xF0 }, .src = mcsmir.v(sv) } });
+                }
+            },
+
             .cmp_lt, .cmp_lt_optimized, .cmp_lte, .cmp_lte_optimized,
             .cmp_gt, .cmp_gt_optimized, .cmp_gte, .cmp_gte_optimized,
             .cmp_eq, .cmp_eq_optimized, .cmp_neq, .cmp_neq_optimized => {

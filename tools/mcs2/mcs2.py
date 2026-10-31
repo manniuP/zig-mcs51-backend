@@ -388,6 +388,13 @@ CASES: dict[str, dict] = {
                    want=0),
     "ge8t":   dict(kind="call", src="cmpval.zig", fn="ge8", args=[("DPL", 5), ("PARM2", 5)], want=1),
     "ge8f":   dict(kind="call", src="cmpval.zig", fn="ge8", args=[("DPL", 4), ("PARM2", 5)], want=0),
+    # M2.5 内部调用（call）：二参数 / u16 参数 / 4 字节 arg0 + PARM 溢出
+    "chain":   dict(kind="call", src="calls.zig", fn="chain", args=[("DPL", 3)], want16=0x0018),
+    "chain32": dict(kind="call", src="calls.zig", fn="chain32", args=[("DPL", 0x21)],
+                    want32=0x12345621),
+    "mix32":   dict(kind="call", src="calls.zig", fn="wide_mix",
+                    args=[("DPL", 0x00), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12), ("PARM2", 0x21)],
+                    want32=0x12345621),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -403,6 +410,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "u16div", "u16rem", "u32div", "u32rem", "i32div", "i32rem", "i8div", "i8rem", "i16div",
          "shlv", "shrv", "shrv0", "sarv",
          "lt32", "lt32b", "ge8t", "ge8f",
+         "chain", "chain32", "mix32",
          "ringdemo"]
 
 

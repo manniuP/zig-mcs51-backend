@@ -175,6 +175,10 @@ pub const Op = union(enum) {
     /// 位测试跳转（8051 `jb`/`jnb`）：`bit` 是位地址（SFR 区按 (A-0x80)*8+n 算）。
     /// on_set=true → 置位时跳（jb）；false → 清零时跳（jnb）。
     bit_br: struct { bit: u8, target: u32, on_set: bool },
+    /// 长调用（lcall）。内部 ABI 与 SDCC 边界 ABI 相同：
+    /// arg0 → DPL/DPH/B/A（≤4 字节），其余 → 被调方 _短名_PARM_2+ 静态区；
+    /// 返回值同样走 DPL/DPH/B/A。因为所有值都住在 DSEG 静态槽，调用不需要保存现场。
+    lcall: struct { sym: []const u8 },
     /// 函数返回（51: `ret`；返回值由调用方先放好，见 `abi`）。
     ret,
     /// 停机；当前切片不建立调用栈。

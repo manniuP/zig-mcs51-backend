@@ -6,6 +6,13 @@
 //! 符号约定：export fn 生成 _<文件名>_<函数名> + 别名 <函数名>，
 //! C 侧按 <函数名> 直接声明即可（与 SDCC 的 _ 前缀一致）。
 
+/// **Zig 调 C**（M2.5 之后才可能）：C 侧提供实现，Zig 只声明。
+extern fn c_scale(x: u8) u8;
+
+export fn zig_calls_c(x: u8) u8 {
+    return c_scale(x) +% 1;
+}
+
 /// 单字节：模拟 CDC 回调里的一步混音（被 C 直接调用）。
 export fn zig_cdc_mix(x: u8) u8 {
     var v: u8 = x ^ 0x5A;

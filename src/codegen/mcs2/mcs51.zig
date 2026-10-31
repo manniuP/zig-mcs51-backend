@@ -171,7 +171,8 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .pop => |x| if (touchesDplDph(x.dst)) null else prev,
         .dec => prev,
         .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .ret, .reti, .halt,
-        .sex, .cmp_wide_br, .mul16, .br_c => null,
+        // lcall 会踩 DPL/DPH（被调方的 arg0 就在那儿）→ 之后的 xdata 访问必须重建 DPTR。
+        .sex, .cmp_wide_br, .mul16, .br_c, .lcall => null,
     };
 }
 
@@ -297,7 +298,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
-            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c => op,
+            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c, .lcall => op,
         };
         // 这次 xdata 访问想要的 DPTR 内容；与当前一致就不重建。
         const want_dptr: ?DptrState = switch (m_op) {
@@ -776,6 +777,11 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                     .{d},
                 ), .jump = x.target } });
             },
+            .lcall => |x| try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                gpa,
+                "    lcall {s}",
+                .{x.sym},
+            ), .jump = null } }),
             .ret => try items.append(gpa, .{ .line = .{ .text = "    ret", .jump = null } }),
             .halt => {
                 // `sjmp .`：跳转到自身死循环。目标不是局部标签（jump=null），
