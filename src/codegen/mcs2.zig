@@ -1461,12 +1461,16 @@ const Lower = struct {
             }
         }
 
-        // 分配：按 op 顺序推进，槽位在组死亡后释放
+        // 分配：按 op 顺序推进，槽位在组死亡后释放。
+        // **从 8 号槽开始**：0x00–0x07 是 bank0 工作寄存器，`byteText` 会把 `.dir a<8`
+        // 渲染成 `rN`（为了 1 字节编码）；复用出来的槽号如果落进 0–7，就会发出
+        // `mov r2,r0` 这种 8051 不存在的指令（sdas: Invalid Addressing Mode）。
         var new_of_group: [256]u8 = @splat(0);
         var slot_free: [256]bool = @splat(true);
         var slot_die: [256]usize = @splat(0);
-        var hi: usize = 0;
-        var pin_hi: usize = 0;
+        var hi: usize = 8;
+        var pin_hi: usize = 8;
+        for (0..8) |r0| slot_free[r0] = false;
         i_loop: {
             var i: usize = 0;
             while (i < n_ops) : (i += 1) {
@@ -1492,7 +1496,7 @@ const Lower = struct {
                         pin_hi += len;
                         if (pin_hi > hi) hi = pin_hi;
                     } else {
-                        var base: usize = 0;
+                        var base: usize = 8;
                         var found = false;
                         while (base + len <= hi) : (base += 1) {
                             var ok = true;
@@ -1534,6 +1538,14 @@ const Lower = struct {
             map[v] = new_of_group[gg] + @as(u8, @intCast(v - group_base[gg]));
         }
         for (self.ops.items) |*op| op.* = mapOpVregs(op.*, &map);
+        // `.dec` 的载荷是**裸 vreg 编号**（mapOpVregs 故意不动它），这里单独补一次；
+        // 漏了它就会拿旧编号发 `dec _mcs_v<旧号>`，编号越界 → 汇编报错。
+        for (self.ops.items) |*op| switch (op.*) {
+            .dec => |r| {
+                if (map[r]) |nw| op.* = .{ .dec = nw };
+            },
+            else => {},
+        };
         // 重建 wide_blk（按新编号）
         self.wide_blk = @splat(false);
         g = 0;
@@ -1562,6 +1574,7 @@ const Lower = struct {
         }
         for (self.ops.items) |op| switch (op) {
             .dec => |r| banned[r] = true,
+
             else => if (isSelfUpdate(op)) |v| {
                 score[v] +|= 1;
             },
@@ -1592,9 +1605,27 @@ const Lower = struct {
         }
         if (np == 0) return;
 
+        // 8051 **没有 `mov rN,rM`**：如果某个 mov 的两个操作数都被选进寄存器，
+        // 就丢掉源那一个（reg→dir / dir→reg 都是合法指令，只有 reg→reg 不行）。
+        var in_map: [256]bool = @splat(false);
+        for (picked[0..np]) |v| in_map[v] = true;
+        for (self.ops.items) |op| switch (op) {
+            .mov => |x| {
+                if (x.dst == .vreg and x.src == .vreg) {
+                    if (in_map[x.dst.vreg] and in_map[x.src.vreg]) in_map[x.src.vreg] = false;
+                }
+            },
+            else => {},
+        };
+
         var map: [256]?u8 = undefined;
         @memset(&map, null);
-        for (picked[0..np], 0..) |v, i| map[v] = regs[i];
+        var slot: usize = 0;
+        for (picked[0..np]) |v| {
+            if (!in_map[v]) continue;
+            map[v] = regs[slot];
+            slot += 1;
+        }
         for (self.ops.items) |*op| op.* = mapOpVregs(op.*, &map);
     }
 
@@ -1641,6 +1672,7 @@ const Lower = struct {
             .store_xdata_idx_sym => |x| isVregByte(x.idx, r) or isVregByte(x.src, r),
             .store_xdata_sym => |x| isVregByte(x.src, r),
             .load_code_idx_sym => |x| isVregByte(x.idx, r),
+            .dec => |v| v == r, // RMW：既读又写
             else => false,
         };
     }
@@ -3385,10 +3417,14 @@ pub fn generate(
     }
 
     // M2.13：寄存器分配（PE 折叠成功时不必——常量写回没有热点值）。
-    // M2.14 切片 1（基本块内槽位复用）已写好（`reuseSlots`），但还有两处没对齐，先关掉：
-    //   ① `.dec` 的载荷是**裸 vreg 编号**，`mapOpVregs` 故意不映射它 → 改名后语义错；
-    //   ② 改名后 sdas8051 报无效指令（未定位到具体哪条）。
-    //   临时槽回收（`flushTempsKeep`，指令内临时操作数）是安全的那部分，已保留。
+    // M2.14 切片 1（基本块内槽位复用）**还没打通**，先关掉。已修掉的两个坑：
+    //   ① 复用槽号落进 0–7 会被 `byteText` 渲染成 `rN` → 发出不存在的 `mov rN,rM`
+    //      （现在复用槽从 8 号开始）；
+    //   ② `.dec` 的载荷是裸 vreg 编号，`mapOpVregs` 不映射它 → 改名后编号越界
+    //      （现在单独补一次映射）。
+    // 但 `cat45` 仍然算错（值被提前复用），说明还有别的寿命/别名漏洞没堵——
+    // 要专门一轮把 liveness 做扎实（含 .dec/.dec_br_nz/wide 块/调用点的边界）再开。
+    // 指令内临时槽回收（`flushTempsKeep`）是安全的那部分，已保留。
     // lw.reuseSlots();
     lw.assignRegisters();
 
