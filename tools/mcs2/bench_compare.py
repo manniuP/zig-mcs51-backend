@@ -92,6 +92,46 @@ ARITH = [
 ]
 
 
+# 这一批是「真程序形状」的对照：switch / 条件表达式 / const 查表 / 间接调用 / CORDIC。
+# (标签, mcs2 的 .lst, mcs2 标签, SDCC 的 C, Keil 的 C（缺省同 SDCC）)
+NEW = [
+    ("switch", "sw1h.lst", "switchex_sw1",
+     "unsigned char f(unsigned char c) { unsigned char r = 0xEE;"
+      " switch (c) { case 1: r = 0x11; break; case 2: r = 0x22; break; case 3: r = 0x33; break; }"
+      " return r; }", None),
+    ("ifexpr", "ifr1.lst", "ifexpr_ifr",
+     "unsigned char f(unsigned char c) { return c ? 0x11 : 0x22; }", None),
+    ("consttab", "cgeti.lst", "consttab_cgeti",
+     "unsigned char f(unsigned char i) { static const unsigned char t[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88}; return t[i]; }",
+     "unsigned char f(unsigned char i) { static const unsigned char code t[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88}; return t[i]; }"),
+    ("indcall", "call_ind.lst", "indcall_call_ind",
+     "unsigned char f(unsigned char (*p)(unsigned char), unsigned char x) { return p(x); }", None),
+    ("cordic_sin", "csin90.lst", "cordic_sin",
+     "int f(int a) {"
+      " static const int at[12] = {8192,4836,2555,1297,651,326,163,81,41,20,10,5};"
+      " int z = a, x = 9949, y = 0, i, q = 0;"
+      " if (z > 0x4000) { z -= 0x4000; q = 1; } else if (z < -0x4000) { z += 0x4000; q = 2; }"
+      " for (i = 0; i < 12; i++) { int xr = x >> i, yr = y >> i;"
+      "   if (z >= 0) { x -= yr; y += xr; z -= at[i]; } else { x += yr; y -= xr; z += at[i]; } }"
+      " if (q == 1) return x; if (q == 2) return -x; return y; }",
+     "int f(int a) {"
+      " static const int code at[12] = {8192,4836,2555,1297,651,326,163,81,41,20,10,5};"
+      " int z = a, x = 9949, y = 0, i, q = 0;"
+      " if (z > 0x4000) { z -= 0x4000; q = 1; } else if (z < -0x4000) { z += 0x4000; q = 2; }"
+      " for (i = 0; i < 12; i++) { int xr = x >> i, yr = y >> i;"
+      "   if (z >= 0) { x -= yr; y += xr; z -= at[i]; } else { x += yr; y -= xr; z += at[i]; } }"
+      " if (q == 1) return x; if (q == 2) return -x; return y; }"),
+]
+
+
+def mcs2_dseg(tag: str) -> int | None:
+    """mcs2 这一函数的静态 DSEG 字节数（每函数一块槽，含 PARM 区）。"""
+    asm = BUILD / f"{tag}.asm"
+    if not asm.exists():
+        return None
+    txt = asm.read_text(encoding="utf-8", errors="replace")
+    return len(re.findall(r"^(_mcs_v\d+|_\w+_PARM_\d+): \.ds 1$", txt, re.M))
+
 def sdcc_bin() -> Path:
     return toolchain_dir()
 
@@ -118,7 +158,9 @@ def _sdcc_size(c_path: Path, fn: str, tag: str) -> int | None:
     return size_any(asm.with_suffix(".lst"), fn)
 
 
-def _keil_size(src_text: str, tag: str) -> int | None:
+def _keil_sizes(src_text: str, tag: str) -> tuple[int | None, int | None]:
+    """(CODE SIZE, DATA SIZE)。DATA 是静态分配（Keil 把局部量放寄存器/覆盖区，所以常是 0）；
+    正好用来对照 mcs2 的「每函数一块静态 DSEG」。"""
     keil_bin = os.environ.get("KEIL_BIN", "")
     c51 = Path(keil_bin) / "C51.EXE" if keil_bin else None
     if not c51 or not c51.exists():
@@ -132,9 +174,11 @@ def _keil_size(src_text: str, tag: str) -> int | None:
                        encoding="utf-8", errors="replace")
     if r.returncode != 0 or not lst.exists():
         print(r.stdout[-400:], r.stderr[-200:])
-        return None
-    m = re.search(r"CODE SIZE\s*=\s*(\d+)", lst.read_text(errors="replace"))
-    return int(m.group(1)) if m else None
+        return (None, None)
+    txt = lst.read_text(errors="replace")
+    code = re.search(r"CODE SIZE\s*=\s*(\d+)", txt)
+    data = re.search(r"DATA SIZE\s*=\s*(\d+)", txt)
+    return (int(code.group(1)) if code else None, int(data.group(1)) if data else 0)
 
 
 def _row(tag: str, ours: int | None, sd: int | None, kl: int | None, note: str) -> str:
@@ -158,7 +202,7 @@ def main() -> int:
     for tag, lst_name, label, c_file, c_fn in LEGACY:
         ours = fn_size(BUILD / lst_name, label)
         sd = _sdcc_size(CB / c_file, c_fn, tag)
-        kl = _keil_size((CB / c_file).read_text(encoding="utf-8"), tag) if have_keil else None
+        kl = _keil_sizes((CB / c_file).read_text(encoding="utf-8"), tag)[0] if have_keil else None
         note = "PE 折叠（循环消失）" if tag == "sum_to_fold" else ""
         print(_row(tag, ours, sd, kl, note))
     print("-" * 76)
@@ -167,11 +211,27 @@ def main() -> int:
         c_path = BUILD / f"{tag}_c.c"
         c_path.write_text(c_one + "\n", encoding="ascii")
         sd = _sdcc_size(c_path, "f", tag)
-        kl = _keil_size(c_one, tag) if have_keil else None
+        kl = _keil_sizes(c_one, tag)[0] if have_keil else None
         note = ""
         if tag in ("u16mul", "u16div", "u32mul", "u32div", "u32rem", "i32div"):
             note = "SDCC/Keil 走库函数，mcs2 内联"
         print(_row(tag, ours, sd, kl, note))
+    print("-" * 76)
+    print("真程序形状（switch / 条件表达式 / const 查表 / 间接调用 / CORDIC）")
+    print(f"{'用例':<12}{'mcs2':>8}{'SDCC 4.6':>9}{'Keil C51':>9}{'mcs2 DSEG':>11}{'Keil DATA':>11}")
+    print("-" * 76)
+    for tag, lst_name, label, c_sdcc, c_keil in NEW:
+        ours = fn_size(BUILD / lst_name, label)
+        c_path = BUILD / f"new_{tag}_c.c"
+        c_path.write_text(c_sdcc + "\n", encoding="ascii")
+        sd = _sdcc_size(c_path, "f", f"new_{tag}")
+        kl = None
+        kd = None
+        if have_keil:
+            kl, kd = _keil_sizes(c_keil or c_sdcc, f"new_{tag}")
+        dseg = mcs2_dseg(lst_name.replace(".lst", ""))
+        fmt = lambda v: f"{v} B" if v is not None else "—"
+        print(f"{tag:<12}{fmt(ours):>8}{fmt(sd):>9}{fmt(kl):>9}{fmt(dseg):>11}{fmt(kd):>11}")
     if not have_keil:
         print("\n（Keil 列未采集：设置 KEIL_BIN=<Keil\\C51\\BIN> 后重跑）")
     return 0
