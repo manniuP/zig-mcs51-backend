@@ -62,6 +62,10 @@ fn isRegText(s: []const u8) bool {
 const DptrState = union(enum) {
     fixed: u16,
     idx: struct { base: u16, idx: Byte, scale: u8 = 1 },
+    /// `mov dptr,#_sym` 之后再叠加了常量偏移
+    sym: struct { sym: []const u8, off: u16 = 0 },
+    /// 符号基址 + 运行期下标（`mov dptr,#_sym` 后叠 idx*scale）
+    idx_sym: struct { sym: []const u8, off: u16 = 0, idx: Byte, scale: u8 = 1 },
 };
 
 fn sameByte(a: Byte, b: Byte) bool {
@@ -96,6 +100,14 @@ fn sameDptr(st: ?DptrState, want: DptrState) bool {
             .idx => |b| a.base == b.base and a.scale == b.scale and sameByte(a.idx, b.idx),
             else => false,
         },
+        .sym => |a| switch (want) {
+            .sym => |b| a.off == b.off and std.mem.eql(u8, a.sym, b.sym),
+            else => false,
+        },
+        .idx_sym => |a| switch (want) {
+            .idx_sym => |b| a.scale == b.scale and a.off == b.off and std.mem.eql(u8, a.sym, b.sym) and sameByte(a.idx, b.idx),
+            else => false,
+        },
     };
 }
 
@@ -123,6 +135,10 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
                 .vreg => |v| v,
                 else => null,
             },
+            .idx_sym => |i| switch (i.idx) {
+                .vreg => |v| v,
+                else => null,
+            },
             else => null,
         };
     };
@@ -138,6 +154,9 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
             .load_dir => |x| writesVreg(x.dst, v),
             .load_xdata => |x| writesVreg(x.dst, v),
             .load_xdata_idx => |x| writesVreg(x.dst, v),
+            .load_xdata_idx_sym => |x| writesVreg(x.dst, v),
+            .load_code_sym => |x| writesVreg(x.dst, v),
+            .load_code_idx_sym => |x| writesVreg(x.dst, v),
             .dec => |x| x == v,
             .dec_br_nz => |x| writesVreg(x.dst, v),
             else => false,
@@ -148,8 +167,15 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
     return switch (op) {
         .load_xdata => |x| .{ .fixed = x.addr },
         .store_xdata => |x| .{ .fixed = x.addr },
+        .lea_dptr_sym => |x| .{ .sym = .{ .sym = x.sym, .off = 0 } },
         .load_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
         .store_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
+        .load_xdata_idx_sym => |x| .{ .idx_sym = .{ .sym = x.sym, .off = x.off, .idx = x.idx, .scale = x.scale } },
+        .store_xdata_idx_sym => |x| .{ .idx_sym = .{ .sym = x.sym, .off = x.off, .idx = x.idx, .scale = x.scale } },
+        .load_xdata_sym => |x| .{ .sym = .{ .sym = x.sym, .off = x.off } },
+        .store_xdata_sym => |x| .{ .sym = .{ .sym = x.sym, .off = x.off } },
+        .load_code_sym => |x| .{ .sym = .{ .sym = x.sym, .off = x.off } },
+        .load_code_idx_sym => |x| .{ .idx_sym = .{ .sym = x.sym, .off = x.off, .idx = x.idx, .scale = x.scale } },
         .imm => |x| if (touchesDplDph(x.dst)) null else prev,
         .mov => |x| if (touchesDplDph(x.dst)) null else prev,
         .add => |x| if (touchesDplDph(x.dst)) null else prev,
@@ -268,10 +294,48 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 .dst = byteOf(x.dst, f.vreg_base),
                 .base = x.base,
                 .idx = byteOf(x.idx, f.vreg_base),
+                .scale = x.scale,
             } },
             .store_xdata_idx => |x| .{ .store_xdata_idx = .{
                 .base = x.base,
                 .idx = byteOf(x.idx, f.vreg_base),
+                .src = byteOf(x.src, f.vreg_base),
+                .scale = x.scale,
+            } },
+            .load_xdata_idx_sym => |x| .{ .load_xdata_idx_sym = .{
+                .dst = byteOf(x.dst, f.vreg_base),
+                .sym = x.sym,
+                .off = x.off,
+                .idx = byteOf(x.idx, f.vreg_base),
+                .scale = x.scale,
+            } },
+            .store_xdata_idx_sym => |x| .{ .store_xdata_idx_sym = .{
+                .sym = x.sym,
+                .off = x.off,
+                .idx = byteOf(x.idx, f.vreg_base),
+                .src = byteOf(x.src, f.vreg_base),
+                .scale = x.scale,
+            } },
+            .load_code_sym => |x| .{ .load_code_sym = .{
+                .dst = byteOf(x.dst, f.vreg_base),
+                .sym = x.sym,
+                .off = x.off,
+            } },
+            .load_code_idx_sym => |x| .{ .load_code_idx_sym = .{
+                .dst = byteOf(x.dst, f.vreg_base),
+                .sym = x.sym,
+                .off = x.off,
+                .idx = byteOf(x.idx, f.vreg_base),
+                .scale = x.scale,
+            } },
+            .load_xdata_sym => |x| .{ .load_xdata_sym = .{
+                .dst = byteOf(x.dst, f.vreg_base),
+                .sym = x.sym,
+                .off = x.off,
+            } },
+            .store_xdata_sym => |x| .{ .store_xdata_sym = .{
+                .sym = x.sym,
+                .off = x.off,
                 .src = byteOf(x.src, f.vreg_base),
             } },
             .and_ => |x| .{ .and_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
@@ -301,7 +365,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
-            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c, .lcall => op,
+            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c, .lcall, .lea_dptr_sym => op,
             .lcall_ind => |x| .{ .lcall_ind = .{
                 .target = f.vreg_base + x.target,
                 .save = byteOf(x.save, f.vreg_base),
@@ -313,6 +377,12 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata => |x| .{ .fixed = x.addr },
             .load_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
             .store_xdata_idx => |x| .{ .idx = .{ .base = x.base, .idx = x.idx, .scale = x.scale } },
+            .load_xdata_idx_sym => |x| .{ .idx_sym = .{ .sym = x.sym, .off = x.off, .idx = x.idx, .scale = x.scale } },
+            .store_xdata_idx_sym => |x| .{ .idx_sym = .{ .sym = x.sym, .off = x.off, .idx = x.idx, .scale = x.scale } },
+            .load_xdata_sym => |x| .{ .sym = .{ .sym = x.sym, .off = x.off } },
+            .store_xdata_sym => |x| .{ .sym = .{ .sym = x.sym, .off = x.off } },
+            .load_code_sym => |x| .{ .sym = .{ .sym = x.sym, .off = x.off } },
+            .load_code_idx_sym => |x| .{ .idx_sym = .{ .sym = x.sym, .off = x.off, .idx = x.idx, .scale = x.scale } },
             else => null,
         };
         const reuse_dptr = if (want_dptr) |w| sameDptr(dptr, w) else false;
@@ -567,6 +637,11 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 }
                 try items.append(gpa, .{ .line = .{ .text = "    movx @dptr,a", .jump = null } });
             },
+            .lea_dptr_sym => |x| try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                gpa,
+                "    mov dptr,#{s}",
+                .{x.sym},
+            ), .jump = null } }),
             .load_xdata_idx => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
@@ -583,6 +658,61 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
                     .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
+                });
+            },
+            // ---- 符号基址（全局/静态数组）：`mov dptr,#_sym` 再叠 idx*scale 或常量偏移 ----
+            .load_xdata_idx_sym => |x| {
+                const d = try byteText(gpa, x.dst);
+                const it = try byteText(gpa, x.idx);
+                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .store_xdata_idx_sym => |x| {
+                const s = try byteText(gpa, x.src);
+                const it = try byteText(gpa, x.idx);
+                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
+                    .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
+                });
+            },
+            .load_xdata_sym => |x| {
+                const d = try byteText(gpa, x.dst);
+                if (!reuse_dptr) try emitDptrSym(gpa, &items, x.sym, x.off);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .store_xdata_sym => |x| {
+                const s = try byteText(gpa, x.src);
+                if (!reuse_dptr) try emitDptrSym(gpa, &items, x.sym, x.off);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
+                    .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
+                });
+            },
+            // ---- 代码段常量表：`clr a` + `movc a,@a+dptr`（A 是 DPTR 的低字节偏移，这里置 0）----
+            .load_code_sym => |x| {
+                const d = try byteText(gpa, x.dst);
+                if (!reuse_dptr) try emitDptrSym(gpa, &items, x.sym, x.off);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = "    clr a", .jump = null } },
+                    .{ .line = .{ .text = "    movc a,@a+dptr", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .load_code_idx_sym => |x| {
+                const d = try byteText(gpa, x.dst);
+                const it = try byteText(gpa, x.idx);
+                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = "    clr a", .jump = null } },
+                    .{ .line = .{ .text = "    movc a,@a+dptr", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
                 });
             },
             .and_ => |x| {
@@ -916,12 +1046,19 @@ fn emitCmpWide(
     }
 }
 
-/// SFR 的位地址：只有 8 字节对齐的 SFR 可位寻址，位地址 = SFR 地址 + 位号。
+/// 可位寻址地址 → 位地址。8051 只有两片区域，**换算规则不同**：
+///   * SFR（≥0x80）：位地址 = 地址 + 位号（0x98.1 → 0x99）；
+///   * RAM 0x20–0x2F：位地址 = (地址 − 0x20) × 8 + 位号（0x20.1 → 0x01）。
+/// 两片都要求 8 字节对齐。以前只认 SFR，于是对 0x20–0x2F 做 `|= 单比特` 只能发
+/// orl dir,#imm，白丢 1 字节；而拿 SFR 公式套 RAM 会指到**别的字节**（0x21 = 0x24.1）——
+/// RAM 区是「位号连续、跨字节」编址的，不是 SFR 那种「地址+位号」。
 fn sfrBitAddr(addr: u8, mask: u8) ?u8 {
-    if (addr < 0x80 or (addr & 0x07) != 0) return null;
+    const bitable = (addr >= 0x80) or (addr >= 0x20 and addr < 0x30);
+    if (!bitable or (addr & 0x07) != 0) return null;
     if (mask == 0 or (mask & (mask - 1)) != 0) return null;
     const n: u8 = @intCast(@ctz(mask));
-    return addr + n;
+    if (addr >= 0x80) return addr + n;
+    return (addr - 0x20) * 8 + n;
 }
 
 /// dptr = base + idx（16 位常量基址 + 8 位运行期下标）。
@@ -979,6 +1116,56 @@ fn emitDptrIndex(
         try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
         try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
     }
+}
+
+/// dptr = _sym（符号 16 位绝对地址）+ off + idx*scale。
+/// 符号基址要 3 字节 `mov dptr,#_sym`；off 与每遍的 idx 各走一次 16 位加。
+fn emitDptrSymIndex(
+    gpa: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(Item),
+    sym: []const u8,
+    off: u16,
+    idx_text: []const u8,
+    scale: u8,
+) !void {
+    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov dptr,#{s}", .{sym}), .jump = null } });
+    if (off != 0) try emitDptrAdd(gpa, items, @truncate(off), @truncate(off >> 8));
+    var pass: u8 = 0;
+    while (pass < scale) : (pass += 1) {
+        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{idx_text}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    add a,dpl", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov dpl,a", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov a,dph", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
+    }
+}
+
+/// dptr += (hi:lo)（16 位立即数加，进位往 DPH 传）。
+fn emitDptrAdd(
+    gpa: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(Item),
+    lo: u8,
+    hi: u8,
+) !void {
+    try items.append(gpa, .{ .line = .{ .text = "    mov a,dpl", .jump = null } });
+    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    add a,#0x{X:0>2}", .{lo}), .jump = null } });
+    try items.append(gpa, .{ .line = .{ .text = "    mov dpl,a", .jump = null } });
+    try items.append(gpa, .{ .line = .{ .text = "    mov a,dph", .jump = null } });
+    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    addc a,#0x{X:0>2}", .{hi}), .jump = null } });
+    try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
+}
+
+/// dptr = _sym + off（符号基址 + 常量偏移）。
+fn emitDptrSym(
+    gpa: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged(Item),
+    sym: []const u8,
+    off: u16,
+) !void {
+    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov dptr,#{s}", .{sym}), .jump = null } });
+    if (off == 0) return;
+    try emitDptrAdd(gpa, items, @truncate(off), @truncate(off >> 8));
 }
 
 /// 指令字节数（M2.3 松弛用）。只覆盖本后端会发出的形态；

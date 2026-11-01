@@ -15,6 +15,7 @@ const Zcu = @import("../Zcu.zig");
 const InternPool = @import("../InternPool.zig");
 const Air = @import("../Air.zig");
 const Type = @import("../Type.zig");
+const Value = @import("../Value.zig");
 const mcsmir = @import("mcs2/mir.zig");
 const mcs51 = @import("mcs2/mcs51.zig");
 
@@ -77,11 +78,20 @@ var no_isr_save: bool = false;
 /// 一个 8 位值的位置（M1：全部经 direct 寻址可达）。
 const Loc = mcsmir.Byte;
 
-/// 指针值：固定地址（`@ptrFromInt` 常量），或「常量基址 + 运行期下标」。
+/// 指针值：固定地址（`@ptrFromInt` 常量）、符号基址（全局/静态变量），
+/// 各自再带「+ 运行期下标 × scale」。
 const PtrRef = union(enum) {
     fixed: u64,
     /// scale = 元素字节数：地址 = base + idx*scale（2 = u16/函数指针，4 = u32）
     elem: struct { base: u64, idx: Loc, scale: u8 = 1 },
+    /// 符号基址 + 常量偏移：地址 = _sym + off（全局变量的定长访问）
+    sym_off: struct { sym: []const u8, off: u64 = 0 },
+    /// 符号基址 + 运行期下标：地址 = _sym + off + idx*scale（`table[i]`，全局数组）
+    elem_sym: struct { sym: []const u8, off: u64 = 0, idx: Loc, scale: u8 = 1 },
+    /// `const` 表的定长访问：地址 = _sym + off，**在代码段**（`movc a,@a+dptr`）
+    code_sym: struct { sym: []const u8, off: u64 = 0 },
+    /// `const` 表 + 运行期下标（同上，代码段）
+    code_elem_sym: struct { sym: []const u8, off: u64 = 0, idx: Loc, scale: u8 = 1 },
 };
 
 /// M1 的线性降级器。不做活跃分析：`.arg` 原地用 ABI 寄存器（零序言），
@@ -100,6 +110,8 @@ const Lower = struct {
     vals: []?Loc = &.{},
     ptr_vals: []?PtrRef = &.{},
     parms: std.ArrayListUnmanaged([]const u8) = .empty,
+    /// 全局变量符号名池（`_sym`）：同一符号只分配一次，结束时统一释放。
+    sym_pool: std.ArrayListUnmanaged([]const u8) = .empty,
     is_isr: bool = false,
     /// 多字节值（u16/u32）：低字节 = 首槽 vreg 号，高字节 = 字节数。
     wide: []?u16 = &.{},
@@ -114,6 +126,12 @@ const Lower = struct {
     saw_ret: bool = false,
     /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
     label_base: u32 = 0,
+    /// comptime 数组常量池：`const tbl = .{…}` 的 `tbl[i]`（运行期下标）在 AIR 里是
+    /// `array_elem_val`，操作数是**聚合值**而不是符号 → 这里给它造一个代码段符号，
+    /// 把字节原样发出去（每个函数各发一份；跨函数去重要跨函数状态，暂不做）。
+    const_lines: std.ArrayListUnmanaged(u8) = .empty,
+    const_seen: [16]?struct { idx: InternPool.Index, sym: []const u8 } = @splat(null),
+    const_n: usize = 0,
     /// arg2 是否落在 B 寄存器（0xF0）。MUL/DIV 会破坏 B，用到时要保存/恢复。
     b_is_arg: bool = false,
     /// 本模块是否用到 dptr（取址/解引用）。用到时 arg0（DPL）必须先搬进 vreg：
@@ -148,21 +166,219 @@ const Lower = struct {
         }
     }
 
-    /// 指针引用：固定地址，或已记录下来的「基址 + 运行期下标」。
+    /// 符号名池：同一文本只分配一次，函数结束时统一释放（SafeAllocator 查泄漏）。
+    fn internSym(self: *Lower, text: []const u8) ?[]const u8 {
+        for (self.sym_pool.items) |s| if (std.mem.eql(u8, s, text)) return s;
+        const dup = self.gpa.dupe(u8, text) catch return null;
+        self.sym_pool.append(self.gpa, dup) catch {
+            self.gpa.free(dup);
+            return null;
+        };
+        return dup;
+    }
+
+    /// comptime 聚合值（`const tbl = .{…}`）→ 代码段符号：把字节原样发成 `.db` 块。
+    /// 同一个值在**本函数内**只发一次（跨函数去重要跨函数状态，暂不做）。
+    fn internConstAggregate(self: *Lower, idx: InternPool.Index, ty: Type) codegen.Error![]const u8 {
+        var i: usize = 0;
+        while (i < self.const_n) : (i += 1) {
+            const e = self.const_seen[i] orelse continue;
+            if (e.idx == idx) return e.sym;
+        }
+        const size: usize = @intCast(ty.abiSize(self.zcu));
+        if (size == 0) return self.fail("零长度常量数组不能下标", .{});
+        const buf = try self.gpa.alloc(u8, size);
+        defer self.gpa.free(buf);
+        const val = Value.fromInterned(idx);
+        val.writeToMemory(self.zcu, buf) catch
+            return self.fail("这个常量表的初值取不出来（可能含函数指针/重定位），不能放进代码段", .{});
+
+        const sym = try std.fmt.allocPrint(self.gpa, "_mcs_k{s}_{d}", .{ self.short_name, self.const_n });
+        self.sym_pool.append(self.gpa, sym) catch {
+            self.gpa.free(sym);
+            return error.OutOfMemory;
+        };
+        if (self.const_n < self.const_seen.len) {
+            self.const_seen[self.const_n] = .{ .idx = idx, .sym = sym };
+            self.const_n += 1;
+        }
+
+        const cl = &self.const_lines;
+        try cl.appendSlice(self.gpa, "\n    .area CSEG (CODE)\n");
+        try cl.appendSlice(self.gpa, sym);
+        try cl.appendSlice(self.gpa, ":\n");
+        var k: usize = 0;
+        while (k < buf.len) : (k += 16) {
+            const end = @min(k + 16, buf.len);
+            try cl.appendSlice(self.gpa, "    .db ");
+            for (buf[k..end], 0..) |b, j| {
+                if (j != 0) try cl.append(self.gpa, ',');
+                try cl.print(self.gpa, "0x{X:0>2}", .{b});
+            }
+            try cl.append(self.gpa, '\n');
+        }
+        return sym;
+    }
+
+    /// `&f` 的函数符号（与直调同一个 `_<fqn>`）：函数地址当值用。
+    fn fnNavSym(self: *Lower, ref: Air.Inst.Ref) ?[]const u8 {
+        const ip_index = ref.toInterned() orelse return null;
+        const key = self.zcu.intern_pool.indexToKey(ip_index);
+        const ptr = switch (key) {
+            .ptr => |p| p,
+            else => return null,
+        };
+        const nav_i = switch (ptr.base_addr) {
+            .nav => |n| n,
+            else => return null,
+        };
+        const nav = self.zcu.intern_pool.getNav(nav_i);
+        const res = nav.resolved orelse return null;
+        if (Type.fromInterned(res.type).zigTypeTag(self.zcu) != .@"fn") return null;
+        const mangled = mangleNavSymbol(self.gpa, &self.zcu.intern_pool, nav_i) catch return null;
+        defer self.gpa.free(mangled);
+        return self.internSym(mangled);
+    }
+    /// 符号地址解引用：ptr 的基址是 `.nav`（全局/静态变量）→ (符号名, 字节偏移)。
+    /// 函数不进这条路（`&f` 当值另有处理）。符号名与全局变量声明同源（`_<fqn>`）。
+    /// `is_code = true` 表示这是 `const`（值在代码段，只能 `movc` 读、不能写）。
+    fn constPtrSym(self: *Lower, ref: Air.Inst.Ref) ?struct { sym: []const u8, off: u64, is_code: bool } {
+        const ip_index = ref.toInterned() orelse return null;
+        const key = self.zcu.intern_pool.indexToKey(ip_index);
+        const ptr = switch (key) {
+            .ptr => |p| p,
+            else => return null,
+        };
+        const nav_i = switch (ptr.base_addr) {
+            .nav => |n| n,
+            else => return null,
+        };
+        const nav = self.zcu.intern_pool.getNav(nav_i);
+        const res = nav.resolved orelse return null;
+        // 函数的 nav 类型是 fn：那是函数地址（M2.6b 的直调路径），不是数据基址。
+        if (Type.fromInterned(res.type).zigTypeTag(self.zcu) == .@"fn") return null;
+        // 全局变量的**声明**符号是「`_` + 未限定名」（与函数不同：函数用 `_<fqn>`
+        // 且另发 `_<导出名>` 别名），所以这里必须按变量声明的方式拼同一个名字。
+        const bare = nav.name.toSlice(&self.zcu.intern_pool);
+        const tmp = std.fmt.allocPrint(self.gpa, "_{s}", .{bare}) catch return null;
+        defer self.gpa.free(tmp);
+        const sym = self.internSym(tmp) orelse return null;
+        return .{ .sym = sym, .off = ptr.byte_offset, .is_code = res.@"const" };
+    }
+
+    /// 指针引用：固定地址 / 符号基址 / 已记录下来的「基址 + 运行期下标」。
     fn ptrRefOf(self: *Lower, ref: Air.Inst.Ref) ?PtrRef {
         if (self.constPtrAddr(ref)) |addr| return .{ .fixed = addr };
+        if (self.constPtrSym(ref)) |s| {
+            return if (s.is_code)
+                .{ .code_sym = .{ .sym = s.sym, .off = s.off } }
+            else
+                .{ .sym_off = .{ .sym = s.sym, .off = s.off } };
+        }
         const idx = ref.toIndex() orelse return null;
         return self.ptr_vals[@backingInt(idx)];
     }
 
-    /// 整个编译单元是否出现会写 DPTR 的指令（保守：多算几个函数只多花 3 字节）。
+    /// 读指针 pr 的第 k 字节到槽 dst（四种基址形态统一在这里）。
+    fn emitLoadByte(self: *Lower, pr: PtrRef, k: u8, dst: u8) codegen.Error!void {
+        switch (pr) {
+            .fixed => |base| {
+                const a = base + k;
+                if (a <= 0xFF) {
+                    try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(dst), .addr = @intCast(a) } });
+                } else if (a <= 0xFFFF) {
+                    try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(dst), .addr = @intCast(a) } });
+                } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{a});
+            },
+            .sym_off => |s| try self.ops.append(self.gpa, .{ .load_xdata_sym = .{
+                .dst = mcsmir.v(dst),
+                .sym = s.sym,
+                .off = @intCast(s.off + k),
+            } }),
+            .elem => |e| {
+                if (e.base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
+                if (e.base + k > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{e.base + k});
+                try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
+                    .dst = mcsmir.v(dst),
+                    .base = @intCast(e.base + k),
+                    .idx = e.idx,
+                    .scale = e.scale,
+                } });
+            },
+            .elem_sym => |e| try self.ops.append(self.gpa, .{ .load_xdata_idx_sym = .{
+                .dst = mcsmir.v(dst),
+                .sym = e.sym,
+                .off = @intCast(e.off + k),
+                .idx = e.idx,
+                .scale = e.scale,
+            } }),
+            .code_sym => |s| try self.ops.append(self.gpa, .{ .load_code_sym = .{
+                .dst = mcsmir.v(dst),
+                .sym = s.sym,
+                .off = @intCast(s.off + k),
+            } }),
+            .code_elem_sym => |e| try self.ops.append(self.gpa, .{ .load_code_idx_sym = .{
+                .dst = mcsmir.v(dst),
+                .sym = e.sym,
+                .off = @intCast(e.off + k),
+                .idx = e.idx,
+                .scale = e.scale,
+            } }),
+        }
+    }
+
+    /// 把 src 写进指针 pr 的第 k 字节。
+    fn emitStoreByte(self: *Lower, pr: PtrRef, k: u8, src: Loc) codegen.Error!void {
+        switch (pr) {
+            .fixed => |base| {
+                const a = base + k;
+                if (a <= 0xFF) {
+                    try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(a), .src = src } });
+                } else if (a <= 0xFFFF) {
+                    try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = @intCast(a), .src = src } });
+                } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{a});
+            },
+            .sym_off => |s| try self.ops.append(self.gpa, .{ .store_xdata_sym = .{
+                .sym = s.sym,
+                .off = @intCast(s.off + k),
+                .src = src,
+            } }),
+            .elem => |e| {
+                if (e.base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
+                if (e.base + k > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{e.base + k});
+                try self.ops.append(self.gpa, .{ .store_xdata_idx = .{
+                    .base = @intCast(e.base + k),
+                    .idx = e.idx,
+                    .src = src,
+                    .scale = e.scale,
+                } });
+            },
+            .elem_sym => |e| try self.ops.append(self.gpa, .{ .store_xdata_idx_sym = .{
+                .sym = e.sym,
+                .off = @intCast(e.off + k),
+                .idx = e.idx,
+                .src = src,
+                .scale = e.scale,
+            } }),
+            .code_sym, .code_elem_sym =>
+                return self.fail("`const` 表在代码段（movc 只读）：不能写入。要可变就声明成 var", .{}),
+        }
+    }
+
+    /// 整个编译单元是否出现会写 DPL/DPH 的指令（保守：多算几个函数只多花 3 字节）。
+    /// **调用也算**：`lcall` 会把被调方的 arg0 放进 DPL（arg2 进 B），
+    /// 而本函数的 1 字节 arg0 平时是「就地当 DPL」用的——不先搬进槽，
+    /// 调用之后再用参数就变成上次的实参（真程序 puthex/putbyte 一撞就中）。
     fn airNeedsDptr(self: *Lower) bool {
         const tags = self.air.instructions.items(.tag);
         const datas = self.air.instructions.items(.data);
         for (tags, 0..) |t, i| switch (t) {
-            .ptr_elem_ptr, .ptr_elem_val => return true,
-            .load => if (self.constPtrAddr(datas[i].ty_op.operand) != null) return true,
-            .store => if (self.constPtrAddr(datas[i].bin_op.lhs) != null) return true,
+            .ptr_elem_ptr, .ptr_elem_val, .array_elem_val => return true,
+            .call, .call_always_tail, .call_never_tail, .call_never_inline => return true,
+            .load => if (self.constPtrAddr(datas[i].ty_op.operand) != null or
+                self.constPtrSym(datas[i].ty_op.operand) != null) return true,
+            .store => if (self.constPtrAddr(datas[i].bin_op.lhs) != null or
+                self.constPtrSym(datas[i].bin_op.lhs) != null) return true,
             else => {},
         };
         return false;
@@ -963,9 +1179,16 @@ const Lower = struct {
             .load_dir => |x| .{ .load_dir = .{ .dst = mapByteVreg(x.dst, map), .addr = x.addr } },
             .store_dir => |x| .{ .store_dir = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
             .load_xdata => |x| .{ .load_xdata = .{ .dst = mapByteVreg(x.dst, map), .addr = x.addr } },
+            .lea_dptr_sym => op,
             .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
             .load_xdata_idx => |x| .{ .load_xdata_idx = .{ .dst = mapByteVreg(x.dst, map), .base = x.base, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
             .store_xdata_idx => |x| .{ .store_xdata_idx = .{ .base = x.base, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map), .scale = x.scale } },
+            .load_xdata_idx_sym => |x| .{ .load_xdata_idx_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
+            .store_xdata_idx_sym => |x| .{ .store_xdata_idx_sym = .{ .sym = x.sym, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map), .scale = x.scale } },
+            .load_xdata_sym => |x| .{ .load_xdata_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .off = x.off } },
+            .load_code_sym => |x| .{ .load_code_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .off = x.off } },
+            .load_code_idx_sym => |x| .{ .load_code_idx_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .off = x.off, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
+            .store_xdata_sym => |x| .{ .store_xdata_sym = .{ .sym = x.sym, .off = x.off, .src = mapByteVreg(x.src, map) } },
             .br_ifnz => |x| .{ .br_ifnz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
             .br_ifz => |x| .{ .br_ifz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
             .cmp_br => |x| .{ .cmp_br = .{ .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map), .cc = x.cc, .target = x.target } },
@@ -1072,6 +1295,10 @@ const Lower = struct {
             .dec_br_nz => |x| isVregByte(x.dst, r),
             .load_xdata_idx => |x| isVregByte(x.idx, r),
             .store_xdata_idx => |x| isVregByte(x.idx, r) or isVregByte(x.src, r),
+            .load_xdata_idx_sym => |x| isVregByte(x.idx, r),
+            .store_xdata_idx_sym => |x| isVregByte(x.idx, r) or isVregByte(x.src, r),
+            .store_xdata_sym => |x| isVregByte(x.src, r),
+            .load_code_idx_sym => |x| isVregByte(x.idx, r),
             else => false,
         };
     }
@@ -1154,9 +1381,17 @@ const Lower = struct {
             .store_dir => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .store_dir = .{ .addr = x.addr, .src = to } } else null,
             .store_xdata => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .store_xdata = .{ .addr = x.addr, .src = to } } else null,
             .load_xdata_idx => |x| if (isVregByte(x.idx, from)) mcsmir.Op{ .load_xdata_idx = .{ .dst = x.dst, .base = x.base, .idx = to, .scale = x.scale } } else null,
+            .load_xdata_idx_sym => |x| if (isVregByte(x.idx, from)) mcsmir.Op{ .load_xdata_idx_sym = .{ .dst = x.dst, .sym = x.sym, .idx = to, .scale = x.scale } } else null,
+            .load_code_idx_sym => |x| if (isVregByte(x.idx, from)) mcsmir.Op{ .load_code_idx_sym = .{ .dst = x.dst, .sym = x.sym, .off = x.off, .idx = to, .scale = x.scale } } else null,
+            .store_xdata_idx_sym => |x| blk: {
+                if (isVregByte(x.idx, from)) break :blk mcsmir.Op{ .store_xdata_idx_sym = .{ .sym = x.sym, .idx = to, .src = x.src, .scale = x.scale } };
+                if (isVregByte(x.src, from)) break :blk mcsmir.Op{ .store_xdata_idx_sym = .{ .sym = x.sym, .idx = x.idx, .src = to, .scale = x.scale } };
+                break :blk null;
+            },
+            .store_xdata_sym => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .store_xdata_sym = .{ .sym = x.sym, .off = x.off, .src = to } } else null,
             .store_xdata_idx => |x| blk: {
-                if (isVregByte(x.idx, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = to, .src = x.src } };
-                if (isVregByte(x.src, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = x.idx, .src = to } };
+                if (isVregByte(x.idx, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = to, .src = x.src, .scale = x.scale } };
+                if (isVregByte(x.src, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = x.idx, .src = to, .scale = x.scale } };
                 break :blk null;
             },
             else => null,
@@ -1187,6 +1422,16 @@ const Lower = struct {
                 else => false,
             };
             if (boundary or !readsVreg(nxt, d) or readCountVreg(self.ops.items, d) != 1) {
+                i += 1;
+                continue;
+            }
+            // 源是 ABI/易失寄存器（DPL/DPH/ACC/B）时**不能**折叠：下一条指令可能先把
+            // DPTR 写掉（`mov dptr,#sym`），之后才轮到读这个操作数 —— 那就读到新值了。
+            // 典型翻车：`const tbl` 的 `tbl[i]`（下标就住在 DPL，而符号基址要先装 DPTR）。
+            if (m.src == .dir and switch (m.src.dir) {
+                0x82, 0x83, 0xE0, 0xF0 => true,
+                else => false,
+            }) {
                 i += 1;
                 continue;
             }
@@ -1739,32 +1984,51 @@ const Lower = struct {
             },
 
             .ptr_elem_ptr => {
-                // 运行期下标：基址必须是固定地址（@ptrFromInt；全局符号待 M2.5 后补）。
+                // 基址：固定地址（@ptrFromInt）或全局/静态变量的符号地址；
+                // 元素地址 = 基址 + idx*scale，常量下标直接折进地址。
                 const bin = self.air.extraData(Air.Bin, @intCast(data.ty_pl.payload)).data;
                 const pr = self.ptrRefOf(bin.lhs) orelse
-                    return self.fail("指针下标的基址必须是固定地址（暂不支持运行期指针）", .{});
-                switch (pr) {
-                    .fixed => |base| {
-                        // 元素字节数 = 结果指针的子类型宽度（u8=1 / u16=2 / u32=4）
-                        const pty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                        // 指针子类型可能是**数组**（T16[i] 的 lhs 是 *[8]u16）→ 再取元素类型
-                        var ety = pty.childType(self.zcu);
-                        while (ety.zigTypeTag(self.zcu) == .array) ety = ety.childType(self.zcu);
-                        const sc = try self.storageBytes(ety, "下标元素");
-                        if (self.dump_air) std.debug.print("  >> elem scale={d} res={s} ety={s}\n", .{
-                            sc,
-                            @tagName(pty.zigTypeTag(self.zcu)),
-                            @tagName(ety.zigTypeTag(self.zcu)),
-                        });
-                        // 常量下标直接折进固定地址（**乘上元素大小**）
-                        if (self.constU8(bin.rhs)) |k| {
-                            self.ptr_vals[@backingInt(inst)] = .{ .fixed = base + @as(u64, k) * sc };
-                            continue;
-                        }
-                        const idx_loc = try self.refLoc(bin.rhs);
-                        self.ptr_vals[@backingInt(inst)] = .{ .elem = .{ .base = base, .idx = idx_loc, .scale = sc } };
-                    },
-                    .elem => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
+                    return self.fail("指针下标的基址必须是固定地址或全局变量（暂不支持运行期指针）", .{});
+                {
+                    // 元素字节数 = 结果指针的子类型宽度（u8=1 / u16=2 / u32=4）
+                    const pty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                    // 指针子类型可能是**数组**（T16[i] 的 lhs 是 *[8]u16）→ 再取元素类型
+                    var ety = pty.childType(self.zcu);
+                    while (ety.zigTypeTag(self.zcu) == .array) ety = ety.childType(self.zcu);
+                    const sc = try self.storageBytes(ety, "下标元素");
+                    if (self.dump_air) std.debug.print("  >> elem scale={d} res={s} ety={s}\n", .{
+                        sc,
+                        @tagName(pty.zigTypeTag(self.zcu)),
+                        @tagName(ety.zigTypeTag(self.zcu)),
+                    });
+                    switch (pr) {
+                        .fixed => |base| {
+                            if (self.constU8(bin.rhs)) |k| {
+                                self.ptr_vals[@backingInt(inst)] = .{ .fixed = base + @as(u64, k) * sc };
+                                continue;
+                            }
+                            const idx_loc = try self.refLoc(bin.rhs);
+                            self.ptr_vals[@backingInt(inst)] = .{ .elem = .{ .base = base, .idx = idx_loc, .scale = sc } };
+                        },
+                        .sym_off => |s| {
+                            if (self.constU8(bin.rhs)) |k| {
+                                self.ptr_vals[@backingInt(inst)] = .{ .sym_off = .{ .sym = s.sym, .off = s.off + @as(u64, k) * sc } };
+                                continue;
+                            }
+                            const idx_loc = try self.refLoc(bin.rhs);
+                            self.ptr_vals[@backingInt(inst)] = .{ .elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = sc } };
+                        },
+                        // const 表（代码段）：常量下标折成 _sym+off，运行期下标走 movc 链
+                        .code_sym => |s| {
+                            if (self.constU8(bin.rhs)) |k| {
+                                self.ptr_vals[@backingInt(inst)] = .{ .code_sym = .{ .sym = s.sym, .off = s.off + @as(u64, k) * sc } };
+                                continue;
+                            }
+                            const idx_loc = try self.refLoc(bin.rhs);
+                            self.ptr_vals[@backingInt(inst)] = .{ .code_elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = sc } };
+                        },
+                        .elem, .elem_sym, .code_elem_sym => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
+                    }
                 }
             },
 
@@ -2062,6 +2326,20 @@ const Lower = struct {
                 }
             },
 
+            // 取函数地址当值（`@intFromPtr(&f)`）：函数指针表的「填表」动作。
+            // 地址就是 `_<fqn>` 这个 16 位符号，用 `mov dptr,#_sym` 装进 DPTR 再抄出来。
+            .int_from_ptr => {
+                const ty_op = data.ty_op;
+                const sym = self.fnNavSym(ty_op.operand) orelse
+                    return self.fail("只支持把**函数**地址转成整数（数据指针的地址暂不支持）", .{});
+                const w = try self.allocWide(2);
+                try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = sym } });
+                try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(w), .src = .{ .dir = 0x82 } } });
+                try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(w + 1), .src = .{ .dir = 0x83 } } });
+                self.vals[@backingInt(inst)] = mcsmir.v(w);
+                self.wide[@backingInt(inst)] = @as(u16, w) | (@as(u16, 2) << 8);
+            },
+
             // 地址装进整数再转指针（@ptrFromInt）：位模式不变，只把宽度信息带过去，
             // 间接调用靠它拿到 2 字节目标地址。
             .ptr_from_int => {
@@ -2085,58 +2363,30 @@ const Lower = struct {
             },
 
             .store, .store_safe => {
-                // bin_op：lhs = 目标，rhs = 值。
-                // 多字节值写回局部槽：逐字节搬运（槽必须是连续的）。
+                // bin_op：lhs = 目标，rhs = 值。目标是指针就走 emitStoreByte（四种基址形态），
+                // 否则是局部槽：多字节逐字节搬运（槽必须连续）。
                 const rty = self.air.typeOf(data.bin_op.rhs, &self.zcu.intern_pool);
                 const rn = try self.storageBytes(rty, "写回");
+                const bin = data.bin_op;
                 if (rn > 1) {
-                    const sbase = try self.wideOperand(data.bin_op.rhs, rn);
-                    // ① 固定地址目标（@ptrFromInt）：逐字节写（≤0xFF 直址，否则 xdata）。
-                    //    这是 u32 全局/外设寄存器块的最短路径，不经过 vreg 槽。
-                    // ② 运行期下标目标：逐字节 store_xdata_idx（base+k 加在同一元素上）
-                    if (self.ptrRefOf(data.bin_op.lhs)) |pr| if (pr == .elem) {
-                        const e2 = pr.elem;
-                        if (e2.base > 0xFF) {
-                            var k5: u8 = 0;
-                            while (k5 < rn) : (k5 += 1) {
-                                try self.ops.append(self.gpa, .{ .store_xdata_idx = .{
-                                    .base = @intCast(e2.base + k5),
-                                    .idx = e2.idx,
-                                    .src = mcsmir.v(sbase + k5),
-                                    .scale = e2.scale,
-                                } });
-                            }
-                            continue;
-                        }
-                    };
-                    if (self.ptrRefOf(data.bin_op.lhs)) |pr| if (pr == .fixed) {
-                        const faddr = pr.fixed;
-                        var k3: u8 = 0;
-                        while (k3 < rn) : (k3 += 1) {
-                            const a3 = faddr + k3;
-                            if (a3 <= 0xFF) {
-                                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(a3), .src = mcsmir.v(sbase + k3) } });
-                            } else if (a3 <= 0xFFFF) {
-                                try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = @intCast(a3), .src = mcsmir.v(sbase + k3) } });
-                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{a3});
-                        }
+                    const sbase = try self.wideOperand(bin.rhs, rn);
+                    if (self.ptrRefOf(bin.lhs)) |pr| {
+                        var k: u8 = 0;
+                        while (k < rn) : (k += 1) try self.emitStoreByte(pr, k, mcsmir.v(sbase + k));
                         continue;
-                    };
-                    const wn = rn;
-                    const dest = try self.refLoc(data.bin_op.lhs);
+                    }
+                    const dest = try self.refLoc(bin.lhs);
                     const dbase: u8 = switch (dest) {
                         .vreg => |v| v,
                         else => return self.fail("多字节写目前只支持局部槽目标", .{}),
                     };
                     var k2: u8 = 0;
-                    while (k2 < wn) : (k2 += 1) {
+                    while (k2 < rn) : (k2 += 1) {
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dbase + k2), .src = mcsmir.v(sbase + k2) } });
                     }
                     continue;
                 }
-                // 目标为固定地址指针（@ptrFromInt）：≤0xFF → SFR/直址；>0xFF → xdata。
-                const bin = data.bin_op;
-                // 多字节写：目标槽位逐字节搬运（目标必须是连续 vreg 槽）。
+                // 单字节：值若是多字节槽（截断写）→ 目标必须是局部槽。
                 if (self.wideOf(bin.rhs)) |w| {
                     const wn: u8 = @truncate(w >> 8);
                     const sbase: u8 = @truncate(w & 0xFF);
@@ -2153,25 +2403,7 @@ const Lower = struct {
                 }
                 if (self.ptrRefOf(bin.lhs)) |pr| {
                     const value = try self.refLoc(bin.rhs);
-                    switch (pr) {
-                        .fixed => |addr| {
-                            if (addr <= 0xFF) {
-                                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = @intCast(addr), .src = value } });
-                            } else if (addr <= 0xFFFF) {
-                                try self.ops.append(self.gpa, .{ .store_xdata = .{ .addr = @intCast(addr), .src = value } });
-                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
-                        },
-                        .elem => |e| {
-                            if (e.base > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{e.base});
-                            if (e.base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
-                            try self.ops.append(self.gpa, .{ .store_xdata_idx = .{
-                                .base = @intCast(e.base),
-                                .idx = e.idx,
-                                .src = value,
-                                .scale = e.scale,
-                            } });
-                        },
-                    }
+                    try self.emitStoreByte(pr, 0, value);
                     continue;
                 }
                 const dest = try self.refLoc(bin.lhs);
@@ -2180,84 +2412,78 @@ const Lower = struct {
                 // store 本身无结果值
             },
 
-            // `buf[i]` 的读取形态：AIR 把「取元素指针 + 解引用」折成 ptr_elem_val。
-            .ptr_elem_val => {
+            // `buf[i]` 的两种折法：
+            //   * `ptr_elem_val`：基址是**指针**（`*[N]T` / `[*]T`）；
+            //   * `array_elem_val`：基址是**数组值**（`const tbl = .{…}` 这种 comptime 数组）。
+            // 两者都降成「基址 + i*元素宽」的一次读取，共用下面的代码。
+            .ptr_elem_val, .array_elem_val => {
+                // 元素字节数 = 指令类型宽度（结果就是元素值），四种基址形态都走 emitLoadByte。
                 const bin = data.bin_op;
-                const pr = self.ptrRefOf(bin.lhs) orelse
-                    return self.fail("元素读取的基址必须是固定地址（暂不支持运行期指针）", .{});
-                const r = try self.allocVreg();
-                switch (pr) {
-                    .fixed => |base| {
-                        if (self.constU8(bin.rhs)) |k| {
-                            const addr = base + k;
-                            if (addr <= 0xFF) {
-                                try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                            } else if (addr <= 0xFFFF) {
-                                try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                            } else return self.fail("地址 0x{X} 超出 51 可寻址范围", .{addr});
-                        } else {
-                            if (base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
-                            if (base > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{base});
-                            const idx_loc = try self.refLoc(bin.rhs);
-                            // ptr_elem_val 的指令类型**就是**元素类型 → 宽度即 scale
-                            // （这里 pr 是 .fixed，不能去读 .elem 字段，否则 Debug 下 union 访问 panic）
-                            const sc2 = try self.storageBytes(self.air.typeOfIndex(inst, &self.zcu.intern_pool), "下标元素");
-                            try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
-                                .dst = mcsmir.v(r),
-                                .base = @intCast(base),
-                                .idx = idx_loc,
-                                .scale = sc2,
-                            } });
+                const ety = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                const n = try self.storageBytes(ety, "下标元素");
+                const pr: PtrRef = self.ptrRefOf(bin.lhs) orelse blk: {
+                    // 操作数是 comptime 聚合值（`const tbl = .{…}` + 运行期下标）：
+                    // 把字节发进代码段，给个符号当只读表用。
+                    if (bin.lhs.toInterned()) |ii| {
+                        const lhs_ty = self.air.typeOf(bin.lhs, &self.zcu.intern_pool);
+                        if (self.zcu.intern_pool.indexToKey(ii) == .aggregate) {
+                            const sym = try self.internConstAggregate(ii, lhs_ty);
+                            break :blk .{ .code_sym = .{ .sym = sym, .off = 0 } };
                         }
-                    },
-                    .elem => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
+                    }
+                    return self.fail("元素读取的基址必须是固定地址/全局变量/comptime 常量数组（暂不支持运行期指针）", .{});
+                };
+                // 常量下标：折成「基址 + k*scale」的一次访问
+                if (self.constU8(bin.rhs)) |k| {
+                    const folded: ?PtrRef = switch (pr) {
+                        .fixed => |b| .{ .fixed = b + @as(u64, k) * n },
+                        .sym_off => |s| .{ .sym_off = .{ .sym = s.sym, .off = s.off + @as(u64, k) * n } },
+                        .code_sym => |s| .{ .code_sym = .{ .sym = s.sym, .off = s.off + @as(u64, k) * n } },
+                        else => null,
+                    };
+                    if (folded) |folded_pr| {
+                        const fb: u8 = if (n > 1) try self.allocWide(n) else try self.allocVreg();
+                        var kk: u8 = 0;
+                        while (kk < n) : (kk += 1) try self.emitLoadByte(folded_pr, kk, fb + kk);
+                        self.vals[@backingInt(inst)] = mcsmir.v(fb);
+                        if (n > 1) self.wide[@backingInt(inst)] = @as(u16, fb) | (@as(u16, n) << 8);
+                        continue;
+                    }
                 }
+                const idx_loc = try self.refLoc(bin.rhs);
+                const indexed: PtrRef = switch (pr) {
+                    .fixed => |b| blk: {
+                        if (b <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
+                        if (b > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{b});
+                        break :blk .{ .elem = .{ .base = b, .idx = idx_loc, .scale = n } };
+                    },
+                    .sym_off => |s| .{ .elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = n } },
+                    .code_sym => |s| .{ .code_elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = n } },
+                    .elem, .elem_sym, .code_elem_sym => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
+                };
+                const r: u8 = if (n > 1) try self.allocWide(n) else try self.allocVreg();
+                var k3: u8 = 0;
+                while (k3 < n) : (k3 += 1) try self.emitLoadByte(indexed, k3, r + k3);
                 self.vals[@backingInt(inst)] = mcsmir.v(r);
+                if (n > 1) self.wide[@backingInt(inst)] = @as(u16, r) | (@as(u16, n) << 8);
             },
 
             .load => {
-                // 宽类型（u16/u32）读取：槽位直接当多字节值，记录宽信息。
+                // 指针读取：逐字节发 `emitLoadByte`（四种基址形态统一走它）。
+                // 宽类型（u16/u32）直接拼成 n 字节连续槽并记录宽信息。
                 const lty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 const ln_b = try self.storageBytes(lty, "读取");
+                const ty_op = data.ty_op;
+                if (self.ptrRefOf(ty_op.operand)) |pr| {
+                    const wb: u8 = if (ln_b > 1) try self.allocWide(ln_b) else try self.allocVreg();
+                    var k: u8 = 0;
+                    while (k < ln_b) : (k += 1) try self.emitLoadByte(pr, k, wb + k);
+                    self.vals[@backingInt(inst)] = mcsmir.v(wb);
+                    if (ln_b > 1) self.wide[@backingInt(inst)] = @as(u16, wb) | (@as(u16, ln_b) << 8);
+                    continue;
+                }
                 if (ln_b > 1) {
-                    // ① 固定地址源（@ptrFromInt）：逐字节读，直接拼成 n 字节槽。
-                    // ② 运行期下标源：逐字节 load_xdata_idx
-                    if (self.ptrRefOf(data.ty_op.operand)) |pr| if (pr == .elem) {
-                        const e3 = pr.elem;
-                        if (e3.base > 0xFF) {
-                            const wb2 = try self.allocWide(ln_b);
-                            var k6: u8 = 0;
-                            while (k6 < ln_b) : (k6 += 1) {
-                                try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
-                                    .dst = mcsmir.v(wb2 + k6),
-                                    .base = @intCast(e3.base + k6),
-                                    .idx = e3.idx,
-                                    .scale = e3.scale,
-                                } });
-                            }
-                            self.vals[@backingInt(inst)] = mcsmir.v(wb2);
-                            self.wide[@backingInt(inst)] = @as(u16, wb2) | (@as(u16, ln_b) << 8);
-                            continue;
-                        }
-                    };
-                    if (self.ptrRefOf(data.ty_op.operand)) |pr| if (pr == .fixed) {
-                        const faddr = pr.fixed;
-                        const wbase = try self.allocWide(ln_b);
-                        var k4: u8 = 0;
-                        while (k4 < ln_b) : (k4 += 1) {
-                            const a4 = faddr + k4;
-                            if (a4 <= 0xFF) {
-                                try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(wbase + k4), .addr = @intCast(a4) } });
-                            } else if (a4 <= 0xFFFF) {
-                                try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(wbase + k4), .addr = @intCast(a4) } });
-                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{a4});
-                        }
-                        self.vals[@backingInt(inst)] = mcsmir.v(wbase);
-                        self.wide[@backingInt(inst)] = @as(u16, wbase) | (@as(u16, ln_b) << 8);
-                        continue;
-                    };
-                    if (self.ptrRefOf(data.ty_op.operand) != null)
-                        return self.fail("多字节 xdata 读取尚未实现（先支持局部槽）", .{});
+                    // 源是局部槽：槽位直接当多字节值。
                     const src = try self.refLoc(data.ty_op.operand);
                     const base: u8 = switch (src) {
                         .vreg => |v| v,
@@ -2265,32 +2491,6 @@ const Lower = struct {
                     };
                     self.vals[@backingInt(inst)] = mcsmir.v(base);
                     self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, ln_b) << 8);
-                    continue;
-                }
-                // ty_op：operand = 指针。固定地址 → load_dir（≤0xFF）/ load_xdata（>0xFF）；
-                // 本地槽 → 直读。
-                const ty_op = data.ty_op;
-                if (self.ptrRefOf(ty_op.operand)) |pr| {
-                    const r = try self.allocVreg();
-                    switch (pr) {
-                        .fixed => |addr| {
-                            if (addr <= 0xFF) {
-                                try self.ops.append(self.gpa, .{ .load_dir = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                            } else if (addr <= 0xFFFF) {
-                                try self.ops.append(self.gpa, .{ .load_xdata = .{ .dst = mcsmir.v(r), .addr = @intCast(addr) } });
-                            } else return self.fail("固定地址 0x{X} 超出 51 可寻址范围", .{addr});
-                        },
-                        .elem => |e| {
-                            if (e.base > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{e.base});
-                            if (e.base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
-                            try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
-                                .dst = mcsmir.v(r),
-                                .base = @intCast(e.base),
-                                .idx = e.idx,
-                            } });
-                        },
-                    }
-                    self.vals[@backingInt(inst)] = mcsmir.v(r);
                     continue;
                 }
                 const src = try self.refLoc(ty_op.operand);
@@ -2470,22 +2670,30 @@ const Lower = struct {
                         .nav => |n| n,
                         else => return self.fail("取地址调用的目标不是具名函数", .{}),
                     };
-                    sym = try mangleNavSymbol(self.gpa, ip, nav);
-                    short = try self.gpa.dupe(u8, ip.getNav(nav).name.toSlice(ip));
+                    const mangled = try mangleNavSymbol(self.gpa, ip, nav);
+                    defer self.gpa.free(mangled);
+                    // 符号进符号池：调用符号要活到 mcs51 发射完，统一在 generate 末尾释放
+                    sym = self.internSym(mangled) orelse return error.OutOfMemory;
+                    // 短名直接用 interned 切片（以前这里每次调用 dupe 一份，SafeAllocator 报泄漏）
+                    short = ip.getNav(nav).name.toSlice(ip);
                     resolved = true;
                 }
                 if (!resolved) {
                     switch (key) {
                         .func => |fi| {
                             const nav = fi.owner_nav;
-                            sym = try mangleNavSymbol(self.gpa, ip, nav);
-                            short = try self.gpa.dupe(u8, ip.getNav(nav).name.toSlice(ip));
+                            const mangled = try mangleNavSymbol(self.gpa, ip, nav);
+                            defer self.gpa.free(mangled);
+                            sym = self.internSym(mangled) orelse return error.OutOfMemory;
+                            short = ip.getNav(nav).name.toSlice(ip);
                         },
                         .@"extern" => |ex| {
                             // C 函数：SDCC 的符号就是 _名字
                             const nm = ex.name.toSlice(ip);
-                            sym = try std.fmt.allocPrint(self.gpa, "_{s}", .{nm});
-                            short = try self.gpa.dupe(u8, nm);
+                            const owned = try std.fmt.allocPrint(self.gpa, "_{s}", .{nm});
+                            defer self.gpa.free(owned);
+                            sym = self.internSym(owned) orelse return error.OutOfMemory;
+                            short = nm;
                         },
                         else => return self.fail("调用目标不是函数（{s}）", .{@tagName(key)}),
                     }
@@ -2705,6 +2913,11 @@ pub fn generate(
     };
     defer lw.ops.deinit(gpa);
     defer lw.parms.deinit(gpa);
+    defer {
+        for (lw.sym_pool.items) |s| gpa.free(s);
+        lw.sym_pool.deinit(gpa);
+    }
+    defer lw.const_lines.deinit(gpa);
 
     const body = air.getMainBody();
     lw.vals = try gpa.alloc(?Loc, air.instructions.len);
@@ -2793,6 +3006,9 @@ pub fn generate(
     var mir: Mir = .{};
     errdefer mir.deinit(gpa);
     try mir.text.appendSlice(gpa, text);
+
+    // comptime 常量表的数据块跟在函数体后面（同一个汇编单元，符号可见）。
+    if (lw.const_lines.items.len != 0) try mir.text.appendSlice(gpa, lw.const_lines.items);
 
     // 中断向量跳板：绝对段 VECTORS 内 .org 到向量地址发 ljmp（函数体在 CSEG 别处）。
     if (is_isr) {

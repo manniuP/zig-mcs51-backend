@@ -44,7 +44,11 @@ if os.environ.get("ZIG017"):                       # 兼容旧习惯：显式指
     ZIG_EXE = Path(os.environ["ZIG017"])
 
 # 需要保持两处一致的文件（相对源码树）
-SYNC_FILES = ["src/codegen/mcs2.zig"]
+SYNC_FILES = [
+    "src/codegen/mcs2.zig",
+    # 链接层：全局变量/const 表的数据发射（.db）也归我们改
+    "src/link/Asx.zig",
+]
 SYNC_GLOB = "src/codegen/mcs2/*.zig"
 
 
@@ -425,6 +429,42 @@ CASES: dict[str, dict] = {
                   args=[("DPL", 3), ("PARM_2", 0x34), ("PARM_3", 0x12)], want16=0x1234),
     "t8rt": dict(kind="call", src="tableidx.zig", fn="t8rt",
                  args=[("DPL", 5), ("PARM2", 0xA5)], want=0xA5),
+    "t16pair": dict(kind="call", src="tableidx.zig", fn="t16pair",
+                    args=[("DPL", 3), ("PARM_2", 0x11), ("PARM_3", 0x11),
+                          ("PARM_4", 0x22), ("PARM_5", 0x22)], want16=0x3333, steps=3000),
+    "t8pair": dict(kind="call", src="tableidx.zig", fn="t8pair",
+                   args=[("DPL", 5), ("PARM2", 0x11), ("PARM_3", 0x22)], want=0x33, steps=1000),
+    "t32rt": dict(kind="call", src="tableu32.zig", fn="t32rt",
+                  args=[("DPL", 3), ("PARM_2", 0x78), ("PARM_3", 0x56),
+                        ("PARM_4", 0x34), ("PARM_5", 0x12)], want32=0x12345678, steps=3000),
+    "t32pair": dict(kind="call", src="tableu32.zig", fn="t32pair",
+                    args=[("DPL", 3), ("PARM_2", 0x11), ("PARM_3", 0x11), ("PARM_4", 0x11), ("PARM_5", 0x11),
+                          ("PARM_6", 0x22), ("PARM_7", 0x22), ("PARM_8", 0x22), ("PARM_9", 0x22)],
+                    # scale=4 × 4 字节 × 2 元素 × 2（写+读）≈ 16 次 xdata 访问，
+                    # 每次约 30 条指令；默认 400 步会半路截断（曾误判成「高字节错」）
+                    want32=0x33333333, steps=8000),
+    # 全局数组（符号基址，mov dptr,#_sym）：常量下标 / 运行期下标 / u8 / 相邻两元素
+    "symconst": dict(kind="call", src="symtab.zig", fn="symconst",
+                     args=[("DPL", 0x34), ("DPH", 0x12)], want16=0x1234, steps=3000),
+    "symrt": dict(kind="call", src="symtab.zig", fn="symrt",
+                  args=[("DPL", 1), ("PARM_2", 0xEF), ("PARM_3", 0xBE)], want16=0xBEEF, steps=3000),
+    "symb": dict(kind="call", src="symtab.zig", fn="symb",
+                 args=[("DPL", 2), ("PARM2", 0x5A)], want=0x5A, steps=2000),
+    "sympair": dict(kind="call", src="symtab.zig", fn="sympair",
+                    args=[("DPL", 1), ("PARM_2", 0x11), ("PARM_3", 0x11),
+                          ("PARM_4", 0x22), ("PARM_5", 0x22)], want16=0x3333, steps=6000),
+    # const 表（代码段 .db + movc）：常量下标 / 运行期下标 / u16 元素
+    "cget2": dict(kind="call", src="consttab.zig", fn="cget2", args=[], want=0x33, steps=1000),
+    "cgeti": dict(kind="call", src="consttab.zig", fn="cgeti", args=[("DPL", 5)], want=0x66, steps=1000),
+    "wgeti": dict(kind="call", src="consttab.zig", fn="wgeti",
+                  args=[("DPL", 1)], want16=0x3344, steps=2000),
+    # 函数指针表：填表（@intFromPtr）+ table[i] + @ptrFromInt + 间接调用
+    "fpt_all": dict(kind="call", src="fptab.zig", fn="fpt_all",
+                    args=[("DPL", 10)], want=0x14, steps=10000),
+    # 调用踩 DPL：arg0 就地住 DPL 时，lcall 之后再用参数必须还是原值
+    "argcall1": dict(kind="call", src="argcall.zig", fn="twice", args=[("DPL", 0x34)], want=0x6A, steps=2000),
+    "argcall2": dict(kind="call", src="argcall.zig", fn="digits", args=[("DPL", 0x34)], want=0x09, steps=2000),
+    "argcall3": dict(kind="call", src="argcall.zig", fn="after", args=[("DPL", 0x34)], want=0x69, steps=2000),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -442,7 +482,10 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "lt32", "lt32b", "ge8t", "ge8f",
          "chain", "chain32", "mix32",
          "call_ind", "twice_ind", "call_addr", "dispatch",
-         "wstore", "wround", "wround2", "addone", "t16rt", "t8rt",
+         "wstore", "wround", "wround2", "addone",
+         "t16rt", "t8rt", "t16pair", "t8pair", "t32rt", "t32pair",
+         "symconst", "symrt", "symb", "sympair", "fpt_all",
+         "argcall1", "argcall2", "argcall3", "cget2", "cgeti", "wgeti",
          "ringdemo"]
 
 
@@ -617,6 +660,8 @@ _crt_main:
 
 FW = {
     "uart": dict(src="uart_demo.zig", name="uart_demo_8h8k64u", dseg=0x30, cseg=0x0000),
+    # 「像真程序」的固件：函数指针表分派 + u16 运算 + UART 打印（AI8051U，115200）
+    "realapp": dict(src="realapp.zig", name="realapp_ai8051u", dseg=0x30, cseg=0x0000),
 }
 
 

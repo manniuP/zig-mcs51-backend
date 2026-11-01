@@ -141,6 +141,8 @@ pub const Op = union(enum) {
     load_dir: struct { dst: Byte, addr: u8 },
     /// dst <- xdata mem[addr]（16 位，`mov dptr,#imm` + `movx a,@dptr` + `mov dst,a`）。
     load_xdata: struct { dst: Byte, addr: u16 },
+    /// dptr = _sym（把符号地址装进 DPTR：函数地址当值的起步动作）。
+    lea_dptr_sym: struct { sym: []const u8 },
     /// 压栈/出栈（操作数为直接地址；ISR 现场保存用，`push 0xE0` 合法）。
     push: struct { src: Byte },
     pop: struct { dst: Byte },
@@ -155,6 +157,20 @@ pub const Op = union(enum) {
     load_xdata_idx: struct { dst: Byte, base: u16, idx: Byte, scale: u8 = 1 },
     /// xdata mem[base + idx] <- src（运行期下标）。
     store_xdata_idx: struct { base: u16, idx: Byte, src: Byte, scale: u8 = 1 },
+    /// dst <- xdata mem[_sym + off + idx*scale]（**符号基址** + 运行期下标：全局/静态数组）。
+    /// 发射为 `mov dptr,#_sym` 再 (+off, +idx*scale)（符号由链接器定址，比常量基址多 3 B）。
+    load_xdata_idx_sym: struct { dst: Byte, sym: []const u8, off: u16 = 0, idx: Byte, scale: u8 = 1 },
+    /// xdata mem[_sym + off + idx*scale] <- src。
+    store_xdata_idx_sym: struct { sym: []const u8, off: u16 = 0, idx: Byte, src: Byte, scale: u8 = 1 },
+    /// dst <- xdata mem[_sym + off]（符号基址 + 常量偏移：全局变量的定长访问）。
+    load_xdata_sym: struct { dst: Byte, sym: []const u8, off: u16 = 0 },
+    /// xdata mem[_sym + off] <- src。
+    store_xdata_sym: struct { sym: []const u8, off: u16 = 0, src: Byte },
+    /// dst <- **代码段** mem[_sym + off]：`mov dptr,#_sym` + `clr a` + `movc a,@a+dptr`。
+    /// `const` 表（CRC 表/字模/字符串）就住代码段——8051 的 XRAM 掉电即失，初值无处可装。
+    load_code_sym: struct { dst: Byte, sym: []const u8, off: u16 = 0 },
+    /// dst <- 代码段 mem[_sym + off + idx*scale]（const 表 + 运行期下标）。
+    load_code_idx_sym: struct { dst: Byte, sym: []const u8, off: u16 = 0, idx: Byte, scale: u8 = 1 },
     /// 局部标签定义，供 br/br_ifnz 引用。
     label: u32,
     /// 无条件跳转到标签。

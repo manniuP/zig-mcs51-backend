@@ -12,6 +12,7 @@ const Path = std.Build.Cache.Path;
 
 const Zcu = @import("../Zcu.zig");
 const Type = @import("../Type.zig");
+const Value = @import("../Value.zig");
 const InternPool = @import("../InternPool.zig");
 const Compilation = @import("../Compilation.zig");
 const codegen = @import("../codegen.zig");
@@ -133,6 +134,39 @@ pub fn updateNav(
     var aw: std.Io.Writer.Allocating = .init(gpa);
     defer aw.deinit();
     const w = &aw.writer;
+
+    // `const` + 编译期已知的值 → **放进代码段**（8051 的 RAM 掉电就没了，谁也不会去装载它）。
+    // 这一步是查表类代码（CRC 表、字模、字符串）能用的前提：代码里用 `movc a,@a+dptr` 读。
+    // 可变的 `var` 仍然只占 XSEG 空间（初值无处可装，运行时自己写）。
+    if (resolved.@"const" and resolved.value != .undef) {
+        const val = Value.fromInterned(resolved.value);
+        var buf = gpa.alloc(u8, size) catch return error.OutOfMemory;
+        defer gpa.free(buf);
+        const ok = blk: {
+            val.writeToMemory(zcu, buf) catch break :blk false;
+            break :blk true;
+        };
+        if (ok) {
+            w.print("\t.area CSEG    (CODE)\n", .{}) catch return error.OutOfMemory;
+            w.print("\t.globl {s}\n", .{name}) catch return error.OutOfMemory;
+            w.print("{s}:\n", .{name}) catch return error.OutOfMemory;
+            // 一行 16 字节，可读性 + 汇编行长度都合适
+            var i: usize = 0;
+            while (i < buf.len) : (i += 16) {
+                const end = @min(i + 16, buf.len);
+                w.print("\t.db ", .{}) catch return error.OutOfMemory;
+                for (buf[i..end], 0..) |b, j| {
+                    if (j != 0) w.print(",", .{}) catch return error.OutOfMemory;
+                    w.print("0x{X:0>2}", .{b}) catch return error.OutOfMemory;
+                }
+                w.print("\n", .{}) catch return error.OutOfMemory;
+            }
+            try asx.assembly.appendSlice(gpa, aw.written());
+            return;
+        }
+        // 值取不出来（函数指针/重定位等）→ 退回「只占空间」
+    }
+
     w.print("\t.area XSEG    (XDATA)\n", .{}) catch return error.OutOfMemory;
     w.print("\t.globl {s}\n", .{name}) catch return error.OutOfMemory;
     w.print("{s}:\n", .{name}) catch return error.OutOfMemory;

@@ -38,6 +38,14 @@ REAL_CASES = [
     "sexcmp", "sexcmp2", "sex16", "i32add", "sar32", "sar8",
     "ucmp_eq", "ucmp_gt", "ucmp_lt", "wbits", "shlv", "shrv", "shrv0", "sarv",
     "lt32", "lt32b", "ge8t", "ge8f",
+    # 运行期下标 + 多字节元素（scale=1/2/4；单元素与相邻两元素）
+    "t8rt", "t8pair", "t16rt", "t16pair", "t32rt", "t32pair",
+    # 全局数组的符号基址（mov dptr,#_sym）：常量下标 / 运行期下标 / u8 / 相邻两元素
+    "symconst", "symrt", "symb", "sympair",
+    # 函数指针表：@intFromPtr 填表 + table[i] + @ptrFromInt 间接调用
+    "fpt_all",
+    # const 表（代码段 .db + movc 读）：常量下标 / 运行期下标 / u16 元素
+    "cget2", "cgeti", "wgeti",
 ]
 
 def harness_head(board: str, fosc: float, baud: int) -> str:
