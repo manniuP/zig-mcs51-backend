@@ -420,6 +420,11 @@ CASES: dict[str, dict] = {
                    args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
                    want32=0x12345679),
     # 运行期下标 + 多字节元素（u16 表）；u8 表作对照
+    # 运行期下标 + 多字节元素（u16 表；scale=2）；u8 表作对照
+    "t16rt": dict(kind="call", src="tableidx.zig", fn="t16rt",
+                  args=[("DPL", 3), ("PARM_2", 0x34), ("PARM_3", 0x12)], want16=0x1234),
+    "t8rt": dict(kind="call", src="tableidx.zig", fn="t8rt",
+                 args=[("DPL", 5), ("PARM2", 0xA5)], want=0xA5),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
 }
@@ -437,7 +442,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "lt32", "lt32b", "ge8t", "ge8f",
          "chain", "chain32", "mix32",
          "call_ind", "twice_ind", "call_addr", "dispatch",
-         "wstore", "wround", "wround2", "addone",
+         "wstore", "wround", "wround2", "addone", "t16rt", "t8rt",
          "ringdemo"]
 
 

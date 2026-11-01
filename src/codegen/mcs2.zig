@@ -119,6 +119,8 @@ const Lower = struct {
     /// 本模块是否用到 dptr（取址/解引用）。用到时 arg0（DPL）必须先搬进 vreg：
     /// 0x82 同时是 DPTR 低字节，地址计算会把它踩掉。
     needs_dptr: bool = false,
+    /// MCS2_DUMP_AIR 环境变量：打印 AIR 指令序列（诊断用）。
+    dump_air: bool = false,
 
     /// 存储宽度（**不是**算术宽度）：≤8 位一律 1 字节容器（u1/u5 这类只能当值存放），
     /// 16/32 按宽度。算术闸门仍然是 requireIntWidth（只认 8/16/32），
@@ -962,8 +964,8 @@ const Lower = struct {
             .store_dir => |x| .{ .store_dir = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
             .load_xdata => |x| .{ .load_xdata = .{ .dst = mapByteVreg(x.dst, map), .addr = x.addr } },
             .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
-            .load_xdata_idx => |x| .{ .load_xdata_idx = .{ .dst = mapByteVreg(x.dst, map), .base = x.base, .idx = mapByteVreg(x.idx, map) } },
-            .store_xdata_idx => |x| .{ .store_xdata_idx = .{ .base = x.base, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map) } },
+            .load_xdata_idx => |x| .{ .load_xdata_idx = .{ .dst = mapByteVreg(x.dst, map), .base = x.base, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
+            .store_xdata_idx => |x| .{ .store_xdata_idx = .{ .base = x.base, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map), .scale = x.scale } },
             .br_ifnz => |x| .{ .br_ifnz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
             .br_ifz => |x| .{ .br_ifz = .{ .cond = mapByteVreg(x.cond, map), .target = x.target } },
             .cmp_br => |x| .{ .cmp_br = .{ .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map), .cc = x.cc, .target = x.target } },
@@ -1151,7 +1153,7 @@ const Lower = struct {
             .push => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .push = .{ .src = to } } else null,
             .store_dir => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .store_dir = .{ .addr = x.addr, .src = to } } else null,
             .store_xdata => |x| if (isVregByte(x.src, from)) mcsmir.Op{ .store_xdata = .{ .addr = x.addr, .src = to } } else null,
-            .load_xdata_idx => |x| if (isVregByte(x.idx, from)) mcsmir.Op{ .load_xdata_idx = .{ .dst = x.dst, .base = x.base, .idx = to } } else null,
+            .load_xdata_idx => |x| if (isVregByte(x.idx, from)) mcsmir.Op{ .load_xdata_idx = .{ .dst = x.dst, .base = x.base, .idx = to, .scale = x.scale } } else null,
             .store_xdata_idx => |x| blk: {
                 if (isVregByte(x.idx, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = to, .src = x.src } };
                 if (isVregByte(x.src, from)) break :blk mcsmir.Op{ .store_xdata_idx = .{ .base = x.base, .idx = x.idx, .src = to } };
@@ -1664,6 +1666,12 @@ const Lower = struct {
         }
         const tag = self.air.instructions.items(.tag)[@backingInt(inst)];
         const data = self.air.instructions.items(.data)[@backingInt(inst)];
+        // 函数名以 _airdump 结尾时，把 AIR 指令序列打到 stderr（tag + 关键操作数）。
+        // 改 codegen 前先看这个，比反复加调试打印快得多。
+        if (self.dump_air) {
+            // 只打 tag（不解析载荷）：载荷布局随 tag 不同，硬解析会越界（踩过 panic）。
+            std.debug.print("AIR[{d}] {s}\n", .{ @backingInt(inst), @tagName(tag) });
+        }
         switch (tag) {
             .dbg_stmt, .dbg_empty_stmt, .dbg_inline_block, .dbg_var_ptr, .dbg_var_val, .dbg_arg_inline => {},
 
@@ -1743,6 +1751,11 @@ const Lower = struct {
                         var ety = pty.childType(self.zcu);
                         while (ety.zigTypeTag(self.zcu) == .array) ety = ety.childType(self.zcu);
                         const sc = try self.storageBytes(ety, "下标元素");
+                        if (self.dump_air) std.debug.print("  >> elem scale={d} res={s} ety={s}\n", .{
+                            sc,
+                            @tagName(pty.zigTypeTag(self.zcu)),
+                            @tagName(ety.zigTypeTag(self.zcu)),
+                        });
                         // 常量下标直接折进固定地址（**乘上元素大小**）
                         if (self.constU8(bin.rhs)) |k| {
                             self.ptr_vals[@backingInt(inst)] = .{ .fixed = base + @as(u64, k) * sc };
@@ -2186,10 +2199,14 @@ const Lower = struct {
                             if (base <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
                             if (base > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{base});
                             const idx_loc = try self.refLoc(bin.rhs);
+                            // ptr_elem_val 的指令类型**就是**元素类型 → 宽度即 scale
+                            // （这里 pr 是 .fixed，不能去读 .elem 字段，否则 Debug 下 union 访问 panic）
+                            const sc2 = try self.storageBytes(self.air.typeOfIndex(inst, &self.zcu.intern_pool), "下标元素");
                             try self.ops.append(self.gpa, .{ .load_xdata_idx = .{
                                 .dst = mcsmir.v(r),
                                 .base = @intCast(base),
                                 .idx = idx_loc,
+                                .scale = sc2,
                             } });
                         }
                     },
@@ -2707,6 +2724,8 @@ pub fn generate(
     // 关键：ISR 的尾声（pop + reti）靠这个字段判定；漏赋值会让 ISR 以 `ret` 结束、
     // 且不恢复现场（栈上留下 4 字节，打断主程序后必错）。
     lw.is_isr = is_isr;
+    // 诊断开关：函数名以 _airdump 结尾 → 打印该函数的 AIR 序列（配合 PE 的 _fold 命名约定）。
+    lw.dump_air = std.mem.indexOf(u8, short_name, "airdump") != null;
 
     if (is_isr and !no_isr_save) {
         // 现场保存：A/PSW/DPTR（M1 指令集用到的全部硬件寄存器；B 未用）。
