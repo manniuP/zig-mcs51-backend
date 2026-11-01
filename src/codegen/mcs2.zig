@@ -94,6 +94,9 @@ const PtrRef = union(enum) {
     code_elem_sym: struct { sym: []const u8, off: u64 = 0, idx: Loc, scale: u8 = 1 },
 };
 
+/// 带返回值块的结果槽：`inst` 是块指令，`base/width` 是 DSEG 槽。
+const BlockSlot = struct { inst: Air.Inst.Index, base: u8, width: u8 };
+
 /// M1 的线性降级器。不做活跃分析：`.arg` 原地用 ABI 寄存器（零序言），
 /// 双目结果默认落新 vreg，唯一的单消费者优化是「ret 前看一眼」——
 /// 结果直接写 DPL，省一次 vreg 往返（`add8` 预算内的关键一招）。
@@ -132,6 +135,9 @@ const Lower = struct {
     const_lines: std.ArrayListUnmanaged(u8) = .empty,
     const_seen: [16]?struct { idx: InternPool.Index, sym: []const u8 } = @splat(null),
     const_n: usize = 0,
+    /// 带返回值的块（`if`/`switch` 表达式）：块结果槽 = **内存 phi**。
+    /// 每条跳向该块的 `br` 把值写进槽，块尾标签之后读槽当结果。
+    block_slots: std.ArrayListUnmanaged(BlockSlot) = .empty,
     /// arg2 是否落在 B 寄存器（0xF0）。MUL/DIV 会破坏 B，用到时要保存/恢复。
     b_is_arg: bool = false,
     /// 本模块是否用到 dptr（取址/解引用）。用到时 arg0（DPL）必须先搬进 vreg：
@@ -384,13 +390,17 @@ const Lower = struct {
         return false;
     }
 
-    /// 编译期 u8 常量（用于把常量下标折进固定地址）。
+    /// 编译期 u8 常量（用于把常量下标折进固定地址、switch 的 case 值）。
+    /// 也认 **enum 值**（`switch (e) { .start => … }` 的 case 项是 enum 标签）。
     fn constU8(self: *Lower, ref: Air.Inst.Ref) ?u8 {
         const ip_index = ref.toInterned() orelse return null;
-        const key = self.zcu.intern_pool.indexToKey(ip_index);
+        const ip = &self.zcu.intern_pool;
+        var key = ip.indexToKey(ip_index);
+        if (key == .enum_tag) key = ip.indexToKey(key.enum_tag.int);
         return switch (key) {
             .int => |int| switch (int.storage) {
                 .u64 => |v| if (v <= 0xFF) @as(u8, @intCast(v)) else null,
+                .i64 => |v| if (v >= 0 and v <= 0xFF) @as(u8, @intCast(v)) else null,
                 else => null,
             },
             else => null,
@@ -784,6 +794,96 @@ const Lower = struct {
         const l = session_temp_base;
         session_temp_base += 1;
         return l;
+    }
+
+    /// 这个块是否有结果槽（带返回值的块）；没有就是普通块。
+    fn slotForBlock(self: *Lower, blk: Air.Inst.Index) ?BlockSlot {
+        for (self.block_slots.items) |s| if (s.inst == blk) return s;
+        return null;
+    }
+
+    /// `switch` 降级成「比较链 + 各分支体」：
+    ///   判定值 == 某个 case 项（或落在某个范围）→ 跳到该分支体；都不中就执行 else 体。
+    /// 分支体末尾统一跳到 switch 结束标签（体自己终结的除外）。
+    /// 现在只支持 **1 字节判定值**（u8 / ≤256 的 enum）——命令分派就是这个形状。
+    fn emitSwitch(self: *Lower, inst: Air.Inst.Index) codegen.Error!void {
+        const us = self.air.unwrapSwitch(inst);
+        const cond_ty = self.air.typeOf(us.operand, &self.zcu.intern_pool);
+        const n = try self.storageBytes(cond_ty, "switch 判定值");
+        if (n != 1) return self.fail("switch 的判定值暂时只支持 8 位（u8 / ≤256 的 enum）", .{});
+        const cond = try self.refLoc(us.operand);
+
+        const CaseRec = struct {
+            label: u32,
+            items: []const Air.Inst.Ref,
+            ranges: []const [2]Air.Inst.Ref,
+            body: []const Air.Inst.Index,
+        };
+        var cases: std.ArrayListUnmanaged(CaseRec) = .empty;
+        defer cases.deinit(self.gpa);
+
+        var it = us.iterateCases();
+        while (it.next()) |c| {
+            try cases.append(self.gpa, .{
+                .label = self.tempLabel(),
+                .items = c.items,
+                .ranges = c.ranges,
+                .body = c.body,
+            });
+        }
+        const else_body = it.elseBody();
+        const end_l = self.tempLabel();
+
+        // ① 比较链
+        for (cases.items) |c| {
+            for (c.items) |item| {
+                const v = self.constU8(item) orelse
+                    return self.fail("switch 的 case 值必须是 8 位以内的整数常量", .{});
+                try self.ops.append(self.gpa, .{ .cmp_br = .{
+                    .lhs = cond,
+                    .rhs = .{ .imm = v },
+                    .cc = .eq,
+                    .target = c.label,
+                } });
+            }
+            for (c.ranges) |r| {
+                const lo = self.constU8(r[0]) orelse
+                    return self.fail("switch 的 case 范围必须是 8 位以内的整数常量", .{});
+                const hi = self.constU8(r[1]) orelse
+                    return self.fail("switch 的 case 范围必须是 8 位以内的整数常量", .{});
+                // cond < lo → 跳过这个范围；再 cond <= hi → 命中
+                const skip = self.tempLabel();
+                try self.ops.append(self.gpa, .{ .cmp_br = .{
+                    .lhs = cond,
+                    .rhs = .{ .imm = lo },
+                    .cc = .lt,
+                    .target = skip,
+                } });
+                try self.ops.append(self.gpa, .{ .cmp_br = .{
+                    .lhs = cond,
+                    .rhs = .{ .imm = hi },
+                    .cc = .le,
+                    .target = c.label,
+                } });
+                try self.ops.append(self.gpa, .{ .label = skip });
+            }
+        }
+
+        // ② else 分支（没写 else 就直接落到结束）
+        if (else_body.len != 0) {
+            const term = try self.emitBody(else_body);
+            if (!term) try self.ops.append(self.gpa, .{ .br = end_l });
+        } else {
+            try self.ops.append(self.gpa, .{ .br = end_l });
+        }
+
+        // ③ 各分支体
+        for (cases.items) |c| {
+            try self.ops.append(self.gpa, .{ .label = c.label });
+            const term = try self.emitBody(c.body);
+            if (!term) try self.ops.append(self.gpa, .{ .br = end_l });
+        }
+        try self.ops.append(self.gpa, .{ .label = end_l });
     }
 
     fn ccOf(tag: Air.Inst.Tag) ?mcsmir.Cc {
@@ -2355,7 +2455,11 @@ const Lower = struct {
 
             .alloc => {
                 // M1：每个局部槽一个 vreg（DSEG 直址）；活跃期优化留给后续 pass。
-                const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                // **注意 `.alloc` 的指令类型是指针**（`*T`），要取子类型才算得对宽度——
+                // 以前直接把指针类型喂给 storageBytes，非 int 一律返回 1，于是 `var x: u16`
+                // 只分到 1 个槽，之后 2 字节的 store 把**下一个局部量**的槽踩掉。
+                const ty_raw = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
+                const ty = if (ty_raw.zigTypeTag(self.zcu) == .pointer) ty_raw.childType(self.zcu) else ty_raw;
                 const n = try self.storageBytes(ty, "局部量");
                 const base = try self.allocWide(n);
                 self.vals[@backingInt(inst)] = mcsmir.v(base);
@@ -2562,7 +2666,17 @@ const Lower = struct {
 
             .br => {
                 // break / 跳块：目标 = 该块定义指令的“出口”标签。
-                try self.ops.append(self.gpa, .{ .br = self.blockEnd(data.br.block_inst) });
+                const br = data.br;
+                // 带值的 br（if/switch 表达式）：先把值写进目标块的结果槽（内存 phi）。
+                if (self.slotForBlock(br.block_inst)) |slot| {
+                    if (self.air.typeOf(br.operand, &self.zcu.intern_pool).zigTypeTag(self.zcu) != .void) {
+                        const n = slot.width;
+                        const src = try self.wideOperand(br.operand, n);
+                        var k: u8 = 0;
+                        while (k < n) : (k += 1) try self.movTo(slot.base + k, mcsmir.v(src + k));
+                    }
+                }
+                try self.ops.append(self.gpa, .{ .br = self.blockEnd(br.block_inst) });
                 return true;
             },
             .repeat => {
@@ -2574,6 +2688,10 @@ const Lower = struct {
                 try self.emitCondBr(inst);
                 return true;
             },
+            // switch（含 while(true) switch 的 loop 形态）：比较链降级，见 emitSwitch。
+            .switch_br, .loop_switch_br => {
+                try self.emitSwitch(inst);
+            },
             .loop => {
                 const blk = self.air.unwrapBlock(inst);
                 try self.ops.append(self.gpa, .{ .label = self.blockHead(inst) });
@@ -2584,11 +2702,20 @@ const Lower = struct {
                 try self.ops.append(self.gpa, .{ .label = end_l });
             },
             .block => {
-                // 带返回值的块（if (c) 1 else 0 这类表达式）需要 phi 语义，
-                // 目前不支持——明确拒绝，别让 refLoc 报「内部错误」。
+                // 带返回值的块 = `if`/`switch` 表达式。用**内存 phi** 降级：
+                // 块结果先分一个槽，每条跳向本块的 `br` 把值写进槽，块尾读槽当结果。
+                // （不需要 phi 结点、也不需要活跃期分析——和本后端「值都在静态槽」一致。）
                 const blk_ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 if (blk_ty.zigTypeTag(self.zcu) != .void) {
-                    return self.fail("if 表达式/块返回值尚未实现：改写成 var x: u8 加 if 语句形式", .{});
+                    const n = try self.storageBytes(blk_ty, "块返回值");
+                    const base: u8 = if (n > 1) try self.allocWide(n) else try self.allocVreg();
+                    try self.block_slots.append(self.gpa, .{ .inst = inst, .base = base, .width = n });
+                    const blk_v = self.air.unwrapBlock(inst);
+                    _ = try self.emitBody(blk_v.body);
+                    try self.ops.append(self.gpa, .{ .label = self.blockEnd(inst) });
+                    self.vals[@backingInt(inst)] = mcsmir.v(base);
+                    if (n > 1) self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, n) << 8);
+                    continue;
                 }
                 const blk = self.air.unwrapBlock(inst);
                 const inner = try self.emitBody(blk.body);
@@ -2732,14 +2859,15 @@ const Lower = struct {
                     const base = bases[ai];
                     var k: u8 = 0;
                     while (k < an) : (k += 1) {
+                        // 调用点也要写被调方的 PARM 符号：名字进符号池（同一名字只留一份，
+                        // 结束时统一释放）——以前这里直接 allocPrint 后扔掉，每次调用漏一份。
+                        const psym = try std.fmt.allocPrint(self.gpa, "_{s}_PARM_{d}", .{ short, spill + k });
+                        defer self.gpa.free(psym);
+                        const kept = self.internSym(psym) orelse return error.OutOfMemory;
                         const dst: mcsmir.Byte = if (ai == 0)
                             .{ .dir = mcsmir.abi.arg_regs[k] }
                         else
-                            .{ .sym = try std.fmt.allocPrint(
-                                self.gpa,
-                                "_{s}_PARM_{d}",
-                                .{ short, spill + k },
-                            ) };
+                            .{ .sym = kept };
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = dst, .src = mcsmir.v(base + k) } });
                     }
                     if (ai > 0) spill += an;
@@ -2918,6 +3046,7 @@ pub fn generate(
         lw.sym_pool.deinit(gpa);
     }
     defer lw.const_lines.deinit(gpa);
+    defer lw.block_slots.deinit(gpa);
 
     const body = air.getMainBody();
     lw.vals = try gpa.alloc(?Loc, air.instructions.len);

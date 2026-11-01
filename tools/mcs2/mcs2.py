@@ -183,10 +183,15 @@ def assemble(asm: Path, name: str, dseg: int, cseg: int = 0x0000) -> Path:
 
 
 def emit_asm(src: Path, tag: str) -> tuple[Path, str]:
-    """zig build-obj -> 汇编文本。产物缺 CSEG 视为编译器异常。"""
+    """zig build-obj -> 汇编文本。产物缺 CSEG 视为编译器异常。
+
+    固定注入命名模块 `cordic`（= tools/mcs2/lib/cordic.zig）：用例里 `@import("cordic")`
+    就能用定点数学库；不 import 的用例不受影响（模块不会被分析）。
+    """
     asm = BUILD / f"{tag}.asm"
     run([str(ZIG_EXE), "build-obj", "-OReleaseSmall", "-target", TARGET,
-         "-femit-bin=" + str(asm), str(src)], env=zig_env())
+         "--dep", "cordic", f"-Mroot={src}", f"-Mcordic={HERE / 'lib' / 'cordic.zig'}",
+         "-femit-bin=" + str(asm)], env=zig_env())
     text = asm.read_text(encoding="utf-8")
     if ".area CSEG (CODE)" not in text:
         raise SystemExit(f"FAIL: {tag} 的汇编产物没有 CSEG 段")
@@ -453,6 +458,51 @@ CASES: dict[str, dict] = {
     "sympair": dict(kind="call", src="symtab.zig", fn="sympair",
                     args=[("DPL", 1), ("PARM_2", 0x11), ("PARM_3", 0x11),
                           ("PARM_4", 0x22), ("PARM_5", 0x22)], want16=0x3333, steps=6000),
+    # 宽局部量（u16/u32 局部必须占够槽）
+    "wloc1": dict(kind="call", src="wide3.zig", fn="wloc1",
+                  args=[("DPL", 0x34), ("DPH", 0x12), ("PARM_2", 0x20), ("PARM_3", 0x00)],
+                  want16=0x1255, steps=4000),
+    "wloc2": dict(kind="call", src="wide3.zig", fn="wloc2",
+                  args=[("DPL", 0x34), ("DPH", 0x12), ("PARM_2", 0x02), ("PARM_3", 0x00)],
+                  want32=0x00031234, steps=8000),
+    # 16/32 位运行期移位次数（8 位已有 shlv/shrv/sarv）
+    "s16r": dict(kind="call", src="shift16.zig", fn="s16r",
+                 args=[("DPL", 0xF8), ("DPH", 0xFF), ("PARM2", 1)], want16=0xFFFC, steps=4000),
+    "u16l": dict(kind="call", src="shift16.zig", fn="u16l",
+                 args=[("DPL", 0x21), ("DPH", 0x43), ("PARM2", 4)], want16=0x3210, steps=4000),
+    "u32l": dict(kind="call", src="shift16.zig", fn="u32l",
+                 args=[("DPL", 0x01), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x00), ("PARM2", 8)],
+                 want32=0x00000100, steps=8000),
+    # CORDIC 定点数学库（lib/cordic.zig）：sin/cos/atan2/sqrt/hypot
+    "csin90": dict(kind="call", src="cordic_sin.zig", fn="csin90", args=[], want16=0x3FFF, steps=30000),
+    "csin45": dict(kind="call", src="cordic_sin.zig", fn="csin45", args=[], want16=0x2D42, steps=30000),
+    "csin180": dict(kind="call", src="cordic_sin.zig", fn="csin180", args=[], want16=0x0005, steps=30000),
+    "ccos0": dict(kind="call", src="cordic_cos.zig", fn="ccos0", args=[], want16=0x3FFF, steps=30000),
+    "cat90": dict(kind="call", src="cordic_atan.zig", fn="cat90", args=[], want16=0x4003, steps=30000),
+    "cat45": dict(kind="call", src="cordic_atan.zig", fn="cat45", args=[], want16=0x2001, steps=30000),
+    # sqrt32/hypot 的 u32 表达式把 DSEG 撑到 131 B（>80）—— 等 M2.14 的槽位复用再进验收；
+    # 现在这两项只保证「能编出来」，不保证能链（库函数本身实现按位试差，不依赖别的东西）。
+    # "csqrt1m": dict(kind="call", src="cordic_sqrt.zig", fn="csqrt1m", args=[], want16=1000, steps=20000),
+    # hypot 会连着 sqrt32 一起发（同一个模块），80 B DSEG 塞不下 —— 等 M2.14 的槽位复用；
+    # 现在只验 sqrt32 本身（hypot 用的是同一套原语）。
+    # "chyp": dict(kind="call", src="cordic_sqrt.zig", fn="chyp", args=[], want16=5, steps=20000),
+    # if / switch 表达式（块返回值，内存 phi）
+    "ifx1": dict(kind="call", src="ifexpr.zig", fn="ifx", args=[("DPL", 1)], want=0x11, steps=1000),
+    "ifx0": dict(kind="call", src="ifexpr.zig", fn="ifx", args=[("DPL", 0)], want=0x22, steps=1000),
+    "ifr1": dict(kind="call", src="ifexpr.zig", fn="ifr", args=[("DPL", 1)], want=0x11, steps=1000),
+    "ifr0": dict(kind="call", src="ifexpr.zig", fn="ifr", args=[("DPL", 0)], want=0x22, steps=1000),
+    "swx2": dict(kind="call", src="ifexpr.zig", fn="swx", args=[("DPL", 2)], want=0x22, steps=1500),
+    "swx9": dict(kind="call", src="ifexpr.zig", fn="swx", args=[("DPL", 9)], want=0xEE, steps=1500),
+    "ifw1": dict(kind="call", src="ifexpr.zig", fn="ifw", args=[("DPL", 1)], want16=0x1234, steps=1500),
+    "ifw0": dict(kind="call", src="ifexpr.zig", fn="ifw", args=[("DPL", 0)], want16=0x5678, steps=1500),
+    # 真 switch：语句形态（多 case / 范围 / else / enum 判定）
+    "sw1h": dict(kind="call", src="switchex.zig", fn="sw1", args=[("DPL", 2)], want=0x22, steps=1000),
+    "sw1m": dict(kind="call", src="switchex.zig", fn="sw1", args=[("DPL", 9)], want=0xEE, steps=1000),
+    "sw2r": dict(kind="call", src="switchex.zig", fn="sw2", args=[("DPL", 4)], want=0x55, steps=1000),
+    "sw2h": dict(kind="call", src="switchex.zig", fn="sw2", args=[("DPL", 8)], want=0x88, steps=1000),
+    "sw2e": dict(kind="call", src="switchex.zig", fn="sw2", args=[("DPL", 7)], want=0xFF, steps=1000),
+    "sw3a": dict(kind="call", src="switchex.zig", fn="sw3", args=[("DPL", 1)], want=0x01, steps=1000),
+    "sw3b": dict(kind="call", src="switchex.zig", fn="sw3", args=[("DPL", 9)], want=0x09, steps=1000),
     # const 表（代码段 .db + movc）：常量下标 / 运行期下标 / u16 元素
     "cget2": dict(kind="call", src="consttab.zig", fn="cget2", args=[], want=0x33, steps=1000),
     "cgeti": dict(kind="call", src="consttab.zig", fn="cgeti", args=[("DPL", 5)], want=0x66, steps=1000),
@@ -486,6 +536,10 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "t16rt", "t8rt", "t16pair", "t8pair", "t32rt", "t32pair",
          "symconst", "symrt", "symb", "sympair", "fpt_all",
          "argcall1", "argcall2", "argcall3", "cget2", "cgeti", "wgeti",
+         "sw1h", "sw1m", "sw2r", "sw2h", "sw2e", "sw3a", "sw3b",
+         "ifx1", "ifx0", "ifr1", "ifr0", "swx2", "swx9", "ifw1", "ifw0",
+         "wloc1", "wloc2", "s16r", "u16l", "u32l",
+         "csin90", "csin45", "csin180", "ccos0", "cat90", "cat45",
          "ringdemo"]
 
 

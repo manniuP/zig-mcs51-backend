@@ -46,6 +46,12 @@ REAL_CASES = [
     "fpt_all",
     # const 表（代码段 .db + movc 读）：常量下标 / 运行期下标 / u16 元素
     "cget2", "cgeti", "wgeti",
+    # 真 switch / if·switch 表达式 / 宽局部量 / 16-32 位运行期移位
+    "sw1h", "sw1m", "sw2r", "sw2h", "sw2e", "sw3a", "sw3b",
+    "ifx1", "ifx0", "ifr1", "ifr0", "swx2", "swx9", "ifw1", "ifw0",
+    "wloc1", "wloc2", "s16r", "u16l", "u32l",
+    # CORDIC 定点数学库（lib/cordic.zig）
+    "csin90", "csin45", "csin180", "ccos0", "cat90", "cat45",
 ]
 
 def harness_head(board: str, fosc: float, baud: int) -> str:
