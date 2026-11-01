@@ -138,6 +138,13 @@ const Lower = struct {
     /// 带返回值的块（`if`/`switch` 表达式）：块结果槽 = **内存 phi**。
     /// 每条跳向该块的 `br` 把值写进槽，块尾标签之后读槽当结果。
     block_slots: std.ArrayListUnmanaged(BlockSlot) = .empty,
+    /// 槽位池：`slot_used[v]` = 该槽当前被占用。**只在函数内部复用「临时操作数槽」**
+    /// （`wideOperand` 为了把操作数摆成连续槽而拷的那几份）——它们在本条 AIR 指令内
+    /// 就死了，复用绝对不会错。指令结果的槽仍然一人一个（真正的活跃期分析留 M2.14 后续）。
+    slot_used: [256]bool = @splat(false),
+    /// 本条指令里分配的可回收槽段（flushTemps 时归还）
+    temp_runs: [24]struct { base: u8, n: u8 } = @splat(.{ .base = 0, .n = 0 }),
+    temp_n: u8 = 0,
     /// arg2 是否落在 B 寄存器（0xF0）。MUL/DIV 会破坏 B，用到时要保存/恢复。
     b_is_arg: bool = false,
     /// 本模块是否用到 dptr（取址/解引用）。用到时 arg0（DPL）必须先搬进 vreg：
@@ -462,14 +469,87 @@ const Lower = struct {
         return self.wide[@backingInt(idx)];
     }
 
-    fn allocWide(self: *Lower, n: u8) !u8 {
-        var base: u8 = 0;
-        var i: u8 = 0;
-        while (i < n) : (i += 1) {
-            const v = try self.allocVreg();
-            self.wide_blk[v] = true;
-            if (i == 0) base = v;
+    /// 分配 n 个**连续**槽。temp=true 表示「本条指令用完就还」。
+    fn allocSlots(self: *Lower, n: u8, temp: bool) !u8 {
+        var base: u16 = 0;
+        while (base + n <= self.nregs) : (base += 1) {
+            var k: u8 = 0;
+            var ok = true;
+            while (k < n) : (k += 1) {
+                if (self.slot_used[@intCast(base + k)]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) continue;
+            k = 0;
+            while (k < n) : (k += 1) {
+                self.slot_used[@intCast(base + k)] = true;
+                self.wide_blk[@intCast(base + k)] = false;
+            }
+            if (temp) self.recordTemp(@intCast(base), n);
+            return @intCast(base);
         }
+        // 池里没有合适的连续段 → 从高水位往上扩
+        const b = self.nregs;
+        if (@as(u16, b) + n > 255) return self.fail("帧寄存器耗尽（M1 限制 255）", .{});
+        var k2: u8 = 0;
+        while (k2 < n) : (k2 += 1) {
+            self.slot_used[@intCast(@as(u16, b) + k2)] = true;
+            self.wide_blk[@intCast(@as(u16, b) + k2)] = false;
+        }
+        self.nregs = @intCast(@as(u16, b) + n);
+        if (temp) self.recordTemp(b, n);
+        return b;
+    }
+
+    fn recordTemp(self: *Lower, base: u8, n: u8) void {
+        if (self.temp_n >= self.temp_runs.len) return;
+        self.temp_runs[self.temp_n] = .{ .base = base, .n = n };
+        self.temp_n += 1;
+    }
+
+    /// 把本条指令的临时槽还回池里（`emitBody` 每条指令结束时调用）。
+    /// `keep` = 本条指令的结果槽：有些指令直接把 `wideOperand` 拷出来的那份**当结果**
+    /// （`.ptr_from_int`/`.int_cast` 这类恒等转换），那一段必须留着，否则结果立刻被复写。
+    fn flushTempsKeep(self: *Lower, keep: ?u8) void {
+        var i: u8 = 0;
+        while (i < self.temp_n) : (i += 1) {
+            const r = self.temp_runs[i];
+            if (keep) |kv| {
+                if (kv >= r.base and kv < r.base +% r.n) continue;
+            }
+            var k: u8 = 0;
+            while (k < r.n) : (k += 1) {
+                self.slot_used[@intCast(@as(u16, r.base) + k)] = false;
+                self.wide_blk[@intCast(@as(u16, r.base) + k)] = false;
+            }
+        }
+        self.temp_n = 0;
+    }
+
+    /// 这条指令的结果槽（不是 vreg 就没有）。
+    fn resultSlot(self: *Lower, inst: Air.Inst.Index) ?u8 {
+        const v = self.vals[@backingInt(inst)] orelse return null;
+        return switch (v) {
+            .vreg => |x| x,
+            else => null,
+        };
+    }
+
+    /// 一块连续槽（函数结果的槽，不回收）
+    fn allocWide(self: *Lower, n: u8) !u8 {
+        const base = try self.allocSlots(n, false);
+        var i: u8 = 0;
+        while (i < n) : (i += 1) self.wide_blk[base + i] = true;
+        return base;
+    }
+
+    /// 只在本条指令内有效的连续槽（`wideOperand` 的拷贝）。
+    fn allocTempWide(self: *Lower, n: u8) !u8 {
+        const base = try self.allocSlots(n, true);
+        var i: u8 = 0;
+        while (i < n) : (i += 1) self.wide_blk[base + i] = true;
         return base;
     }
 
@@ -702,14 +782,15 @@ const Lower = struct {
             const base: u8 = @truncate(w & 0xFF);
             const wn: u8 = @truncate(w >> 8);
             if (wn == n) return base;
-            const dst = try self.allocWide(n);
+            // 变宽拷出来的这份是**临时**：本条指令用完就还池（emitBody 每条指令 flush）
+            const dst = try self.allocTempWide(n);
             var i: u8 = 0;
             while (i < wn and i < n) : (i += 1) try self.movTo(dst + i, mcsmir.v(base + i));
             if (wn < n) try self.fillHigh(dst, wn, n, base + (wn - 1), sgn);
             return dst;
         }
         if (self.constWide(ref)) |v| {
-            const dst = try self.allocWide(n);
+            const dst = try self.allocTempWide(n);
             var i: u8 = 0;
             while (i < n) : (i += 1) {
                 const b: u8 = @truncate(v >> @intCast(8 * @as(u32, i)));
@@ -719,7 +800,7 @@ const Lower = struct {
         }
         // 单字节值（u8/i8 提升到 16/32 位）：低字节搬过去，高位按符号性补。
         const loc = try self.refLoc(ref);
-        const dst = try self.allocWide(n);
+        const dst = try self.allocTempWide(n);
         try self.movTo(dst, loc);
         try self.fillHigh(dst, 1, n, dst, sgn);
         return dst;
@@ -730,11 +811,7 @@ const Lower = struct {
     }
 
     fn allocVreg(self: *Lower) !u8 {
-        const total = session_vreg_base +| self.nregs;
-        if (total == 255) return self.fail("帧寄存器耗尽（M1 限制 255）", .{});
-        const r = self.nregs;
-        self.nregs += 1;
-        return r;
+        return self.allocSlots(1, false);
     }
 
     fn typeIsU8(self: *Lower, ty: Type) bool {
@@ -1303,7 +1380,172 @@ const Lower = struct {
         };
     }
 
+
+    /// M2.14 切片 1：**基本块内的槽位复用**。
+    /// 每个值原本独占一个（或一段连续）槽位；这里把「定义点到最后一次读都落在同一个
+    /// 基本块内」（中间没有标签/跳转）的值，在它死之后把槽位让给后面的值。
+    /// 跨标签/循环/分支的值一律**钉住**（不复用）——循环体内部的直线段仍然可复用，
+    /// 因为下一轮会重新执行定义。
+    fn reuseSlots(self: *Lower) void {
+        const ops = self.ops.items;
+        const n_ops = ops.len;
+        if (n_ops == 0 or self.nregs == 0) return;
+        const nv: usize = self.nregs;
+
+        var def_at: [256]?usize = @splat(null);
+        var last_read: [256]?usize = @splat(null);
+        for (ops, 0..) |op, i| {
+            var v: usize = 0;
+            while (v < nv) : (v += 1) {
+                const b: u8 = @intCast(v);
+                if (writesVregOp(op, b) and def_at[v] == null) def_at[v] = i;
+                if (readsVreg(op, b)) last_read[v] = i;
+            }
+        }
+
+        // 基本块边界：这些 op 之后不允许跨值复用
+        const is_boundary = struct {
+            fn f(o: mcsmir.Op) bool {
+                return switch (o) {
+                    .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .br_c, .ret, .reti, .halt, .lcall, .lcall_ind => true,
+                    else => false,
+                };
+            }
+        }.f;
+
+        // 把「连续 wide_blk」的槽并成一组（多字节块必须整段连着搬）
+        var group_of: [256]u16 = @splat(0xFFFF);
+        var group_base: [256]u8 = @splat(0);
+        var group_len: [256]u8 = @splat(1);
+        var n_groups: usize = 0;
+        var v: usize = 0;
+        while (v < nv) {
+            var len: usize = 1;
+            if (self.wide_blk[v]) {
+                while (v + len < nv and self.wide_blk[v + len]) len += 1;
+            }
+            group_base[n_groups] = @intCast(v);
+            group_len[n_groups] = @intCast(len);
+            var k: usize = 0;
+            while (k < len) : (k += 1) group_of[v + k] = @intCast(n_groups);
+            n_groups += 1;
+            v += len;
+        }
+
+        // 逐组：定义点 = 组内最早，死亡点 = 组内最晚读；中间有边界就钉住
+        var g_def: [256]usize = @splat(n_ops);
+        var g_die: [256]usize = @splat(0);
+        var g_pin: [256]bool = @splat(false);
+        v = 0;
+        while (v < nv) : (v += 1) {
+            const g = group_of[v];
+            if (def_at[v]) |d| {
+                if (d < g_def[g]) g_def[g] = d;
+            }
+            if (last_read[v]) |l| {
+                if (l > g_die[g]) g_die[g] = l;
+            }
+        }
+        var g: usize = 0;
+        while (g < n_groups) : (g += 1) {
+            if (g_def[g] >= n_ops) {
+                g_pin[g] = true;
+                continue;
+            }
+            var i: usize = g_def[g] + 1;
+            while (i < g_die[g] and i < n_ops) : (i += 1) {
+                if (is_boundary(ops[i])) {
+                    g_pin[g] = true;
+                    break;
+                }
+            }
+        }
+
+        // 分配：按 op 顺序推进，槽位在组死亡后释放
+        var new_of_group: [256]u8 = @splat(0);
+        var slot_free: [256]bool = @splat(true);
+        var slot_die: [256]usize = @splat(0);
+        var hi: usize = 0;
+        var pin_hi: usize = 0;
+        i_loop: {
+            var i: usize = 0;
+            while (i < n_ops) : (i += 1) {
+                // 释放已经死掉的槽位
+                var s: usize = 0;
+                while (s < hi) : (s += 1) {
+                    if (!slot_free[s] and slot_die[s] <= i) slot_free[s] = true;
+                }
+                // 看看有没有组在这一条 op 上出生
+                g = 0;
+                while (g < n_groups) : (g += 1) {
+                    if (g_def[g] != i) continue;
+                    const len = group_len[g];
+                    if (g_pin[g]) {
+                        // 钉住的组：永远放在水线之上
+                        if (pin_hi + len > 255) break :i_loop;
+                        new_of_group[g] = @intCast(pin_hi);
+                        s = pin_hi;
+                        while (s < pin_hi + len) : (s += 1) {
+                            slot_free[s] = false;
+                            slot_die[s] = n_ops;
+                        }
+                        pin_hi += len;
+                        if (pin_hi > hi) hi = pin_hi;
+                    } else {
+                        var base: usize = 0;
+                        var found = false;
+                        while (base + len <= hi) : (base += 1) {
+                            var ok = true;
+                            var k: usize = 0;
+                            while (k < len) : (k += 1) {
+                                if (!slot_free[base + k]) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if (ok) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (!found) base = hi;
+                        if (base + len > 255) break :i_loop;
+                        new_of_group[g] = @intCast(base);
+                        s = base;
+                        while (s < base + len) : (s += 1) {
+                            slot_free[s] = false;
+                            slot_die[s] = if (g_die[g] > i) g_die[g] else i;
+                        }
+                        if (base + len > hi) hi = base + len;
+                    }
+                }
+            }
+        }
+
+        if (hi == 0 or hi > 255) return;
+        // 没缩水就别改（也避免把 assignRegisters 的既有结论打散）
+        if (hi >= nv) return;
+
+        var map: [256]?u8 = undefined;
+        @memset(&map, null);
+        v = 0;
+        while (v < nv) : (v += 1) {
+            const gg = group_of[v];
+            map[v] = new_of_group[gg] + @as(u8, @intCast(v - group_base[gg]));
+        }
+        for (self.ops.items) |*op| op.* = mapOpVregs(op.*, &map);
+        // 重建 wide_blk（按新编号）
+        self.wide_blk = @splat(false);
+        g = 0;
+        while (g < n_groups) : (g += 1) {
+            if (group_len[g] < 2) continue;
+            var k: u8 = 0;
+            while (k < group_len[g]) : (k += 1) self.wide_blk[new_of_group[g] + k] = true;
+        }
+        self.nregs = @intCast(hi);
+    }
     fn assignRegisters(self: *Lower) void {
+
         if (self.is_isr) return;
         for (self.ops.items) |op| switch (op) {
             .push, .pop => return,
@@ -1403,7 +1645,45 @@ const Lower = struct {
         };
     }
 
+
+    /// 这条 op 是否**写**某个 vreg（`dst`/`pop`/`dec_br_nz` 等）。与 readsVreg 对称。
+    fn writesVregOp(op: mcsmir.Op, r: u8) bool {
+        return switch (op) {
+            .add => |x| isVregByte(x.dst, r),
+            .sub => |x| isVregByte(x.dst, r),
+            .and_ => |x| isVregByte(x.dst, r),
+            .or_ => |x| isVregByte(x.dst, r),
+            .xor_ => |x| isVregByte(x.dst, r),
+            .mul => |x| isVregByte(x.dst, r),
+            .div_ => |x| isVregByte(x.dst, r),
+            .rem_ => |x| isVregByte(x.dst, r),
+            .not_ => |x| isVregByte(x.dst, r),
+            .addc => |x| isVregByte(x.dst, r),
+            .subb => |x| isVregByte(x.dst, r),
+            .rlc => |x| isVregByte(x.dst, r),
+            .rrc => |x| isVregByte(x.dst, r),
+            .shl => |x| isVregByte(x.dst, r),
+            .shr => |x| isVregByte(x.dst, r),
+            .mov => |x| isVregByte(x.dst, r),
+            .imm => |x| isVregByte(x.dst, r),
+            .load_dir => |x| isVregByte(x.dst, r),
+            .load_xdata => |x| isVregByte(x.dst, r),
+            .load_xdata_idx => |x| isVregByte(x.dst, r),
+            .load_xdata_idx_sym => |x| isVregByte(x.dst, r),
+            .load_xdata_sym => |x| isVregByte(x.dst, r),
+            .load_code_sym => |x| isVregByte(x.dst, r),
+            .load_code_idx_sym => |x| isVregByte(x.dst, r),
+            .pop => |x| isVregByte(x.dst, r),
+            .dec_br_nz => |x| isVregByte(x.dst, r),
+            .dec => |v| v == r,
+            .mul16 => |x| isVregByte(x.lo, r) or isVregByte(x.hi, r),
+            .sex => |x| isVregByte(x.dst, r),
+            .lcall_ind => |x| isVregByte(x.save, r),
+            else => false,
+        };
+    }
     fn readCountVreg(ops: []const mcsmir.Op, r: u8) usize {
+
         var n: usize = 0;
         for (ops) |op| if (readsVreg(op, r)) {
             n += 1;
@@ -2009,6 +2289,9 @@ const Lower = struct {
                 continue;
             }
         }
+        // 每条 AIR 指令结束时把「临时操作数槽」还回池里（结果槽不还）。
+        // `continue` / `return` 都会跑到这个 defer，所以各分支不用各自记得清。
+        defer self.flushTempsKeep(self.resultSlot(inst));
         const tag = self.air.instructions.items(.tag)[@backingInt(inst)];
         const data = self.air.instructions.items(.data)[@backingInt(inst)];
         // 函数名以 _airdump 结尾时，把 AIR 指令序列打到 stderr（tag + 关键操作数）。
@@ -3102,6 +3385,11 @@ pub fn generate(
     }
 
     // M2.13：寄存器分配（PE 折叠成功时不必——常量写回没有热点值）。
+    // M2.14 切片 1（基本块内槽位复用）已写好（`reuseSlots`），但还有两处没对齐，先关掉：
+    //   ① `.dec` 的载荷是**裸 vreg 编号**，`mapOpVregs` 故意不映射它 → 改名后语义错；
+    //   ② 改名后 sdas8051 报无效指令（未定位到具体哪条）。
+    //   临时槽回收（`flushTempsKeep`，指令内临时操作数）是安全的那部分，已保留。
+    // lw.reuseSlots();
     lw.assignRegisters();
 
     // 没有 ret 也允许：只要 body 以 br 终结（如 while(true)），控制流不会落空。
