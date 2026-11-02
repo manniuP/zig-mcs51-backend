@@ -1,0 +1,26 @@
+# tag | mcs2 的 .lst | mcs2 函数标签 | C 文件 | 备注
+add | add.lst | add | add | 
+sum | sum.lst | sum | sum | 
+memrt | memrt.lst | memrt | memrt | 
+ringdemo | ringdemo.lst | ringdemo | ringdemo | 
+sum_to_fold | sum_to_fold.lst | sum_to_fold | sum_to_fold | 
+u16add | u16add.lst | multi_u16add | f | 
+u16mul | u16mul.lst | mul_u16mul | f | 
+u16div | u16div.lst | div_u16div | f | 
+u32add | u32add.lst | multi_u32add | f | 
+u32mul | u32mul.lst | mul32_u32mul | f | 
+u32div | u32div.lst | div32_u32div | f | 
+u32rem | u32rem.lst | div32_u32rem | f | 
+i32div | i32div.lst | sdiv_i32div | f | 
+u32shl | shlv.lst | shiftv_shlv | f | 
+u32shr | shrv.lst | shiftv_shrv | f | 
+sar32 | sar32.lst | sar_sar32 | f | 
+cmp32 | ucmp_gt.lst | wide_ucmp32 | f | 
+sexcmp | sexcmp.lst | signed_sexcmp | f | 
+switch | sw1h.lst | switchex_sw1 | f | keil 复用 sdcc 源码
+ifexpr | ifr1.lst | ifexpr_ifr | f | keil 复用 sdcc 源码
+consttab | cgeti.lst | consttab_cgeti | f | 
+table16 | t16rt.lst | t16rt | f | 
+table32 | t32pair.lst | t32pair | f | 
+indcall | call_ind.lst | indcall_call_ind | f | keil 复用 sdcc 源码
+cordic_sin | csin90.lst | cordic_sin | f | 

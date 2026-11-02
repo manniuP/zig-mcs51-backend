@@ -25,6 +25,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 与 mcs2.py 一致：Windows 管道默认 GBK，中文表头/备注会变乱码。
+for _s in (sys.stdout, sys.stderr):
+    try:
+        _s.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = Path(__file__).resolve().parent
 BUILD = HERE / "build"
 CB = HERE / "bench_c"
@@ -65,80 +72,24 @@ def size_any(lst: Path, fn: str) -> int | None:
         end = addr + 1
     return None if (first is None or end is None) else end - first
 
-# (标签, mcs2 的 .lst, mcs2 标签, C 文件, C 函数)
-LEGACY = [
-    ("add",         "add.lst",         "add",         "add.c",     "add"),
-    ("sum",         "sum.lst",         "sum",         "sum.c",     "sum"),
-    ("memrt",       "memrt.lst",       "memrt",       "memrt.c",   "memrt"),
-    ("ringdemo",    "ringdemo.lst",    "ringdemo",    "ring.c",    "ringdemo"),
-    ("sum_to_fold", "sum_to_fold.lst", "sum_to_fold", "fold.c",    "sum_to_fold"),
-]
-
-# 算术内核：每项一段单函数 C（Keil 要求一文件一函数）
-ARITH = [
-    ("u16add",  "u16add.lst",  "multi_u16add",   "unsigned int f(unsigned int a, unsigned int b) { return a + b; }"),
-    ("u16mul",  "u16mul.lst",  "mul_u16mul",     "unsigned int f(unsigned int a, unsigned int b) { return a * b; }"),
-    ("u16div",  "u16div.lst",  "div_u16div",     "unsigned int f(unsigned int a, unsigned int b) { return a / b; }"),
-    ("u32add",  "u32add.lst",  "multi_u32add",   "unsigned long f(unsigned long a, unsigned long b) { return a + b; }"),
-    ("u32mul",  "u32mul.lst",  "mul32_u32mul",   "unsigned long f(unsigned long a, unsigned long b) { return a * b; }"),
-    ("u32div",  "u32div.lst",  "div32_u32div",   "unsigned long f(unsigned long a, unsigned long b) { return a / b; }"),
-    ("u32rem",  "u32rem.lst",  "div32_u32rem",   "unsigned long f(unsigned long a, unsigned long b) { return a % b; }"),
-    ("i32div",  "i32div.lst",  "sdiv_i32div",    "long f(long a, long b) { return a / b; }"),
-    ("u32shl",  "shlv.lst",    "shiftv_shlv",    "unsigned long f(unsigned long a, unsigned char n) { return a << n; }"),
-    ("u32shr",  "shrv.lst",    "shiftv_shrv",    "unsigned long f(unsigned long a, unsigned char n) { return a >> n; }"),
-    ("sar32",   "sar32.lst",   "sar_sar32",      "long f(long a) { return a >> 3; }"),
-    ("cmp32",   "ucmp_gt.lst", "wide_ucmp32",    "unsigned char f(unsigned long a, unsigned long b) { return a > b; }"),
-    ("sexcmp",  "sexcmp.lst",  "signed_sexcmp",  "unsigned char f(signed char x) { long a = x; return a < -1; }"),
-]
+EXAMPLES = HERE.parents[1] / "examples" / "compare"
 
 
-# 这一批是「真程序形状」的对照：switch / 条件表达式 / const 查表 / 间接调用 / CORDIC。
-# (标签, mcs2 的 .lst, mcs2 标签, SDCC 的 C, Keil 的 C（缺省同 SDCC）)
-NEW = [
-    ("switch", "sw1h.lst", "switchex_sw1",
-     "unsigned char f(unsigned char c) { unsigned char r = 0xEE;"
-      " switch (c) { case 1: r = 0x11; break; case 2: r = 0x22; break; case 3: r = 0x33; break; }"
-      " return r; }", None),
-    ("ifexpr", "ifr1.lst", "ifexpr_ifr",
-     "unsigned char f(unsigned char c) { return c ? 0x11 : 0x22; }", None),
-    ("consttab", "cgeti.lst", "consttab_cgeti",
-     "unsigned char f(unsigned char i) { static const unsigned char t[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88}; return t[i]; }",
-     "unsigned char f(unsigned char i) { static const unsigned char code t[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88}; return t[i]; }"),
-    # 表下标（scale=2 / scale=4）：本轮优化（一次 mul ab 求积 + 符号偏移折进重定位）的直接靶子。
-    # C 侧用 volatile 防止「写了又读」被折叠成直接返回 v。
-    ("table16", "t16rt.lst", "t16rt",
-     "unsigned int f(unsigned char i, unsigned int v) {"
-      " volatile unsigned int __xdata *p = (volatile unsigned int __xdata *)0x8200;"
-      " p[i] = v; return p[i]; }",
-     "unsigned int f(unsigned char i, unsigned int v) {"
-      " volatile unsigned int xdata *p = (volatile unsigned int xdata *)0x8200;"
-      " p[i] = v; return p[i]; }"),
-    ("table32", "t32pair.lst", "t32pair",
-     "unsigned long f(unsigned char i, unsigned long a, unsigned long b) {"
-      " volatile unsigned long __xdata *p = (volatile unsigned long __xdata *)0x8400;"
-      " p[i] = a; p[i + 1] = b; return p[i] + p[i + 1]; }",
-     "unsigned long f(unsigned char i, unsigned long a, unsigned long b) {"
-      " volatile unsigned long xdata *p = (volatile unsigned long xdata *)0x8400;"
-      " p[i] = a; p[i + 1] = b; return p[i] + p[i + 1]; }"),
-    ("indcall", "call_ind.lst", "indcall_call_ind",
-     "unsigned char f(unsigned char (*p)(unsigned char), unsigned char x) { return p(x); }", None),
-    ("cordic_sin", "csin90.lst", "cordic_sin",
-     "int f(int a) {"
-      " static const int at[12] = {8192,4836,2555,1297,651,326,163,81,41,20,10,5};"
-      " int z = a, x = 9949, y = 0, i, q = 0;"
-      " if (z > 0x4000) { z -= 0x4000; q = 1; } else if (z < -0x4000) { z += 0x4000; q = 2; }"
-      " for (i = 0; i < 12; i++) { int xr = x >> i, yr = y >> i;"
-      "   if (z >= 0) { x -= yr; y += xr; z -= at[i]; } else { x += yr; y -= xr; z += at[i]; } }"
-      " if (q == 1) return x; if (q == 2) return -x; return y; }",
-     "int f(int a) {"
-      " static const int code at[12] = {8192,4836,2555,1297,651,326,163,81,41,20,10,5};"
-      " int z = a, x = 9949, y = 0, i, q = 0;"
-      " if (z > 0x4000) { z -= 0x4000; q = 1; } else if (z < -0x4000) { z += 0x4000; q = 2; }"
-      " for (i = 0; i < 12; i++) { int xr = x >> i, yr = y >> i;"
-      "   if (z >= 0) { x -= yr; y += xr; z -= at[i]; } else { x += yr; y -= xr; z += at[i]; } }"
-      " if (q == 1) return x; if (q == 2) return -x; return y; }"),
-]
+def load_cases() -> list[tuple[str, str, str, str, str]]:
+    """读 examples/compare/cases.txt：tag | lst | mcs2 标签 | C 函数 | 备注。"""
+    out: list[tuple[str, str, str, str, str]] = []
+    for line in (EXAMPLES / "cases.txt").read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = [x.strip() for x in line.split("|")]
+        tag, lst, label, cfn = parts[0], parts[1], parts[2], parts[3]
+        note = parts[4] if len(parts) > 4 else ""
+        out.append((tag, lst, label, cfn, note))
+    return out
 
+
+def c_file(tool: str, tag: str) -> Path:
+    return EXAMPLES / "c" / tool / f"{tag}.c"
 
 def mcs2_dseg(tag: str) -> int | None:
     """mcs2 这一函数的静态 DSEG 字节数（每函数一块槽，含 PARM 区）。"""
@@ -213,43 +164,22 @@ def main() -> int:
             os.environ["KEIL_BIN"] = str(cand)
             have_keil = True
             print(f"（自动发现 Keil：{cand}）")
-    print(f"{'用例':<12}{'mcs2':>8}{'SDCC 4.6':>9}{'Keil C51':>9}   备注")
-    print("-" * 76)
-    for tag, lst_name, label, c_file, c_fn in LEGACY:
+    cases = load_cases()
+    fmt = lambda v: f"{v} B" if v is not None else "—"
+    print(f"{'用例':<14}{'mcs2':>8}{'SDCC 4.6':>9}{'Keil C51':>9}{'mcs2 DSEG':>11}{'Keil DATA':>11}   备注")
+    print("-" * 96)
+    for tag, lst_name, label, c_fn, note in cases:
         ours = fn_size(BUILD / lst_name, label)
-        sd = _sdcc_size(CB / c_file, c_fn, tag)
-        kl = _keil_sizes((CB / c_file).read_text(encoding="utf-8"), tag)[0] if have_keil else None
-        note = "PE 折叠（循环消失）" if tag == "sum_to_fold" else ""
-        print(_row(tag, ours, sd, kl, note))
-    print("-" * 76)
-    for tag, lst_name, label, c_one in ARITH:
-        ours = fn_size(BUILD / lst_name, label)
-        c_path = BUILD / f"{tag}_c.c"
-        c_path.write_text(c_one + "\n", encoding="ascii")
-        sd = _sdcc_size(c_path, "f", tag)
-        kl = _keil_sizes(c_one, tag)[0] if have_keil else None
-        note = ""
-        if tag in ("u16mul", "u16div", "u32mul", "u32div", "u32rem", "i32div"):
-            note = "SDCC/Keil 走库函数，mcs2 内联"
-        print(_row(tag, ours, sd, kl, note))
-    print("-" * 76)
-    print("真程序形状（switch / 条件表达式 / const 查表 / 间接调用 / CORDIC）")
-    print(f"{'用例':<12}{'mcs2':>8}{'SDCC 4.6':>9}{'Keil C51':>9}{'mcs2 DSEG':>11}{'Keil DATA':>11}")
-    print("-" * 76)
-    for tag, lst_name, label, c_sdcc, c_keil in NEW:
-        ours = fn_size(BUILD / lst_name, label)
-        c_path = BUILD / f"new_{tag}_c.c"
-        c_path.write_text(c_sdcc + "\n", encoding="ascii")
-        sd = _sdcc_size(c_path, "f", f"new_{tag}")
+        sd = _sdcc_size(c_file("sdcc", tag), c_fn, tag)
         kl = None
         kd = None
         if have_keil:
-            kl, kd = _keil_sizes(c_keil or c_sdcc, f"new_{tag}")
+            ktext = c_file("keil", tag).read_text(encoding="utf-8")
+            kl, kd = _keil_sizes(ktext, f"cmp_{tag}")
         dseg = mcs2_dseg(lst_name.replace(".lst", ""))
-        fmt = lambda v: f"{v} B" if v is not None else "—"
-        print(f"{tag:<12}{fmt(ours):>8}{fmt(sd):>9}{fmt(kl):>9}{fmt(dseg):>11}{fmt(kd):>11}")
+        print(f"{tag:<14}{fmt(ours):>8}{fmt(sd):>9}{fmt(kl):>9}{fmt(dseg):>11}{fmt(kd):>11}   {note}")
     if not have_keil:
-        print("\n（Keil 列未采集：设置 KEIL_BIN=<Keil\\C51\\BIN> 后重跑）")
+        print("\n（Keil 列未采集：设置 KEIL_BIN=<Keil>\\C51\\BIN 后重跑）")
     return 0
 
 
