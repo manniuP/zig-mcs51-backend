@@ -26,6 +26,9 @@ jobs:
 
       - name: 构建编译器（ReleaseFast）
         shell: bash
+        env:
+          # 关键：用**本树的** lib（含 mcs51/mcs251 目标定义），不是引导 zig 自带的
+          ZIG_LIB_DIR: ${{ github.workspace }}/lib
         run: |
           zig version
           zig build -Doptimize=ReleaseFast -Dno-lib --summary all
