@@ -26,3 +26,5 @@ zig-out/
 __pycache__/
 tools/mcs2/build/
 
+dist/
+.zig-global-cache/
