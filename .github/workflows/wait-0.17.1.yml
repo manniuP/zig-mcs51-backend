@@ -1,0 +1,41 @@
+name: 0.17.1 发版后自动构建
+
+on:
+  schedule:
+    - cron: "0 3 * * *"        # 每天 03:00 UTC 探一次
+  workflow_dispatch:
+
+jobs:
+  check-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - id: probe
+        name: 探 0.17.1 是否发版
+        run: |
+          avail=$(curl -s https://ziglang.org/download/index.json \
+            | python3 -c "import json,sys; d=json.load(sys.stdin); print(1 if \"0.17.1\" in d else 0)")
+          echo "available=$avail" >> "$GITHUB_OUTPUT"
+          echo "0.17.1 available: $avail"
+
+      - uses: actions/checkout@v4
+        if: steps.probe.outputs.available == '1'
+
+      - uses: mlugg/setup-zig@v2
+        if: steps.probe.outputs.available == '1'
+        with:
+          version: 0.17.1
+
+      - name: 构建（ReleaseFast）
+        if: steps.probe.outputs.available == '1'
+        env:
+          ZIG_LIB_DIR: ${{ github.workspace }}/lib
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+        run: |
+          zig version
+          zig build -Doptimize=ReleaseFast -Dno-lib --summary all
+
+      - uses: actions/upload-artifact@v4
+        if: steps.probe.outputs.available == '1'
+        with:
+          name: zig-mcs51-linux-x86_64
+          path: zig-out/bin/zig
