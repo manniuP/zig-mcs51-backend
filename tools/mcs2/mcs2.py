@@ -29,6 +29,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows 控制台/管道的默认编码是 GBK，中文在 UTF-8 查看器里就是乱码（白方块）。
+# 这里把本工具的 stdout/stderr 统一强制成 UTF-8：日志、管道、终端都是同一份字节。
+# （realcheck / bench_compare / fwsize 都 import 本模块，一并生效。）
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = Path(__file__).resolve().parent            # zig-0.17/tools/mcs2
 SRC_TREE = HERE.parents[1]                         # zig-0.17：源码真源
 WORKSPACE = HERE.parents[2]
@@ -37,6 +46,12 @@ CACHE = WORKSPACE / "zig017"                       # 缓存集中在这里，不
 GLOBAL_CACHE = CACHE / "cache-mcs2"
 LOCAL_CACHE = CACHE / "cache-mcs2-local"
 BUILD = HERE / "build"
+# 用例与定点库都放在 examples/mcs51/（统一由那里的 build.zig 构建）：
+#   examples/mcs51/src/*.zig   —— 每个文件一组用例
+#   examples/mcs51/lib/cordic.zig —— @import("cordic") 的定点数学库
+EXAMPLES = SRC_TREE / "examples" / "mcs51"
+TESTS = EXAMPLES / "src"
+CORDIC = EXAMPLES / "lib" / "cordic.zig"
 ZIG_EXE = BUILD_TREE / "zig-out" / "bin" / "zig.exe"
 TARGET = "mcs51-freestanding"
 
@@ -48,6 +63,8 @@ SYNC_FILES = [
     "src/codegen/mcs2.zig",
     # 链接层：全局变量/const 表的数据发射（.db）也归我们改
     "src/link/Asx.zig",
+    # 宿主链接（COFF）：weak external 的宽松解析，修自举 build runner 的解析失败
+    "src/link/Coff.zig",
 ]
 SYNC_GLOB = "src/codegen/mcs2/*.zig"
 
@@ -151,8 +168,13 @@ def run(cmd, cwd=None, env=None, check=True) -> subprocess.CompletedProcess:
 
 # ---------------------------------------------------------------- 构建
 
-def build(rebuild: bool = False) -> None:
-    """同步源码并构建编译器。增量几秒；全量 2-3 分钟。"""
+def build(rebuild: bool = False, release: bool = False) -> None:
+    """同步源码并构建编译器。增量几秒；全量 2-3 分钟。
+
+    `release=True`（或环境变量 MCS2_RELEASE=1）用 ReleaseFast：
+    Debug 版带 SafeAllocator 的泄漏检查，会把编译器内部（上游）的"leaked"刷到 stderr；
+    日常用（尤其想让本编译器自己跑 `zig build`）用 ReleaseFast 更干净也更快。
+    """
     if not (BUILD_TREE / "build.zig").exists():
         raise SystemExit(f"{BUILD_TREE} 里没有 build.zig——构建树不完整")
     sync()
@@ -163,7 +185,9 @@ def build(rebuild: bool = False) -> None:
     if rebuild:
         print("   （--rebuild：先删 zig-out）")
         shutil.rmtree(BUILD_TREE / "zig-out", ignore_errors=True)
-    run([zig, "build", "-Doptimize=Debug", "-Dversion-string=0.17.1"],
+    opt = "ReleaseFast" if (release or os.environ.get("MCS2_RELEASE") == "1") else "Debug"
+    print(f"   （optimize={opt}）")
+    run([zig, "build", f"-Doptimize={opt}", "-Dversion-string=0.17.1"],
         cwd=BUILD_TREE, env=build_env())
     if not ZIG_EXE.exists():
         raise SystemExit(f"构建结束但没有产物：{ZIG_EXE}")
@@ -190,7 +214,7 @@ def emit_asm(src: Path, tag: str) -> tuple[Path, str]:
     """
     asm = BUILD / f"{tag}.asm"
     run([str(ZIG_EXE), "build-obj", "-OReleaseSmall", "-target", TARGET,
-         "--dep", "cordic", f"-Mroot={src}", f"-Mcordic={HERE / 'lib' / 'cordic.zig'}",
+         "--dep", "cordic", f"-Mroot={src}", f"-Mcordic={CORDIC}",
          "-femit-bin=" + str(asm)], env=zig_env())
     text = asm.read_text(encoding="utf-8")
     if ".area CSEG (CODE)" not in text:
@@ -442,6 +466,55 @@ CASES: dict[str, dict] = {
     "t32rt": dict(kind="call", src="tableu32.zig", fn="t32rt",
                   args=[("DPL", 3), ("PARM_2", 0x78), ("PARM_3", 0x56),
                         ("PARM_4", 0x34), ("PARM_5", 0x12)], want32=0x12345678, steps=3000),
+    # 三维数组：屏幕帧缓冲 fb[page][row][col]（步长 4096 / 128 / 2）
+    "fb3d": dict(kind="call", src="fb3d.zig", fn="px",
+                 args=[("DPL", 1), ("PARM_2", 5), ("PARM_3", 7), ("PARM_4", 0xEF), ("PARM_5", 0xBE)],
+                 want16=0xBEEF, steps=8000),
+    # 全局三维数组（符号基址）
+    "gfb": dict(kind="call", src="fb3d.zig", fn="gpx",
+                args=[("DPL", 1), ("PARM_2", 3), ("PARM_3", 9), ("PARM_4", 0x34), ("PARM_5", 0x12)],
+                want16=0x1234, steps=8000),
+    # 同一缓冲的两种寻址互相验证（多维 vs 平面），不对就非 0
+    "fbchk": dict(kind="call", src="fb3d.zig", fn="pxchk",
+                  args=[("DPL", 1), ("PARM_2", 5), ("PARM_3", 7), ("PARM_4", 0xEF), ("PARM_5", 0xBE)],
+                  want16=0x0000, steps=12000),
+    # 运行期指针做基址：p[i] 的 p 是参数/指针变量
+    "p2d": dict(kind="call", src="ptrrt.zig", fn="p2d",
+                args=[("DPL", 0x00), ("DPH", 0x81), ("PARM_2", 2), ("PARM_3", 3), ("PARM_4", 0xC3)],
+                want=0xC3, steps=6000),
+    "pprt": dict(kind="call", src="ptrrt.zig", fn="pprt",
+                 args=[("DPL", 0x00), ("DPH", 0x81), ("PARM_2", 5), ("PARM_3", 0xA5)],
+                 want=0xA5, steps=4000),
+    # scale=2：u16 元素 + 运行期基址（base + i*2 的进位要进 DPH）
+    "pu16": dict(kind="call", src="ptrrt.zig", fn="pu16",
+                 args=[("DPL", 0x00), ("DPH", 0x81), ("PARM_2", 3),
+                       ("PARM_3", 0x34), ("PARM_4", 0x12)],
+                 want16=0x1234, steps=6000),
+    # 尾递归：自递归（变循环）+ 互递归（ljmp 到另一个函数），栈不增长
+    "trsum": dict(kind="call", src="tailrec.zig", fn="trsum", args=[("DPL", 5)], want16=15, steps=20000),
+    "trev": dict(kind="call", src="tailrec.zig", fn="evodd", args=[("DPL", 4)], want=1, steps=20000),
+    "trod": dict(kind="call", src="tailrec.zig", fn="evodd", args=[("DPL", 5)], want=0, steps=20000),
+    # 多字节全局变量：写进 var g: u32 / u16，再从**另一个函数**读回
+    "wg32": dict(kind="call", src="gwide.zig", fn="wg32",
+                 args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
+                 want32=0x12345678, steps=4000),
+    "wg16": dict(kind="call", src="gwide.zig", fn="wg16",
+                 args=[("DPL", 0x34), ("DPH", 0x12)], want16=0x1234, steps=3000),
+    # 全局 u32 的读-改-写 / 参与宽比较
+    "wginc": dict(kind="call", src="gwide.zig", fn="wginc",
+                  args=[("DPL", 0x00), ("DPH", 0x10), ("B", 0x00), ("ACC", 0x00),
+                        ("PARM_2", 0x34), ("PARM_3", 0x02), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                  want32=0x1234, steps=8000),
+    "wgcmp1": dict(kind="call", src="gwide.zig", fn="wgcmp",
+                   args=[("DPL", 0x35), ("DPH", 0x12), ("B", 0x00), ("ACC", 0x00)],
+                   want=1, steps=4000),
+    "wgcmp0": dict(kind="call", src="gwide.zig", fn="wgcmp",
+                   args=[("DPL", 0x34), ("DPH", 0x12), ("B", 0x00), ("ACC", 0x00)],
+                   want=0, steps=4000),
+    # arg0 是 32 位（第 3 字节在 B）→ 乘 scale 前必须保护 B，否则 x>>16 被踩坏
+    "bscale": dict(kind="call", src="btable.zig", fn="bscale",
+                   args=[("DPL", 0x56), ("DPH", 0x34), ("B", 0x12), ("ACC", 0x00), ("PARM_2", 3)],
+                   want16=0x3468, steps=4000),
     "t32pair": dict(kind="call", src="tableu32.zig", fn="t32pair",
                     args=[("DPL", 3), ("PARM_2", 0x11), ("PARM_3", 0x11), ("PARM_4", 0x11), ("PARM_5", 0x11),
                           ("PARM_6", 0x22), ("PARM_7", 0x22), ("PARM_8", 0x22), ("PARM_9", 0x22)],
@@ -480,12 +553,9 @@ CASES: dict[str, dict] = {
     "ccos0": dict(kind="call", src="cordic_cos.zig", fn="ccos0", args=[], want16=0x3FFF, steps=30000),
     "cat90": dict(kind="call", src="cordic_atan.zig", fn="cat90", args=[], want16=0x4003, steps=30000),
     "cat45": dict(kind="call", src="cordic_atan.zig", fn="cat45", args=[], want16=0x2001, steps=30000),
-    # sqrt32/hypot 的 u32 表达式把 DSEG 撑到 131 B（>80）—— 等 M2.14 的槽位复用再进验收；
-    # 现在这两项只保证「能编出来」，不保证能链（库函数本身实现按位试差，不依赖别的东西）。
-    # "csqrt1m": dict(kind="call", src="cordic_sqrt.zig", fn="csqrt1m", args=[], want16=1000, steps=20000),
-    # hypot 会连着 sqrt32 一起发（同一个模块），80 B DSEG 塞不下 —— 等 M2.14 的槽位复用；
-    # 现在只验 sqrt32 本身（hypot 用的是同一套原语）。
-    # "chyp": dict(kind="call", src="cordic_sqrt.zig", fn="chyp", args=[], want16=5, steps=20000),
+    # sqrt32 / hypot：DSEG 79 B；跨函数 skip 标签撞号已改由模块级保留编号段分配。
+    "csqrt1m": dict(kind="call", src="cordic_sqrt.zig", fn="csqrt1m", args=[], want16=1000, steps=20000),
+    "chyp": dict(kind="call", src="cordic_sqrt.zig", fn="chyp", args=[], want16=5, steps=20000),
     # if / switch 表达式（块返回值，内存 phi）
     "ifx1": dict(kind="call", src="ifexpr.zig", fn="ifx", args=[("DPL", 1)], want=0x11, steps=1000),
     "ifx0": dict(kind="call", src="ifexpr.zig", fn="ifx", args=[("DPL", 0)], want=0x22, steps=1000),
@@ -533,14 +603,15 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "chain", "chain32", "mix32",
          "call_ind", "twice_ind", "call_addr", "dispatch",
          "wstore", "wround", "wround2", "addone",
-         "t16rt", "t8rt", "t16pair", "t8pair", "t32rt", "t32pair",
+         "t16rt", "t8rt", "t16pair", "t8pair", "t32rt", "t32pair", "bscale", "wg32", "wg16", "wginc", "wgcmp1", "wgcmp0", "trsum", "trev", "trod",
+         "pprt", "pu16", "fb3d", "fbchk", "gfb", "p2d",
          "symconst", "symrt", "symb", "sympair", "fpt_all",
          "argcall1", "argcall2", "argcall3", "cget2", "cgeti", "wgeti",
          "sw1h", "sw1m", "sw2r", "sw2h", "sw2e", "sw3a", "sw3b",
          "ifx1", "ifx0", "ifr1", "ifr0", "swx2", "swx9", "ifw1", "ifw0",
          "wloc1", "wloc2", "s16r", "u16l", "u32l",
          "csin90", "csin45", "csin180", "ccos0", "cat90", "cat45",
-         "ringdemo"]
+         "csqrt1m", "chyp", "ringdemo"]
 
 
 def check_selftest() -> bool:
@@ -572,7 +643,7 @@ def check_selftest() -> bool:
 def check_call(name: str, spec: dict) -> bool:
     dseg = spec.get("dseg", 0x30)
     steps = spec.get("steps", 400)
-    _, text = emit_asm(HERE / "tests" / spec["src"], name)
+    _, text = emit_asm(TESTS / spec["src"], name)
     if spec.get("want_ljmp") and "ljmp" not in text:
         print("FAIL: 期望长跳（ljmp）但产物里没有——跳转松弛没生效")
         return False
@@ -628,7 +699,7 @@ loop:
 
 
 def check_interrupt(name: str) -> bool:
-    _, text = emit_asm(HERE / "tests" / "interrupt.zig", name)
+    _, text = emit_asm(TESTS / "interrupt.zig", name)
     # ISR 必须真的保存/恢复现场并以 reti 结束（曾因 Lower.is_isr 漏赋值退化成 ret）。
     pushes = text.count("    push ")
     pops = text.count("    pop ")
@@ -726,7 +797,7 @@ def firmware(which: str, tag: str = "") -> int:
         print(f"未知固件 {which}；可用：{', '.join(FW)}")
         return 2
     BUILD.mkdir(parents=True, exist_ok=True)
-    _, text = emit_asm(HERE / "tests" / spec["src"], spec["name"])
+    _, text = emit_asm(TESTS / spec["src"], spec["name"])
     merged = merge(spec["name"], FW_ENTRY, text)
     ihx = assemble(merged, spec["name"], dseg=spec["dseg"], cseg=spec["cseg"])
     # 产物放工作区 build/fw/（与既有固件同处，烧录脚本按目录找）

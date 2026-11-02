@@ -104,6 +104,22 @@ NEW = [
     ("consttab", "cgeti.lst", "consttab_cgeti",
      "unsigned char f(unsigned char i) { static const unsigned char t[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88}; return t[i]; }",
      "unsigned char f(unsigned char i) { static const unsigned char code t[8] = {0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88}; return t[i]; }"),
+    # 表下标（scale=2 / scale=4）：本轮优化（一次 mul ab 求积 + 符号偏移折进重定位）的直接靶子。
+    # C 侧用 volatile 防止「写了又读」被折叠成直接返回 v。
+    ("table16", "t16rt.lst", "t16rt",
+     "unsigned int f(unsigned char i, unsigned int v) {"
+      " volatile unsigned int __xdata *p = (volatile unsigned int __xdata *)0x8200;"
+      " p[i] = v; return p[i]; }",
+     "unsigned int f(unsigned char i, unsigned int v) {"
+      " volatile unsigned int xdata *p = (volatile unsigned int xdata *)0x8200;"
+      " p[i] = v; return p[i]; }"),
+    ("table32", "t32pair.lst", "t32pair",
+     "unsigned long f(unsigned char i, unsigned long a, unsigned long b) {"
+      " volatile unsigned long __xdata *p = (volatile unsigned long __xdata *)0x8400;"
+      " p[i] = a; p[i + 1] = b; return p[i] + p[i + 1]; }",
+     "unsigned long f(unsigned char i, unsigned long a, unsigned long b) {"
+      " volatile unsigned long xdata *p = (volatile unsigned long xdata *)0x8400;"
+      " p[i] = a; p[i + 1] = b; return p[i] + p[i + 1]; }"),
     ("indcall", "call_ind.lst", "indcall_call_ind",
      "unsigned char f(unsigned char (*p)(unsigned char), unsigned char x) { return p(x); }", None),
     ("cordic_sin", "csin90.lst", "cordic_sin",

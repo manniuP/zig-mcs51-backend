@@ -52,6 +52,34 @@ REAL_CASES = [
     "wloc1", "wloc2", "s16r", "u16l", "u32l",
     # CORDIC 定点数学库（lib/cordic.zig）
     "csin90", "csin45", "csin180", "ccos0", "cat90", "cat45",
+    # ---- 2026-11-01 新增能力（仿真已过，真机补测）----
+    # 尾递归：自递归编成循环 + 互递归（ljmp 到另一函数），栈不增长
+    "trsum", "trev", "trod",
+    # 运行期指针做基址：p[i] 写后读 / u16 元素（scale=2）/ 二维 p[i][j]
+    "pprt", "pu16", "p2d",
+    # 三维数组（帧缓冲）：固定地址 3D / 全局 3D / 多维 vs 平面地址交叉验证
+    "fb3d", "gfb", "fbchk",
+    # 多字节全局变量：写读 / 读改写 / 参与宽比较
+    "wg32", "wg16", "wginc", "wgcmp1", "wgcmp0",
+    # B 寄存器保护（arg0 是 32 位时，表下标的 MUL 不能踩掉 arg2）
+    "bscale",
+    # ---- 补齐历史遗留：这些一直是「只在仿真跑」的 ----
+    # 局部量地址 / 循环 / 大循环 / 环形缓冲
+    "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big", "ringdemo",
+    # 内存/位操作边角（读改写、比较零）。
+    # ⚠️ bitpoll/bitclear **不进真机**：bitpoll 会轮询一个外部状态位，
+    # 硅片上那位不变就永远卡在循环里 —— 而 ISP 触发代码在打印循环之后，
+    # 固件挂住就再也接不到 @STCISP#，整轮自动烧录会被它锁死（踩过）。
+    "memrt", "bitfn", "xor2", "ne5", "ne_imm",
+    # 内部调用链 / 间接调用（函数指针）/ 参数搬运 / 命令分派
+    "chain", "chain32", "mix32", "call_ind", "twice_ind", "call_addr",
+    "argcall1", "argcall2", "argcall3", "dispatch",
+    # 32 位 xdata 读写与四舍五入（wstore 只看内存、没有返回值 → 留在仿真里）
+    "wround", "wround2", "addone",
+    # 中断（ISR）：Timer0 中断里给 xdata 0x8000 计数，主循环反复打印 interrupt=NN。
+    # 验收口径 = 「进得来中断 + ISR 跑完 + reti 回到主程序 + 计数在涨」，所以只要 NN ≥ 1。
+    # 真机外壳：VECTORS 里放复位跳转（0x0000）+ ISR 向量（0x000B），CSEG 起点 0x0080。
+    "interrupt",
 ]
 
 def harness_head(board: str, fosc: float, baud: int) -> str:
@@ -99,6 +127,26 @@ _crt_main:
 # AI8051U 的 IAP_CONTR = 0xC7（官方 AI8051U.h 第 82 行），SWBS=bit6、SWRST=bit5 → 写 0x60。
 # 用「任何字节」而不是魔法字：AiCube 的下载握手最早发出的是 0x7F，
 # 但它按自己的下载波特率发（可能 2400），在 115200 下收到的是乱码——只认同一个值会漏。
+# 中断版（主循环挂死时也能自救）：UART1 接收中断 → ISR 里同样写 IAP_CONTR=0x60。
+# 向量 = 0x0003 + 8*4 = 0x0023（AI8051U 8 位模式，同 ziguart 的实机配置）。
+# 为什么需要它：轮询版只在打印循环里检查，一旦某个用例自己卡在死循环（例如轮询外部状态位），
+# 就再也接不到 @STCISP# → 整轮自动烧录被锁死（2026-11-01 踩过）。中断版不受主循环影响。
+ISP_VECTOR = """
+    .area VECTORS (ABS,CODE)
+    .org 0x0023
+    ljmp _isp_isr
+    .area CSEG (CODE)
+_isp_isr:
+    jnb 0x98,_isp_ti        ; RI=0 → 这是 TI（发送完成）中断，不是下载命令
+    mov a,0x99              ; 读 SBUF（硬件清 RI）
+    mov 0xA8,#0x00          ; IE=0：不再接受新中断（马上要复位）
+    mov 0xC7,#0x60          ; IAP_CONTR：SWBS=1 + SWRST=1 → 进 ISP
+    reti                    ; （复位在即，走不到这里）
+_isp_ti:
+    clr 0x99                ; 清 TI：打印子程序靠它判断发送完成
+    reti
+"""
+
 ISP_WATCH = """
     ; ---- 串口收到字节就软复位进 ISP（下载模式），不需要按 RST/断电 ----
     ; 注意 jb/jnb 只有 ±127 的射程，_again 在整块用例之前（几百字节外）→ 落到 ljmp。
@@ -178,6 +226,9 @@ def case_asm(name: str, spec: dict, slot: int) -> str:
     for pos, val in spec["args"]:
         if pos in ("DPL", "DPH", "B", "ACC"):
             out.append(f"    mov {pos.lower()},#0x{val:02X}\n")
+        elif pos == "SYM16":
+            # 传一个符号的 16 位地址（拆低/高字节）—— 间接调用/函数指针测试用
+            out.append(f"    mov dpl,#<{val}\n    mov dph,#>{val}\n")
         elif pos == "PARM2":
             out.append(f"    mov _{spec['fn']}_PARM_2,#0x{val:02X}\n")
         elif pos.startswith("PARM_"):
@@ -202,18 +253,60 @@ def case_asm(name: str, spec: dict, slot: int) -> str:
     return "".join(out)
 
 
+def isr_asm(isp: bool) -> str:
+    """ISR 组的外壳：起 Timer0 中断，主循环反复打印 xdata 0x8000 的计数值。
+
+    T2 已被波特率占用，所以计数器用 Timer0（与 interrupt.zig 的 ISR 一致：
+    向量号 1 → 0x000B，mcs2 自动发向量跳板）。
+    验收口径：只要打印出 `isr=XX` 且 XX ≥ 1，就说明「真机中断进得来、ISR 跑完、
+    reti 回主程序、xdata 计数在涨」这条链路成立。
+    """
+    out = """    mov 0x89,#0x01        ; TMOD：T0 = 模式1（16 位）
+    mov 0x8C,#0xF0        ; TH0
+    mov 0x8A,#0x00        ; TL0
+    mov 0xA8,#0x82        ; IE：EA=1, ET0=1
+    setb 0x8C             ; TCON.TR0 = 1（位地址 0x8C = TCON.4）
+_again:
+""" + putc_asm("interrupt=") + """    mov dptr,#0x8000
+    movx a,@dptr
+    acall _ph8
+""" + putc_asm("\r\n")
+    if isp:
+        out += ISP_WATCH
+    return out
+
+
 def build_group(cases: list[str], idx: int, board: str, fosc: float, baud: int,
                 wait_ti: bool = True, isp: bool = False) -> tuple[Path, Path]:
     """一组（同一 src 文件）→ (ihx, 合并后的 asm)。"""
     src = mcs2.CASES[cases[0]]["src"]
     suffix = "" if wait_ti else "_sim"
-    _, body = mcs2.emit_asm(HERE / "tests" / src, f"real_g{idx}{suffix}")
+    _, body = mcs2.emit_asm(mcs2.TESTS / src, f"real_g{idx}{suffix}")
     harness = harness_head(board, fosc, baud)
+    if mcs2.CASES[cases[0]].get("kind") == "interrupt":
+        # 中断组：没有「调用-取返回值」的形状，单独拼外壳
+        # 复位跳转必须放进**绝对向量区**（0x0000），CSEG 让到 0x0080 之后：
+        # 否则「复位向量」和「中断向量」只能二选一（前者在 CSEG 头，后者在 VECTORS）。
+        harness = harness.replace(
+            "    .area CSEG (CODE)\n    ljmp _crt_main\n",
+            "    .area VECTORS (ABS,CODE)\n    .org 0x0000\n    ljmp _crt_main\n    .area CSEG (CODE)\n",
+            1,
+        )
+        harness += isr_asm(isp)
+        harness += harness_lib(wait_ti)
+        tag = f"real_g{idx}{suffix}_{src.split('.')[0]}"
+        merged = mcs2.merge(tag, harness, body)
+        # 中断组必须把 CSEG 让开向量区（0x0003 + 8*13 = 0x006B），否则代码压掉向量表 →
+        # 芯片一中断就跳进垃圾（表现为「烧完一声不响」）。
+        ihx = mcs2.assemble(merged, tag, dseg=0x30, cseg=0x0080)
+        return ihx, merged
     # 整组结果**反复打印**：烧完随时接串口都能收到（接线/烧录占着串口的顺序不再冲突）。
     harness += "_again:\n"
     for i, c in enumerate(cases):
         harness += case_asm(c, mcs2.CASES[c], 0x8000 + i * 4)
     if isp:
+        # 只用轮询版：UART 中断与 _putw 的 TI 轮询会打架（ISR 清掉 TI，主机永远等不到），
+        # 实测开了中断反而一个字都打不出来。挂死类用例改成「不进真机套件」来规避。
         harness += ISP_WATCH
     harness += harness_lib(wait_ti)
     tag = f"real_g{idx}{suffix}_{src.split('.')[0]}"
@@ -245,7 +338,9 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=20.0,
                     help="--watch/--read 最长秒数（--read 收齐即退）")
     ap.add_argument("--isp", action="store_true",
-                    help="固件里加「收到串口字节就软复位进 ISP」——**本机 AI8051U 实测无效**（只复位、回不到 ISP），默认关")
+                    help="固件里加「收到串口字节就软复位进 ISP」（pc: jb SCON.RI → SBUF → IAP_CONTR=0x60）。"
+                         "注意：它只能让**已经在跑本版固件**的芯片进 ISP；芯片里若是旧固件（没有这段），"
+                         "第一次仍要人工复位/断电一次，之后就能全自动")
     ap.add_argument("--board", choices=("ai8051u", "stc8h"), default="ai8051u",
                     help="ai8051u：UART1 → P3.0/P3.1 + Timer2（默认）；stc8h：P3.6/P3.7 + Timer1")
     ap.add_argument("--baud", type=int, default=115200)
@@ -311,6 +406,16 @@ def main() -> int:
             dst = FW_DIR / f"real_g{gi}_{src.split('.')[0]}_{args.board}_{args.baud}.ihx"
             dst.write_bytes(ihx.read_bytes())
             print(f"    → {dst}")
+        if args.sim and mcs2.CASES[g[0]].get("kind") == "interrupt":
+            # 中断组没有「返回值」可比：查形状（ISR 存/取现场成对、有 reti、向量在 0x000B）
+            pushes = asm_text.count("\n    push ")
+            pops = asm_text.count("\n    pop ")
+            reti = "\n    reti" in asm_text
+            vec = "0x000B" in asm_text.upper().replace("0X", "0x")
+            shape_ok = pushes > 0 and pushes == pops and reti and vec
+            print(f"    {'PASS' if shape_ok else 'FAIL'} ISR 形状：push {pushes} / pop {pops} / reti={reti} / 向量 0x000B={vec}")
+            ok_all = ok_all and shape_ok
+            continue
         if args.sim:
             expect = []
             for i, c in enumerate(g):
@@ -423,7 +528,12 @@ def _collect(port: str, baud: int, results: dict[str, int], want: set[str],
                         results[name] = sum(b << (8 * k) for k, b in enumerate(raw))
                         w = _want(name)
                         rb = _want_bytes(name)
-                        good = results[name] == w
+                        # 中断组没有固定期望值（计数随中断次数变）：≥1 即证明中断链路成立
+                        if mcs2.CASES[name].get("kind") == "interrupt":
+                            w = results[name] if results[name] >= 1 else 0
+                            good = results[name] >= 1
+                        else:
+                            good = results[name] == w
                         print(f"  {'PASS' if good else 'FAIL'} {name} = "
                               f"0x{results[name]:0{rb * 2}X}（期望 0x{w:0{rb * 2}X}）")
         except Exception:
@@ -455,10 +565,14 @@ def auto(live: Path, port: str, baud: int, order: list[str],
         if all(c in results for c in cases):
             print(f"[组{gi}] 已在芯片上跑过，跳过")
             continue
-        src_ihx = FW_DIR / f"real_g{gi}_{src.split('.')[0]}_ai8051u_{baud}.ihx"
-        if not src_ihx.exists():
-            print(f"缺固件 {src_ihx}：先跑 python realcheck.py --build --baud {baud}")
+        # 按「源文件名」找固件，不按组号：用例表增删后组号会平移，组号写死会让
+        # 「只补跑几组」（--cases）找不到文件。
+        stem = src.split(".")[0]
+        cands = sorted(FW_DIR.glob(f"real_g*_{stem}_ai8051u_{baud}.ihx"))
+        if not cands:
+            print(f"缺固件 real_g*_{stem}_ai8051u_{baud}.ihx：先跑 python realcheck.py --build --baud {baud}")
             return 2
+        src_ihx = cands[-1]
         payload = src_ihx.read_bytes()
         print(f"[组{gi}/{len(order) - 1}] 写 {live.name} ← {src_ihx.name}"
               f"（{len(cases)} 项：{', '.join(cases)}）")
