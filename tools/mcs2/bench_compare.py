@@ -38,6 +38,7 @@ CB = HERE / "bench_c"
 KEIL_DIR = BUILD / "keil"
 
 sys.path.insert(0, str(HERE))
+import cycles51   # noqa: E402
 from assemble51 import assemble, toolchain_dir   # noqa: E402
 from fnsize import ROW, fn_size                   # noqa: E402
 
@@ -136,7 +137,7 @@ def _keil_sizes(src_text: str, tag: str) -> tuple[int | None, int | None]:
     name = f"k_{tag}.c"
     (KEIL_DIR / name).write_text(src_text + "\n", encoding="ascii")
     lst = KEIL_DIR / name.replace(".c", ".lst")
-    r = subprocess.run([str(c51), name, "SMALL", f"PRINT({lst.name})", "OPTIMIZE(8,SPEED)"],
+    r = subprocess.run([str(c51), name, "SMALL", f"PRINT({lst.name})", "CODE", "OPTIMIZE(8,SPEED)"],
                        cwd=KEIL_DIR, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0 or not lst.exists():
@@ -166,7 +167,8 @@ def main() -> int:
             print(f"（自动发现 Keil：{cand}）")
     cases = load_cases()
     fmt = lambda v: f"{v} B" if v is not None else "—"
-    print(f"{'用例':<14}{'mcs2':>8}{'SDCC 4.6':>9}{'Keil C51':>9}{'mcs2 DSEG':>11}{'Keil DATA':>11}   备注")
+    print(f"{'用例':<14}{'mcs2':>8}{'SDCC':>7}{'Keil':>7}"
+          f"{'周期m':>8}{'周期S':>8}{'周期K':>8}{'DSEG':>7}{'KDATA':>7}   备注")
     print("-" * 96)
     for tag, lst_name, label, c_fn, note in cases:
         ours = fn_size(BUILD / lst_name, label)
@@ -177,7 +179,40 @@ def main() -> int:
             ktext = c_file("keil", tag).read_text(encoding="utf-8")
             kl, kd = _keil_sizes(ktext, f"cmp_{tag}")
         dseg = mcs2_dseg(lst_name.replace(".lst", ""))
-        print(f"{tag:<14}{fmt(ours):>8}{fmt(sd):>9}{fmt(kl):>9}{fmt(dseg):>11}{fmt(kd):>11}   {note}")
+        cy_m = cy_s = cy_k = None
+        try:
+            asm_m = (BUILD / lst_name.replace(".lst", ".asm")).read_text(encoding="utf-8", errors="replace")
+            r = cycles51.fn_cycles(asm_m, label)
+            if not r["insns"]:
+                r = cycles51.fn_cycles(asm_m, f"{tag}_{label}")
+            if not r["insns"] and "_" in label:
+                r = cycles51.fn_cycles(asm_m, label.split("_", 1)[1])
+            if not r["insns"]:
+                lst_p = BUILD / lst_name
+                if lst_p.exists():
+                    lt = lst_p.read_text(encoding="utf-8", errors="replace")
+                    for cand in (label, f"{tag}_{label}", lst_p.stem):
+                        r = cycles51.fn_cycles_lst(lt, cand)
+                        if r["insns"]:
+                            break
+            cy_m = r["min"] if r["insns"] else None
+        except Exception:
+            pass
+        try:
+            asm_s = (BUILD / f"{tag}_sdcc.asm").read_text(encoding="utf-8", errors="replace")
+            r = cycles51.fn_cycles(asm_s, c_fn)
+            cy_s = r["min"] if r["insns"] else None
+        except Exception:
+            pass
+        if have_keil and (KEIL_DIR / f"k_cmp_{tag}.lst").exists():
+            klst = (KEIL_DIR / f"k_cmp_{tag}.lst").read_text(encoding="utf-8", errors="replace")
+            r = cycles51.fn_cycles(klst, "_" + c_fn, style="keil")
+            if not r["insns"]:
+                r = cycles51.fn_cycles(klst, c_fn, style="keil")
+            cy_k = r["min"] if r["insns"] else None
+        f2 = lambda v: f"{v}" if v is not None else "—"
+        print(f"{tag:<14}{fmt(ours):>8}{fmt(sd):>7}{fmt(kl):>7}"
+              f"{f2(cy_m):>8}{f2(cy_s):>8}{f2(cy_k):>8}{f2(dseg):>7}{f2(kd):>7}   {note}")
     if not have_keil:
         print("\n（Keil 列未采集：设置 KEIL_BIN=<Keil>\\C51\\BIN 后重跑）")
     return 0
