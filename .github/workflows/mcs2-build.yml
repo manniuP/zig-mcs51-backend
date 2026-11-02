@@ -1,0 +1,45 @@
+name: mcs2 构建（Windows / Linux）
+
+on:
+  push:
+    branches: [mcs2-0.17]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # 引导用的上游 Zig：与本树基线一致（0.17）
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+
+      - name: 构建编译器（ReleaseFast）
+        shell: bash
+        run: |
+          zig version
+          zig build -Doptimize=ReleaseFast -Dno-lib --summary all
+
+      - name: 冒烟：用产物编一个示例
+        shell: bash
+        run: |
+          BIN=$(ls zig-out/bin/zig* | head -1)
+          echo "compiler: $BIN"
+          cd examples/mcs51
+          ZIG_LIB_DIR=$PWD/../../lib "$PWD/../../$BIN" build || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zig-mcs51-${{ matrix.name }}
+          path: |
+            zig-out/bin/zig*
