@@ -75,7 +75,7 @@ cd examples/mcs51 && zig build -Dzig=../../zig-out/bin/zig
 
 # 验收与测量
 cd ../../tools/mcs2
-python mcs2.py check            # 133 项仿真验收（ucsim 8052）
+python mcs2.py check            # 135 项仿真验收（ucsim 8052）
 python bench_compare.py         # 生成上表（需要 SDCC bin；Keil 可选，设 KEIL_BIN 或自动发现）
 python fwsize.py                # 另一套口径：整份固件（含被拉进来的库）
 ```
@@ -139,7 +139,7 @@ export fn px(z: u8, y: u8, x: u8, c: u16) void {
 | `src/codegen/mcs2/mir.zig` | 极小的 MIR 指令集（一条指令 = 一段固定汇编模板） |
 | `src/codegen/mcs2/mcs51.zig` | MIR → 8051 汇编发射器（DPTR 复用、跳转松弛、位地址换算） |
 | `src/link/Asx.zig` | ASxxxx 链接抽象（全局变量与 `const` 表的数据发射） |
-| `examples/mcs51/` | **全部示例与验收用例**：`src/*.zig`（49 个文件 / 133 项）、`lib/cordic.zig`、统一的 `build.zig` |
+| `examples/mcs51/` | **全部示例与验收用例**：`src/*.zig`（48 个文件 / 135 项）、`lib/cordic.zig`、统一的 `build.zig` |
 | `tools/mcs2/` | 验收驱动（编译→汇编→链接→ucsim 比对）、三方尺寸对比、能力探针、真机脚本 |
 
 ## 已知限制
@@ -155,10 +155,11 @@ export fn px(z: u8, y: u8, x: u8, c: u16) void {
 
 ## 验证
 
-- **仿真**：133 项用例，经 `sdas8051`+`sdld` 链成 `.ihx` 后在 ucsim-51（8052 模式）里读回 xdata 判定。
-- **真机**：26 组固件脚本（`tools/mcs2/realcheck.py`）在 AI8051U-34K64（8 位模式）上跑通；
+- **仿真**：135 项用例，经 `sdas8051`+`sdld` 链成 `.ihx` 后在 ucsim-51（8052 模式）里读回 xdata 判定。
+- **真机**：129 项 / 42 组固件（`tools/mcs2/realcheck.py`）在 AI8051U-34K64（8 位模式）上跑通；
   同一套脚本也能无板自检（`--sim`，与仿真用例共用同一份 `.ihx`）。
-- **三方对照**：`bench_compare.py` / `fwsize.py` 随时重算上面两张表。
+- **三方对照**：`bench_compare.py` / `fwsize.py` 随时重算上面两张表；
+  对比源码集中在 `examples/compare/c/{sdcc,keil}/`，25 例结果见 `docs/对比-全部示例-2026-11-02.md`。
 
 ## 与上游 Zig 的差异
 
