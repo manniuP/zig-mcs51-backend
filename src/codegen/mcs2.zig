@@ -74,12 +74,30 @@ var session_label_base: u32 = 0;
 /// 诊断开关（默认 false）：ISR 跳过 push/pop 保存恢复——仅定位 ucsim 中断行为时临时置 true。
 /// 真机必须保存现场（主代码用 A/DPTR 时，ISR 不保存会踩坏返回值）。
 var no_isr_save: bool = false;
+/// 实验开关：true = 操作数是存储别名时禁止原地写回（正确但 DSEG 涨到 110B，装不下）。
+const forbid_alias_reuse: bool = false;
+/// 诊断：MCS2_NO_REUSE_WIDE=1 关掉「宽运算原地写回」（定位 reuseWideDst 的误判）。
+var no_reuse_wide: bool = false; // 诊断开关：诊断时手工改 true
+/// 实验开关：只读消费者的结果分到临时槽。实测 DSEG 98→115（更差），默认关。
+const scratch_results: bool = true;
+/// 记账开关：打印每个永久 allocWide 块（AIR 指令、槽基址、宽度、最后读取点）。
+const account_wide: bool = true; // 记账开关
 
 /// 一个 8 位值的位置（M1：全部经 direct 寻址可达）。
 const Loc = mcsmir.Byte;
 
 /// 指针值：固定地址（`@ptrFromInt` 常量）、符号基址（全局/静态变量），
 /// 各自再带「+ 运行期下标 × scale」。
+/// 多维下标的一项：addr += idx * scale
+const DTerm = struct { idx: Loc = .{ .imm = 0 }, scale: u32 = 1 };
+
+/// 多维下标的基址
+const ChainBase = union(enum) {
+    fixed: u64,
+    sym: struct { sym: []const u8, off: u64 = 0 },
+    rt: struct { lo: Loc, hi: Loc, off: u64 = 0 },
+};
+
 const PtrRef = union(enum) {
     fixed: u64,
     /// scale = 元素字节数：地址 = base + idx*scale（2 = u16/函数指针，4 = u32）
@@ -92,6 +110,13 @@ const PtrRef = union(enum) {
     code_sym: struct { sym: []const u8, off: u64 = 0 },
     /// `const` 表 + 运行期下标（同上，代码段）
     code_elem_sym: struct { sym: []const u8, off: u64 = 0, idx: Loc, scale: u8 = 1 },
+    /// **运行期指针做基址**：地址在两个槽里（低字节在前）。`p[i]` 的 p 是参数/指针变量。
+    rt: struct { lo: Loc, hi: Loc, off: u64 = 0 },
+    /// 运行期指针 + 运行期下标：地址 = base + off + idx*scale
+    rt_elem: struct { lo: Loc, hi: Loc, off: u64 = 0, idx: Loc, scale: u8 = 1 },
+    /// **多维**（屏幕帧缓冲 `fb[z][y][x]` 这种）：地址 = 基址 + Σ idx_k * scale_k。
+    /// 已有的单下标形态继续走上面几个变体（更省），第二次下标才升级成链。
+    chain: struct { base: ChainBase, n: u8 = 0, terms: [4]DTerm = .{ .{}, .{}, .{}, .{} } },
 };
 
 /// 带返回值块的结果槽：`inst` 是块指令，`base/width` 是 DSEG 槽。
@@ -127,6 +152,8 @@ const Lower = struct {
     ret_wide: u8 = 1,
     ret_byte: ?u8, // u8 返回的 ABI 地址；void 时为 null
     saw_ret: bool = false,
+    /// 已判成尾调用的那条 `ret`（发射到它时直接跳过：控制流已经在 `ljmp` 处走了）。
+    tail_ret: ?Air.Inst.Index = null,
     /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
     label_base: u32 = 0,
     /// comptime 数组常量池：`const tbl = .{…}` 的 `tbl[i]`（运行期下标）在 AIR 里是
@@ -144,6 +171,15 @@ const Lower = struct {
     slot_used: [256]bool = @splat(false),
     /// 本条指令里分配的可回收槽段（flushTemps 时归还）
     temp_runs: [24]struct { base: u8, n: u8 } = @splat(.{ .base = 0, .n = 0 }),
+    /// 每个临时段属于哪条指令（生命周期判定用）：owner 还有后续读者就不能回收。
+    temp_owner: [24]Air.Inst.Index = @splat(@enumFromInt(0)),
+    /// 短寿命 scratch：按 AIR 最后读取点回收（Kimi 2026-11-02 的方案）。
+    scratch_runs: [32]struct { base: u8, n: u8, last: usize } = @splat(.{ .base = 0, .n = 0, .last = 0 }),
+    scratch_n: u8 = 0,
+    /// 本条指令的结果是否允许放 scratch（由 emitBody 每条指令算好）。
+    cur_scratch_ok: bool = false,
+    /// 正在 lower 的指令（temp 分配时记录 owner）。
+    cur_inst: Air.Inst.Index = @enumFromInt(0),
     temp_n: u8 = 0,
     /// arg2 是否落在 B 寄存器（0xF0）。MUL/DIV 会破坏 B，用到时要保存/恢复。
     b_is_arg: bool = false,
@@ -157,6 +193,8 @@ const Lower = struct {
     /// 16/32 按宽度。算术闸门仍然是 requireIntWidth（只认 8/16/32），
     /// 所以「能存」不会变成「能静默错算」。
     fn storageBytes(self: *Lower, ty: Type, comptime what: []const u8) codegen.Error!u8 {
+        // mcs51 的指针就是 2 字节地址（arg0 时在 DPL/DPH，其余在 PARM 两字节）。
+        if (ty.zigTypeTag(self.zcu) == .pointer) return 2;
         if (ty.zigTypeTag(self.zcu) != .int) return 1;
         const bits = ty.bitSize(self.zcu);
         if (bits <= 8) return 1;
@@ -292,7 +330,135 @@ const Lower = struct {
         return self.ptr_vals[@backingInt(idx)];
     }
 
-    /// 读指针 pr 的第 k 字节到槽 dst（四种基址形态统一在这里）。
+    /// 一个类型占多少字节（数组 = 各维乘积 × 元素宽）。多维下标的**步长**要整块大小，
+    /// 不能只取最内层元素（`[32][64]u16` 的步长是 4096，不是 2）。
+    fn pointeeBytes(self: *Lower, ty: Type, comptime what: []const u8) codegen.Error!u32 {
+        var t = ty;
+        var n: u32 = 1;
+        while (t.zigTypeTag(self.zcu) == .array) {
+            n *= @intCast(t.arrayLen(self.zcu));
+            if (n > 0x10000) return self.fail("{s}：元素跨度超过 64 KB", .{what});
+            t = t.childType(self.zcu);
+        }
+        const eb = try self.storageBytes(t, what);
+        return n * eb;
+    }
+
+    /// 取下标：常量直接成 imm；16 位下标拆成低/高两个槽（多维链按项加）。
+    const IndexSlot = struct { lo: Loc, hi: ?Loc = null };
+    /// 宽度按**实际槽宽**（`wide` 表）判断，不看类型：Zig 把下标从 u8/u16 转成 usize(24 位)，
+    /// 但 int_cast 是透传，槽里仍是 1 或 2 字节 —— 按类型判断会读到邻槽。
+    fn indexLoc(self: *Lower, ref: Air.Inst.Ref) codegen.Error!IndexSlot {
+        if (self.constU8(ref)) |k| return .{ .lo = .{ .imm = k } };
+        if (self.wideOf(ref)) |w| {
+            const n: u8 = @truncate(w >> 8);
+            if (n >= 2) {
+                const base: u8 = @truncate(w & 0xFF);
+                return .{ .lo = mcsmir.v(base), .hi = mcsmir.v(base + 1) };
+            }
+        }
+        return .{ .lo = try self.refLoc(ref) };
+    }
+
+    /// 「多维链」追加一维（新下标可以占 1 或 2 个字节）。
+    /// 16 位下标拆成两项：低字节×步长 + 高字节×(步长<<8) —— 只做 8×8 MUL，不做 16×16。
+    fn chainAppend(self: *Lower, base: ChainBase, terms: []const DTerm, idx: Loc, sc: u32, idx_hi: ?Loc) codegen.Error!PtrRef {
+        var c = PtrRef{ .chain = .{ .base = base } };
+        var n: u8 = 0;
+        for (terms) |t| {
+            if (n >= 3) return self.fail("多维下标项过多", .{});
+            c.chain.terms[n] = t;
+            n += 1;
+        }
+        c.chain.terms[n] = .{ .idx = idx, .scale = sc };
+        n += 1;
+        if (idx_hi) |hi| {
+            const hs = (sc << 8) & 0xFFFF;
+            if (hs != 0) {
+                c.chain.terms[n] = .{ .idx = hi, .scale = hs };
+                n += 1;
+            }
+        }
+        c.chain.n = n;
+        return c;
+    }
+
+    /// 在已有基址上再加一维（统一的「取元素地址」规则）。
+    /// 单下标变体的 scale/idx 都是 u8：**步长 > 255 或 16 位下标** 只能升级成链。
+    fn indexedRef(self: *Lower, pr: PtrRef, idx: Loc, idx_hi: ?Loc, sc: u32) codegen.Error!PtrRef {
+        if (sc > 255 or idx_hi != null) return switch (pr) {
+            .fixed => |b| try self.chainAppend(.{ .fixed = b }, &.{}, idx, sc, idx_hi),
+            .sym_off => |s| try self.chainAppend(.{ .sym = .{ .sym = s.sym, .off = s.off } }, &.{}, idx, sc, idx_hi),
+            .rt => |r| try self.chainAppend(.{ .rt = .{ .lo = r.lo, .hi = r.hi, .off = r.off } }, &.{}, idx, sc, idx_hi),
+            .elem => |e| try self.chainAppend(.{ .fixed = e.base }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
+            .elem_sym => |e| try self.chainAppend(.{ .sym = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
+            .rt_elem => |e| try self.chainAppend(.{ .rt = .{ .lo = e.lo, .hi = e.hi, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
+            .chain => |c| try self.chainAppend(c.base, c.terms[0..c.n], idx, sc, idx_hi),
+            .code_sym, .code_elem_sym => return self.fail("const 表的多维下标暂不支持（只有一维）", .{}),
+        };
+        return switch (pr) {
+            .fixed => |b| .{ .elem = .{ .base = b, .idx = idx, .scale = @intCast(sc) } },
+            .sym_off => |s| .{ .elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx, .scale = @intCast(sc) } },
+            .code_sym => |s| .{ .code_elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx, .scale = @intCast(sc) } },
+            .rt => |r| .{ .rt_elem = .{ .lo = r.lo, .hi = r.hi, .off = r.off, .idx = idx, .scale = @intCast(sc) } },
+            .elem => |e| try self.chainAppend(.{ .fixed = e.base }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
+            .elem_sym => |e| try self.chainAppend(.{ .sym = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
+            .rt_elem => |e| try self.chainAppend(.{ .rt = .{ .lo = e.lo, .hi = e.hi, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
+            .chain => |c| try self.chainAppend(c.base, c.terms[0..c.n], idx, sc, null),
+            .code_elem_sym => return self.fail("const 表的多维下标暂不支持（只有一维）", .{}),
+        };
+    }
+
+    /// 多维链 → DPTR：先装基址，再逐维 `dptr += idx*scale`。
+    fn emitDptrChain(self: *Lower, base: ChainBase, terms: []const DTerm, k: u8) codegen.Error!void {
+        switch (base) {
+            .fixed => |b| {
+                const a: u16 = @truncate(b + k);
+                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = 0x82, .src = .{ .imm = @truncate(a) } } });
+                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = 0x83, .src = .{ .imm = @truncate(a >> 8) } } });
+            },
+            .sym => |s| try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = s.sym, .off = @truncate(s.off + k) } }),
+            .rt => |r| {
+                try self.ops.append(self.gpa, .{ .add = .{ .dst = .{ .dir = 0x82 }, .lhs = r.lo, .rhs = .{ .imm = @truncate(r.off + k) } } });
+                try self.ops.append(self.gpa, .{ .addc = .{ .dst = .{ .dir = 0x83 }, .lhs = r.hi, .rhs = .{ .imm = @truncate((r.off + k) >> 8) } } });
+            },
+        }
+        for (terms) |t| {
+            try self.ops.append(self.gpa, .{ .dptr_add_scaled = .{ .idx = t.idx, .scale = @intCast(t.scale) } });
+        }
+    }
+    /// DPL/DPH = base(16 位，两个槽) + off [+ idx*scale]。
+    /// 全部用 add/addc 逐字节搭：**不碰 B**（B 可能载着 arg2），也不需要 mul。
+    fn emitDptrFromRt(self: *Lower, lo: Loc, hi: Loc, off: u64, idx: ?Loc, scale: u8) codegen.Error!void {
+        const o: u16 = @truncate(off);
+        try self.ops.append(self.gpa, .{ .add = .{
+            .dst = .{ .dir = 0x82 },
+            .lhs = lo,
+            .rhs = .{ .imm = @truncate(o) },
+        } });
+        try self.ops.append(self.gpa, .{ .addc = .{
+            .dst = .{ .dir = 0x83 },
+            .lhs = hi,
+            .rhs = .{ .imm = @truncate(o >> 8) },
+        } });
+        if (idx) |ix| {
+            var s: u8 = 0;
+            while (s < scale) : (s += 1) {
+                try self.ops.append(self.gpa, .{ .add = .{
+                    .dst = .{ .dir = 0x82 },
+                    .lhs = .{ .dir = 0x82 },
+                    .rhs = ix,
+                } });
+                try self.ops.append(self.gpa, .{ .addc = .{
+                    .dst = .{ .dir = 0x83 },
+                    .lhs = .{ .dir = 0x83 },
+                    .rhs = .{ .imm = 0 },
+                } });
+            }
+        }
+    }
+
+    /// 读指针 pr 的第 k 字节到槽 dst（多种基址形态统一在这里）。
     fn emitLoadByte(self: *Lower, pr: PtrRef, k: u8, dst: u8) codegen.Error!void {
         switch (pr) {
             .fixed => |base| {
@@ -325,6 +491,20 @@ const Lower = struct {
                 .idx = e.idx,
                 .scale = e.scale,
             } }),
+            // 运行期指针：DPL/DPH = base + off + idx*scale，再 movx。
+            .rt => |r| {
+                try self.emitDptrFromRt(r.lo, r.hi, r.off + k, null, 1);
+                try self.ops.append(self.gpa, .{ .load_xdata_dptr = .{ .dst = mcsmir.v(dst) } });
+            },
+            .rt_elem => |e| {
+                try self.emitDptrFromRt(e.lo, e.hi, e.off + k, e.idx, e.scale);
+                try self.ops.append(self.gpa, .{ .load_xdata_dptr = .{ .dst = mcsmir.v(dst) } });
+            },
+            // 多维（`fb[z][y][x]`）：基址 + 各维偏移，逐项加到 DPTR 上。
+            .chain => |c| {
+                try self.emitDptrChain(c.base, c.terms[0..c.n], k);
+                try self.ops.append(self.gpa, .{ .load_xdata_dptr = .{ .dst = mcsmir.v(dst) } });
+            },
             .code_sym => |s| try self.ops.append(self.gpa, .{ .load_code_sym = .{
                 .dst = mcsmir.v(dst),
                 .sym = s.sym,
@@ -373,6 +553,18 @@ const Lower = struct {
                 .src = src,
                 .scale = e.scale,
             } }),
+            .rt => |r| {
+                try self.emitDptrFromRt(r.lo, r.hi, r.off + k, null, 1);
+                try self.ops.append(self.gpa, .{ .store_xdata_dptr = .{ .src = src } });
+            },
+            .rt_elem => |e| {
+                try self.emitDptrFromRt(e.lo, e.hi, e.off + k, e.idx, e.scale);
+                try self.ops.append(self.gpa, .{ .store_xdata_dptr = .{ .src = src } });
+            },
+            .chain => |c| {
+                try self.emitDptrChain(c.base, c.terms[0..c.n], k);
+                try self.ops.append(self.gpa, .{ .store_xdata_dptr = .{ .src = src } });
+            },
             .code_sym, .code_elem_sym =>
                 return self.fail("`const` 表在代码段（movc 只读）：不能写入。要可变就声明成 var", .{}),
         }
@@ -427,6 +619,22 @@ const Lower = struct {
             }
         }
         return null;
+    }
+
+    /// 尾调用判定：本指令的结果被**紧接的** `ret` 原样返回？
+    /// 命中就返回那条 `ret` 的指令号（发射时跳过它——前面已经 `ljmp` 走掉了）。
+    /// `has_result=false` 表示被调方返回 void：这时 `ret` 的操作数也必须是 void，
+    /// 否则我们是"丢掉调用结果、返回别的值"，不能当尾调用。
+    fn tailRetOf(self: *Lower, body: []const Air.Inst.Index, idx: usize, inst: Air.Inst.Index, has_result: bool) ?Air.Inst.Index {
+        const ni = self.nextRealIdx(body, idx) orelse return null;
+        const ri = body[ni];
+        if (self.air.instructions.items(.tag)[@backingInt(ri)] != .ret) return null;
+        const rop = self.air.instructions.items(.data)[@backingInt(ri)].un_op;
+        if (has_result) {
+            const rop_idx = rop.toIndex() orelse return null;
+            if (rop_idx != inst) return null;
+        } else if (rop.toIndex() != null) return null;
+        return ri;
     }
 
     // ---- 多字节（u16/u32）表示与固定模板 ----
@@ -506,6 +714,7 @@ const Lower = struct {
     fn recordTemp(self: *Lower, base: u8, n: u8) void {
         if (self.temp_n >= self.temp_runs.len) return;
         self.temp_runs[self.temp_n] = .{ .base = base, .n = n };
+        self.temp_owner[self.temp_n] = self.cur_inst;
         self.temp_n += 1;
     }
 
@@ -539,7 +748,13 @@ const Lower = struct {
 
     /// 一块连续槽（函数结果的槽，不回收）
     fn allocWide(self: *Lower, n: u8) !u8 {
+        // 结果只被只读消费者吃 → 走 scratch（最后读取点之后自动还池）。
+        if (scratch_results and self.cur_scratch_ok) return self.allocScratch(n, self.cur_inst);
         const base = try self.allocSlots(n, false);
+        if (account_wide) {
+            const t = self.air.instructions.items(.tag)[@backingInt(self.cur_inst)];
+            std.debug.print("WIDE fn={s} tag={s} inst={d} base={d} n={d} last={d}\n", .{ self.short_name, @tagName(t), @backingInt(self.cur_inst), base, n, self.airLastRead(self.cur_inst) });
+        }
         var i: u8 = 0;
         while (i < n) : (i += 1) self.wide_blk[base + i] = true;
         return base;
@@ -582,9 +797,13 @@ const Lower = struct {
     fn fillHigh(self: *Lower, dst: u8, from: u8, n: u8, src_top: u8, signed: bool) !void {
         var i = from;
         if (signed) {
-            const e = try self.allocVreg();
-            try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(e), .src = mcsmir.v(src_top) } });
-            while (i < n) : (i += 1) try self.movTo(dst + i, mcsmir.v(e));
+            if (from < n) {
+                // 第一个高位直接 sex 进目标，其余从它复制 —— 省掉一个中转槽和一条 mov。
+                // 原来：sex → 临时槽 e；再 mov dst+i, e（i 全遍历）。
+                try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(dst + from), .src = mcsmir.v(src_top) } });
+                i = from + 1;
+                while (i < n) : (i += 1) try self.movTo(dst + i, mcsmir.v(dst + from));
+            }
         } else {
             while (i < n) : (i += 1) try self.immTo(dst + i, 0);
         }
@@ -646,8 +865,10 @@ const Lower = struct {
             try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(dst + 1), .lhs = mcsmir.v(dst + 1), .rhs = mcsmir.v(t2) } });
             return;
         }
-        const t = try self.allocWide(n);
-        const ctr = try self.allocVreg();
+        // 内部工作副本只在本次乘法里用（结果另有一块）→ 用临时槽，指令结束就还池。
+        // 原来用 allocWide 会永久占 n 字节：hypot 里两次 u32 乘法白扔 8 B。
+        const t = try self.allocTempWide(n);
+        const ctr = try self.allocSlots(1, true);
         var k: u8 = 0;
         while (k < n) : (k += 1) {
             try self.immTo(dst + k, 0);
@@ -773,6 +994,165 @@ const Lower = struct {
     /// 把一个操作数准备成 n 个连续槽位，返回基址。
     /// 变宽时按来源类型的符号性补位：无符号补 0，有符号补符号位——
     /// 这就是 i8→i16→i32 的符号扩展，也是负数常量变宽的位模式来源。
+    /// 「结果原地写回 lhs」的判定：lhs 在本条指令之后不再被读、且它本来就是 n 字节块。
+    /// 每个二元宽运算都新开 n 个槽是 DSEG 的主要来源之一（CORDIC 的 `x -= y` 尤其多）。
+    /// 注意必须要求 `a` 就是 lhs 自己的块基址 —— 宽度不等时 wideOperand 会拷进临时槽，
+    /// 那种槽在指令结束就被回收，不能当结果。
+    fn reuseWideDst(self: *Lower, body: []const Air.Inst.Index, idx: usize, lhs: Air.Inst.Ref, a: u8, n: u8) bool {
+        if (no_reuse_wide) return false;
+        const w = self.wideOf(lhs) orelse return false;
+        if (@as(u8, @truncate(w >> 8)) != n) return false;
+        if (@as(u8, @truncate(w & 0xFF)) != a) return false;
+        const alias = self.wideIsAlias(lhs, n);
+        // ① 操作数是**存储别名**（变量槽）：只能按「紧接着存回同一个局部槽」放行。
+        //    用引用计数在这里是错的 —— 变量每次读都重新 load，那条 load 永远只被本指令用，
+        //    于是计数恒为 0，`n >= res + bit` 就会把结果写进 res 的存储（2026-11-02 的 bug）。
+        if (alias) {
+            if (idx + 1 >= body.len) return false;
+            const next = body[idx + 1];
+            const next_tag = self.air.instructions.items(.tag)[@backingInt(next)];
+            switch (next_tag) {
+                .store, .store_safe => {},
+                else => { return false; },
+            }
+            const st = self.air.instructions.items(.data)[@backingInt(next)].bin_op;
+            const rhs_i = st.rhs.toIndex() orelse return false;
+            if (@backingInt(rhs_i) != @backingInt(body[idx])) return false;
+            if (self.ptrRefOf(st.lhs) != null) { return false; }
+            const dest = self.refLoc(st.lhs) catch return false;
+            const dslot: u8 = switch (dest) {
+                .vreg => |v| v,
+                else => return false,
+            };
+            if (dslot != a) { return false; }
+            const sty = self.air.typeOf(st.rhs, &self.zcu.intern_pool);
+            const sw = self.storageBytes(sty, "写回宽度") catch return false;
+            if (sw != n) { return false; }
+            return true;
+        }
+        // ② 操作数本身就是临时槽（SSA 语义成立）：沿用「定义在本块 + 全函数无人再读」。
+        const ti = lhs.toIndex() orelse return false;
+        var defined_here = false;
+        for (body[0..idx]) |ins| {
+            if (@backingInt(ins) == @backingInt(ti)) {
+                defined_here = true;
+                break;
+            }
+        }
+        if (!defined_here) return false;
+        return self.useCountWholeAir(ti, body[idx]) == 0;
+    }
+
+    /// 这条指令的值在全函数里最后一次被读的位置（下标）；没人读返回 0。
+    fn airLastRead(self: *Lower, target: Air.Inst.Index) usize {
+        var last: usize = 0;
+        var i: usize = 0;
+        while (i < self.air.instructions.len) : (i += 1) {
+            const ins: Air.Inst.Index = @enumFromInt(i);
+            if (@backingInt(ins) == @backingInt(target)) continue;
+            if (self.instUsesValue(ins, target)) last = i;
+        }
+        return last;
+    }
+
+    /// 分配一段「到期自动回收」的 scratch（宽结果用）。到期 = 最后读取点已过。
+    fn allocScratch(self: *Lower, n: u8, owner: Air.Inst.Index) !u8 {
+        const base = try self.allocSlots(n, false);
+        var i: u8 = 0;
+        while (i < n) : (i += 1) self.wide_blk[base + i] = true;
+        if (self.scratch_n < self.scratch_runs.len) {
+            self.scratch_runs[self.scratch_n] = .{ .base = base, .n = n, .last = self.airLastRead(owner) };
+            self.scratch_n += 1;
+        }
+        return base;
+    }
+
+    /// 回收所有「最后读取点已经过去」的 scratch。
+    fn freeDeadScratch(self: *Lower, at: usize) void {
+        var w: u8 = 0;
+        var i: u8 = 0;
+        while (i < self.scratch_n) : (i += 1) {
+            const r = self.scratch_runs[i];
+            if (r.last >= at) {
+                self.scratch_runs[w] = r;
+                w += 1;
+                continue;
+            }
+            var k: u8 = 0;
+            while (k < r.n) : (k += 1) {
+                self.slot_used[@intCast(@as(u16, r.base) + k)] = false;
+                self.wide_blk[@intCast(@as(u16, r.base) + k)] = false;
+            }
+        }
+        self.scratch_n = w;
+    }
+
+    /// 该宽操作数是不是**直接别名到存储**（变量槽/固定地址），而不是一份临时拷贝。
+    /// wideOperand 在 width 正好相等时直接返回原槽 ⇒ 原地写回会踩掉变量本身。
+    /// 本条指令的结果是否**只被下一条指令只读消费**（cmp / 作加减法的右操作数 / 写存储的值）。
+    /// 只有这些形态才允许把结果分到临时槽：它们读一次就走，不会被写回去。
+    /// `load`、未知消费者一律不放行（可能把结果当自己的落点，临时槽会被提前复用）。
+    /// 本条指令的结果是否**所有消费者都只读**（cmp / 加减法右操作数 / 乘除任一侧 / store 值 / 实参 / 返回值）。
+    /// 只读消费者读一次就走、不会把结果当落点，所以结果可以放 scratch（最后读取点后自动还池）。
+    /// 注意要看**全函数所有使用者**：只看下一条会漏掉「先算两个、再一起用」的形态（hypot 就是）。
+    fn scratchConsumerOk(self: *Lower, body: []const Air.Inst.Index, idx: usize) bool {
+        const cur = body[idx];
+        var uses: usize = 0;
+        var i: usize = 0;
+        while (i < self.air.instructions.len) : (i += 1) {
+            const ins: Air.Inst.Index = @enumFromInt(i);
+            if (@backingInt(ins) == @backingInt(cur)) continue;
+            if (!self.instUsesValue(ins, cur)) continue;
+            uses += 1;
+            if (!self.isReadOnlyUse(ins, cur)) return false;
+        }
+        return uses > 0;
+    }
+
+    /// 单条指令对某个值的用法是不是「只读」。
+    fn isReadOnlyUse(self: *Lower, ins: Air.Inst.Index, target: Air.Inst.Index) bool {
+        const tag = self.air.instructions.items(.tag)[@backingInt(ins)];
+        const d = self.air.instructions.items(.data)[@backingInt(ins)];
+        const t = @backingInt(target);
+        switch (tag) {
+            .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq => {
+                if (d.bin_op.lhs.toIndex()) |x| if (@backingInt(x) == t) return true;
+                if (d.bin_op.rhs.toIndex()) |x| if (@backingInt(x) == t) return true;
+            },
+            .mul, .mul_wrap, .div_trunc, .rem => {
+                if (d.bin_op.lhs.toIndex()) |x| if (@backingInt(x) == t) return true;
+                if (d.bin_op.rhs.toIndex()) |x| if (@backingInt(x) == t) return true;
+            },
+            .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap => {
+                if (d.bin_op.rhs.toIndex()) |x| if (@backingInt(x) == t) return true;
+            },
+            .store, .store_safe => {
+                if (d.bin_op.rhs.toIndex()) |x| if (@backingInt(x) == t) return true;
+            },
+            .ret, .ret_safe => {
+                if (d.un_op.toIndex()) |x| if (@backingInt(x) == t) return true;
+            },
+            .call, .call_always_tail, .call_never_tail, .call_never_inline => {
+                const ci = self.air.unwrapCall(ins);
+                for (ci.args) |a| {
+                    if (a.toIndex()) |x| {
+                        if (@backingInt(x) == t) return true;
+                    }
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
+    fn wideIsAlias(self: *Lower, ref: Air.Inst.Ref, n: u8) bool {
+        if (self.wideOf(ref)) |w| {
+            const wn: u8 = @truncate(w >> 8);
+            return wn == n;
+        }
+        return false;
+    }
+
     fn wideOperand(self: *Lower, ref: Air.Inst.Ref, n: u8) !u8 {
         const sgn = blk: {
             const ty = self.air.typeOf(ref, &self.zcu.intern_pool);
@@ -980,45 +1360,79 @@ const Lower = struct {
 
 
 
+    /// 这条 AIR 是否读取 target。供局部优化与全函数死亡判定共用。
+    fn instUsesValue(self: *Lower, ins: Air.Inst.Index, target: Air.Inst.Index) bool {
+        const tag = self.air.instructions.items(.tag)[@backingInt(ins)];
+        const d = self.air.instructions.items(.data)[@backingInt(ins)];
+        switch (tag) {
+            // 二元操作：**所有** bin_op 形态都要算进来。
+            // 早期只列了 add/sub/cmp，漏掉 shr/mul/bit_and ... 会让 useCountWholeAir
+            // 误判「值已死」，原地写回提前覆盖源槽（sqrt32 的 res >> 1 就是这么错的）。
+            .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap,
+            .mul, .mul_wrap, .div_trunc, .rem,
+            .bit_and, .bit_or, .xor, .shl, .shr, .shl_exact, .shr_exact,
+            .store, .store_safe,
+            .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq,
+            => {
+                if (d.bin_op.lhs.toIndex()) |x| {
+                    if (@backingInt(x) == @backingInt(target)) return true;
+                }
+                if (d.bin_op.rhs.toIndex()) |x| {
+                    if (@backingInt(x) == @backingInt(target)) return true;
+                }
+            },
+            // 单操作数消费者：比较结果被 return / 转换 / 取反直接吃掉时也算「当值用」。
+            .ret, .ret_safe => {
+                if (d.un_op.toIndex()) |x| {
+                    if (@backingInt(x) == @backingInt(target)) return true;
+                }
+            },
+            // 带返回值块通过 br 把值写入内存 phi；漏算就会提前覆盖源槽。
+            .br => {
+                if (d.br.operand.toIndex()) |x| {
+                    if (@backingInt(x) == @backingInt(target)) return true;
+                }
+            },
+            // 调用实参/被调方也是使用者：漏了会让 airLastRead 返回 0，
+            // 既误判「值已死」，也错过「实参是只读消费者」的 scratch 机会。
+            .call, .call_always_tail, .call_never_tail, .call_never_inline => {
+                const ci = self.air.unwrapCall(ins);
+                if (ci.callee.toIndex()) |x| {
+                    if (@backingInt(x) == @backingInt(target)) return true;
+                }
+                for (ci.args) |a| {
+                    if (a.toIndex()) |x| {
+                        if (@backingInt(x) == @backingInt(target)) return true;
+                    }
+                }
+            },
+            .int_cast, .int_cast_safe, .trunc, .not, .bit_cast => {
+                if (d.ty_op.operand.toIndex()) |x| {
+                    if (@backingInt(x) == @backingInt(target)) return true;
+                }
+            },
+            else => {},
+        }
+        return false;
+    }
+
     /// P1：数一数某条指令的值在 body 里被用了几次（跳过 skip 位置）。
     fn useCount(self: *Lower, body: []const Air.Inst.Index, target: Air.Inst.Index, skip: usize) usize {
         var n: usize = 0;
         for (body, 0..) |ins, k| {
-            if (k == skip) continue;
-            const tag = self.air.instructions.items(.tag)[@backingInt(ins)];
-            const d = self.air.instructions.items(.data)[@backingInt(ins)];
-            var hit = false;
-            switch (tag) {
-                .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap, .store, .store_safe => {
-                    if (d.bin_op.lhs.toIndex()) |x| {
-                        if (@backingInt(x) == @backingInt(target)) hit = true;
-                    }
-                    if (d.bin_op.rhs.toIndex()) |x| {
-                        if (@backingInt(x) == @backingInt(target)) hit = true;
-                    }
-                },
-                .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq => {
-                    if (d.bin_op.lhs.toIndex()) |x| {
-                        if (@backingInt(x) == @backingInt(target)) hit = true;
-                    }
-                    if (d.bin_op.rhs.toIndex()) |x| {
-                        if (@backingInt(x) == @backingInt(target)) hit = true;
-                    }
-                },
-                // 单操作数消费者：比较结果被 return / 转换 / 取反直接吃掉时也算「当值用」。
-                .ret, .ret_safe => {
-                    if (d.un_op.toIndex()) |x| {
-                        if (@backingInt(x) == @backingInt(target)) hit = true;
-                    }
-                },
-                .int_cast, .int_cast_safe, .trunc, .not, .bit_cast => {
-                    if (d.ty_op.operand.toIndex()) |x| {
-                        if (@backingInt(x) == @backingInt(target)) hit = true;
-                    }
-                },
-                else => {},
-            }
-            if (hit) n += 1;
+            if (k != skip and self.instUsesValue(ins, target)) n += 1;
+        }
+        return n;
+    }
+
+    /// 原地写回专用：跨块引用也算存活，skip 是要排除的当前指令。
+    fn useCountWholeAir(self: *Lower, target: Air.Inst.Index, skip: Air.Inst.Index) usize {
+        var n: usize = 0;
+        var i: usize = 0;
+        while (i < self.air.instructions.len) : (i += 1) {
+            const ins: Air.Inst.Index = @enumFromInt(i);
+            if (@backingInt(ins) == @backingInt(skip)) continue;
+            if (self.instUsesValue(ins, target)) n += 1;
         }
         return n;
     }
@@ -1317,6 +1731,11 @@ const Lower = struct {
         };
     }
 
+    /// 宽块在 MIR 里只保存首槽号；重命名时必须移动整个基址，不能只映射其中的临时字节。
+    fn mapWideVreg(v: u8, map: *const [256]?u8) u8 {
+        return map[v] orelse v;
+    }
+
     fn mapOpVregs(op: mcsmir.Op, map: *const [256]?u8) mcsmir.Op {
         return switch (op) {
             .imm => |x| .{ .imm = .{ .dst = mapByteVreg(x.dst, map), .value = x.value } },
@@ -1339,13 +1758,16 @@ const Lower = struct {
             .rlc => |x| .{ .rlc = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
             .rrc => |x| .{ .rrc = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
             .subb => |x| .{ .subb = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
-            .clr_c => op,
+            .clr_c, .ljmp => op,
+            .load_xdata_dptr => |x| .{ .load_xdata_dptr = .{ .dst = mapByteVreg(x.dst, map) } },
+            .dptr_add_scaled => |x| .{ .dptr_add_scaled = .{ .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
+            .store_xdata_dptr => |x| .{ .store_xdata_dptr = .{ .src = mapByteVreg(x.src, map) } },
             .shl => |x| .{ .shl = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
             .shr => |x| .{ .shr = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n, .arith = x.arith } },
             .sex => |x| .{ .sex = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
             .cmp_wide_br => |x| .{ .cmp_wide_br = .{
-                .lhs = x.lhs,
-                .rhs = x.rhs,
+                .lhs = mapWideVreg(x.lhs, map),
+                .rhs = mapWideVreg(x.rhs, map),
                 .n = x.n,
                 .tmp = mapByteVreg(x.tmp, map),
                 .cc = x.cc,
@@ -1360,8 +1782,8 @@ const Lower = struct {
             .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
             .load_xdata_idx => |x| .{ .load_xdata_idx = .{ .dst = mapByteVreg(x.dst, map), .base = x.base, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
             .store_xdata_idx => |x| .{ .store_xdata_idx = .{ .base = x.base, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map), .scale = x.scale } },
-            .load_xdata_idx_sym => |x| .{ .load_xdata_idx_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
-            .store_xdata_idx_sym => |x| .{ .store_xdata_idx_sym = .{ .sym = x.sym, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map), .scale = x.scale } },
+            .load_xdata_idx_sym => |x| .{ .load_xdata_idx_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .off = x.off, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
+            .store_xdata_idx_sym => |x| .{ .store_xdata_idx_sym = .{ .sym = x.sym, .off = x.off, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map), .scale = x.scale } },
             .load_xdata_sym => |x| .{ .load_xdata_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .off = x.off } },
             .load_code_sym => |x| .{ .load_code_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .off = x.off } },
             .load_code_idx_sym => |x| .{ .load_code_idx_sym = .{ .dst = mapByteVreg(x.dst, map), .sym = x.sym, .off = x.off, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
@@ -1371,7 +1793,10 @@ const Lower = struct {
             .cmp_br => |x| .{ .cmp_br = .{ .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map), .cc = x.cc, .target = x.target } },
             .dec_br_nz => |x| .{ .dec_br_nz = .{ .dst = mapByteVreg(x.dst, map), .target = x.target } },
             .br_c, .lcall => op,
-            .lcall_ind => op,
+            .lcall_ind => |x| .{ .lcall_ind = .{
+                .target = mapWideVreg(x.target, map),
+                .save = mapByteVreg(x.save, map),
+            } },
             .push => |x| .{ .push = .{ .src = mapByteVreg(x.src, map) } },
             .pop => |x| .{ .pop = .{ .dst = mapByteVreg(x.dst, map) } },
             .dec => op, // 载荷是裸 vreg 下标；对应 vreg 已被禁用映射
@@ -1413,7 +1838,34 @@ const Lower = struct {
             }
         }.f;
 
-        // 把「连续 wide_blk」的槽并成一组（多字节块必须整段连着搬）
+        // 多字节块必须整段连着搬。除了仍然存活的 wide_blk，还要从 MIR 恢复
+        // 临时宽块的邻接约束：临时槽在每条 AIR 末尾归还时 wide_blk 已清除，
+        // 但 cmp_wide_br/lcall_ind 里的基址仍要求原来的若干槽保持连续。
+        var wide_join: [255]bool = @splat(false);
+        if (nv > 1) {
+            var j: usize = 0;
+            while (j + 1 < nv) : (j += 1) {
+                wide_join[j] = self.wide_blk[j] and self.wide_blk[j + 1];
+            }
+        }
+        for (ops) |op| switch (op) {
+            .cmp_wide_br => |x| {
+                const width: usize = x.n;
+                var k: usize = 0;
+                while (k + 1 < width) : (k += 1) {
+                    const at: usize = @as(usize, x.lhs) + k;
+                    if (at + 1 < nv) wide_join[at] = true;
+                    const ar: usize = @as(usize, x.rhs) + k;
+                    if (ar + 1 < nv) wide_join[ar] = true;
+                }
+            },
+            .lcall_ind => |x| {
+                const at: usize = x.target;
+                if (at + 1 < nv) wide_join[at] = true;
+            },
+            else => {},
+        };
+
         var group_of: [256]u16 = @splat(0xFFFF);
         var group_base: [256]u8 = @splat(0);
         var group_len: [256]u8 = @splat(1);
@@ -1421,9 +1873,7 @@ const Lower = struct {
         var v: usize = 0;
         while (v < nv) {
             var len: usize = 1;
-            if (self.wide_blk[v]) {
-                while (v + len < nv and self.wide_blk[v + len]) len += 1;
-            }
+            while (v + len < nv and wide_join[v + len - 1]) len += 1;
             group_base[n_groups] = @intCast(v);
             group_len[n_groups] = @intCast(len);
             var k: usize = 0;
@@ -1474,10 +1924,11 @@ const Lower = struct {
         i_loop: {
             var i: usize = 0;
             while (i < n_ops) : (i += 1) {
-                // 释放已经死掉的槽位
+                // 最后读取所在指令执行完后才释放。多字节 MIR 内部可能先写目标、
+                // 再继续读源，不能让同一条指令里的“死亡源”和“新生目标”共槽。
                 var s: usize = 0;
                 while (s < hi) : (s += 1) {
-                    if (!slot_free[s] and slot_die[s] <= i) slot_free[s] = true;
+                    if (!slot_free[s] and slot_die[s] < i) slot_free[s] = true;
                 }
                 // 看看有没有组在这一条 op 上出生
                 g = 0;
@@ -1485,7 +1936,9 @@ const Lower = struct {
                     if (g_def[g] != i) continue;
                     const len = group_len[g];
                     if (g_pin[g]) {
-                        // 钉住的组：永远放在水线之上
+                        // 钉住的组：永远放在当前高水位之上。此前可复用组可能
+                        // 已经把 hi 推高，不能仍从旧 pin_hi 分配而覆盖活动槽。
+                        if (pin_hi < hi) pin_hi = hi;
                         if (pin_hi + len > 255) break :i_loop;
                         new_of_group[g] = @intCast(pin_hi);
                         s = pin_hi;
@@ -1641,6 +2094,12 @@ const Lower = struct {
         };
     }
 
+    fn isWideVreg(base: u8, n: u8, r: u8) bool {
+        const begin: u16 = base;
+        const at: u16 = r;
+        return at >= begin and at < begin + @as(u16, n);
+    }
+
     fn readsVreg(op: mcsmir.Op, r: u8) bool {
         return switch (op) {
             .add => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
@@ -1649,6 +2108,7 @@ const Lower = struct {
             .or_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .xor_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .mul => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .mul16 => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .div_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .rem_ => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .not_ => |x| isVregByte(x.src, r),
@@ -1658,8 +2118,10 @@ const Lower = struct {
             .subb => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
             .shl => |x| isVregByte(x.lhs, r),
             .shr => |x| isVregByte(x.lhs, r),
+            .sex => |x| isVregByte(x.src, r),
             .mov => |x| isVregByte(x.src, r),
             .cmp_br => |x| isVregByte(x.lhs, r) or isVregByte(x.rhs, r),
+            .cmp_wide_br => |x| isWideVreg(x.lhs, x.n, r) or isWideVreg(x.rhs, x.n, r) or isVregByte(x.tmp, r),
             .br_ifnz => |x| isVregByte(x.cond, r),
             .br_ifz => |x| isVregByte(x.cond, r),
             .push => |x| isVregByte(x.src, r),
@@ -1672,6 +2134,7 @@ const Lower = struct {
             .store_xdata_idx_sym => |x| isVregByte(x.idx, r) or isVregByte(x.src, r),
             .store_xdata_sym => |x| isVregByte(x.src, r),
             .load_code_idx_sym => |x| isVregByte(x.idx, r),
+            .lcall_ind => |x| isWideVreg(x.target, 2, r) or isVregByte(x.save, r),
             .dec => |v| v == r, // RMW：既读又写
             else => false,
         };
@@ -1710,6 +2173,7 @@ const Lower = struct {
             .dec => |v| v == r,
             .mul16 => |x| isVregByte(x.lo, r) or isVregByte(x.hi, r),
             .sex => |x| isVregByte(x.dst, r),
+            .cmp_wide_br => |x| isVregByte(x.tmp, r),
             .lcall_ind => |x| isVregByte(x.save, r),
             else => false,
         };
@@ -2241,6 +2705,20 @@ const Lower = struct {
         return null;
     }
 
+    /// 自检：op 流里是否有重复定义的标签（改写类优化用来自证没发坏代码）。
+    fn hasDupLabels(self: *Lower) bool {
+        var seen = std.AutoHashMap(u32, void).init(self.gpa);
+        defer seen.deinit();
+        for (self.ops.items) |op| switch (op) {
+            .label => |l| {
+                if (seen.contains(l)) return true;
+                seen.put(l, {}) catch return false;
+            },
+            else => {},
+        };
+        return false;
+    }
+
     fn emitCondBr(self: *Lower, inst: Air.Inst.Index) codegen.Error!void {
         const air = self.air;
         const cb = air.unwrapCondBr(inst);
@@ -2274,18 +2752,34 @@ const Lower = struct {
                 if (info != null and (info.?.bytes > 1 or info.?.signed)) {
                     // 多字节/有符号比较：整条借位链一次发完（8 位无符号仍走 cmp_br）。
                     const oi = info.?;
-                    const lhs = try self.wideOperand(bin.lhs, oi.bytes);
-                    const rhs = try self.wideOperand(bin.rhs, oi.bytes);
-                    const tmp = try self.allocVreg();
-                    try self.ops.append(self.gpa, .{ .cmp_wide_br = .{
-                        .lhs = lhs,
-                        .rhs = rhs,
-                        .n = oi.bytes,
-                        .tmp = mcsmir.v(tmp),
-                        .cc = cc.invert(),
-                        .signed = oi.signed,
-                        .target = else_lbl,
-                    } });
+                    // 有符号 x < 0 / x >= 0：直接测最高字节的符号位（抄 SDCC 的 jnb acc.7）。
+                    // 省掉「把常量 0 物化成一整块 + 跑完整借位链」，absU 的 cmp 槽就是这么多的。
+                    const rhs_zero = if (self.constWide(bin.rhs)) |v| v == 0 else false;
+                    const is_lt = tg == .cmp_lt or tg == .cmp_lt_optimized;
+                    const is_gte = tg == .cmp_gte or tg == .cmp_gte_optimized;
+                    if (oi.signed and rhs_zero and (is_lt or is_gte)) {
+                        const lhs = try self.wideOperand(bin.lhs, oi.bytes);
+                        const tmp = try self.allocVreg();
+                        try self.movTo(tmp, mcsmir.v(lhs + oi.bytes - 1));
+                        try self.ops.append(self.gpa, .{ .clr_c = {} });
+                        try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(tmp), .src = mcsmir.v(tmp) } });
+                        // 条件不成立 → else：lt 时"C==0 即非负"；gte 时"C==1 即负"。
+                        try self.ops.append(self.gpa, .{ .br_c = .{ .target = else_lbl, .on_set = !is_lt } });
+                        fused = true;
+                    } else {
+                        const lhs = try self.wideOperand(bin.lhs, oi.bytes);
+                        const rhs = try self.wideOperand(bin.rhs, oi.bytes);
+                        const tmp = try self.allocVreg();
+                        try self.ops.append(self.gpa, .{ .cmp_wide_br = .{
+                            .lhs = lhs,
+                            .rhs = rhs,
+                            .n = oi.bytes,
+                            .tmp = mcsmir.v(tmp),
+                            .cc = cc.invert(),
+                            .signed = oi.signed,
+                            .target = else_lbl,
+                        } });
+                    }
                 } else {
                     const lhs = try self.refLoc(bin.lhs);
                     const rhs = try self.refLoc(bin.rhs);
@@ -2323,6 +2817,20 @@ const Lower = struct {
         }
         // 每条 AIR 指令结束时把「临时操作数槽」还回池里（结果槽不还）。
         // `continue` / `return` 都会跑到这个 defer，所以各分支不用各自记得清。
+        self.cur_inst = inst;
+        self.cur_scratch_ok = switch (self.air.instructions.items(.tag)[@backingInt(inst)]) {
+            .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap,
+            .mul, .mul_wrap, .div_trunc, .rem, .bit_and, .bit_or, .xor,
+            .shl, .shr, .shl_exact, .shr_exact, .not,
+            // 转换**结果**也可以 scratch：转换若分配新块，那它是全新的；只要它的消费者都只读
+            // （典型是 ret），这块就可以在最后读取点之后还池。恒等转换本来就不分配，走不到这里。
+            .int_cast, .int_cast_safe, .trunc, .bit_cast,
+            => self.scratchConsumerOk(body, idx),
+            .call, .call_always_tail, .call_never_tail, .call_never_inline,
+            => self.scratchConsumerOk(body, idx),
+            else => false,
+        };
+        self.freeDeadScratch(idx);
         defer self.flushTempsKeep(self.resultSlot(inst));
         const tag = self.air.instructions.items(.tag)[@backingInt(inst)];
         const data = self.air.instructions.items(.data)[@backingInt(inst)];
@@ -2337,10 +2845,11 @@ const Lower = struct {
 
             .arg => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                if (self.wideBytes(ty) == null and ty.zigTypeTag(self.zcu) != .bool) {
+                const is_ptr = ty.zigTypeTag(self.zcu) == .pointer;
+                if (self.wideBytes(ty) == null and ty.zigTypeTag(self.zcu) != .bool and !is_ptr) {
                     return self.zcu.codegenFail(
                         self.nav,
-                        "mcs2: 参数类型 {s} 尚未实现（目前只支持 8/16/32 位整数与 bool）",
+                        "mcs2: 参数类型 {s} 尚未实现（目前只支持 8/16/32 位整数、bool 与指针）",
                         .{@tagName(ty.zigTypeTag(self.zcu))},
                     );
                 }
@@ -2349,7 +2858,7 @@ const Lower = struct {
                 // 对齐它 = u16/u32 的 C 互操作免费，不需要 thunk。
                 // ADR-001 边界 ABI：按**字节**摆放（arg0 → DPL，之后 → PARM_n）；
                 // u16 占两个字节（DPL/DPH 或 PARM_n/PARM_{n+1}）。
-                const nlat = self.wideBytes(ty) orelse 1;
+                const nlat: u8 = if (is_ptr) 2 else (self.wideBytes(ty) orelse 1);
                 if (nlat > 1) {
                     const base = try self.allocWide(nlat);
                     var k: u8 = 0;
@@ -2363,6 +2872,11 @@ const Lower = struct {
                         };
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(base + k), .src = src } });
                     }
+                    // 指针参数：记成「运行期 16 位基址」，后面 p[i] 直接从这里取。
+                    if (is_ptr) self.ptr_vals[@backingInt(inst)] = .{ .rt = .{
+                        .lo = mcsmir.v(base),
+                        .hi = mcsmir.v(base + 1),
+                    } };
                     if (self.arg_cursor == 0) {
                         if (nlat >= 3) self.b_is_arg = true; // B 是第 3 个字节
                     } else {
@@ -2405,45 +2919,42 @@ const Lower = struct {
                 const pr = self.ptrRefOf(bin.lhs) orelse
                     return self.fail("指针下标的基址必须是固定地址或全局变量（暂不支持运行期指针）", .{});
                 {
-                    // 元素字节数 = 结果指针的子类型宽度（u8=1 / u16=2 / u32=4）
+                    // 元素**步长** = 结果指针所指类型的完整大小：
+                    //   `T16[i]`（lhs 是 *[8]u16，结果 *u16）→ 2
+                    //   `fb[z]` （lhs 是 *[32][64]u16，结果 *[32][64]u16）→ 32*64*2 = 4096
+                    // 旧写法把子数组剥到最内层元素（→2），多维下标就会指错地方。
                     const pty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                    // 指针子类型可能是**数组**（T16[i] 的 lhs 是 *[8]u16）→ 再取元素类型
-                    var ety = pty.childType(self.zcu);
-                    while (ety.zigTypeTag(self.zcu) == .array) ety = ety.childType(self.zcu);
-                    const sc = try self.storageBytes(ety, "下标元素");
-                    if (self.dump_air) std.debug.print("  >> elem scale={d} res={s} ety={s}\n", .{
+                    const sc = try self.pointeeBytes(pty.childType(self.zcu), "下标元素");
+                    if (self.dump_air) std.debug.print("  >> elem stride={d} res={s}\n", .{
                         sc,
                         @tagName(pty.zigTypeTag(self.zcu)),
-                        @tagName(ety.zigTypeTag(self.zcu)),
                     });
-                    switch (pr) {
-                        .fixed => |base| {
-                            if (self.constU8(bin.rhs)) |k| {
-                                self.ptr_vals[@backingInt(inst)] = .{ .fixed = base + @as(u64, k) * sc };
+                    // 常量下标优先折叠：地址直接落成常量 / 符号+偏移（省掉整条加法序列）。
+                    if (self.constU8(bin.rhs)) |k| {
+                        const fld = @as(u64, k) * sc;
+                        switch (pr) {
+                            .fixed => |b| {
+                                self.ptr_vals[@backingInt(inst)] = .{ .fixed = b + fld };
                                 continue;
-                            }
-                            const idx_loc = try self.refLoc(bin.rhs);
-                            self.ptr_vals[@backingInt(inst)] = .{ .elem = .{ .base = base, .idx = idx_loc, .scale = sc } };
-                        },
-                        .sym_off => |s| {
-                            if (self.constU8(bin.rhs)) |k| {
-                                self.ptr_vals[@backingInt(inst)] = .{ .sym_off = .{ .sym = s.sym, .off = s.off + @as(u64, k) * sc } };
+                            },
+                            .sym_off => |s| {
+                                self.ptr_vals[@backingInt(inst)] = .{ .sym_off = .{ .sym = s.sym, .off = s.off + fld } };
                                 continue;
-                            }
-                            const idx_loc = try self.refLoc(bin.rhs);
-                            self.ptr_vals[@backingInt(inst)] = .{ .elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = sc } };
-                        },
-                        // const 表（代码段）：常量下标折成 _sym+off，运行期下标走 movc 链
-                        .code_sym => |s| {
-                            if (self.constU8(bin.rhs)) |k| {
-                                self.ptr_vals[@backingInt(inst)] = .{ .code_sym = .{ .sym = s.sym, .off = s.off + @as(u64, k) * sc } };
+                            },
+                            .code_sym => |s| {
+                                self.ptr_vals[@backingInt(inst)] = .{ .code_sym = .{ .sym = s.sym, .off = s.off + fld } };
                                 continue;
-                            }
-                            const idx_loc = try self.refLoc(bin.rhs);
-                            self.ptr_vals[@backingInt(inst)] = .{ .code_elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = sc } };
-                        },
-                        .elem, .elem_sym, .code_elem_sym => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
+                            },
+                            .rt => |r| {
+                                self.ptr_vals[@backingInt(inst)] = .{ .rt = .{ .lo = r.lo, .hi = r.hi, .off = r.off + fld } };
+                                continue;
+                            },
+                            else => {},
+                        }
                     }
+                    // 其余情况：基址 + 一维下标（第二次下标起升级成多维链）
+                    const idx_slot = try self.indexLoc(bin.rhs);
+                    self.ptr_vals[@backingInt(inst)] = try self.indexedRef(pr, idx_slot.lo, idx_slot.hi, sc);
                 }
             },
 
@@ -2453,9 +2964,27 @@ const Lower = struct {
                 const n = (try self.requireIntWidth(ty, "加减法")).bytes;
                 // 多字节：固定模板 = clr c + addc/subb 逐字节（低字节在前）。
                 if (n > 1) {
+                    // ① 0 - x 直接走二补码取负：省掉「把常量 0 物化成 n 个槽」。
+                    // absU（if (v < 0) return -v）这类形态原来光零常量就占 4 槽。
+                    const is_sub_tag = tag == .sub or tag == .sub_safe or tag == .sub_wrap;
+                    if (is_sub_tag) {
+                        if (self.constWide(bin.lhs)) |lv| {
+                            if (lv == 0) {
+                                const bneg = try self.wideOperand(bin.rhs, n);
+                                const dneg = if (self.reuseWideDst(body, idx, bin.rhs, bneg, n)) bneg else try self.allocWide(n);
+                                try self.negInto(dneg, bneg, n);
+                                self.vals[@backingInt(inst)] = mcsmir.v(dneg);
+                                self.wide[@backingInt(inst)] = @as(u16, dneg) | (@as(u16, n) << 8);
+                                continue;
+                            }
+                        }
+                    }
                     const a = try self.wideOperand(bin.lhs, n);
                     const b = try self.wideOperand(bin.rhs, n);
-                    const d = try self.allocWide(n);
+                    const reuse_n = (self.reuseWideDst(body, idx, bin.lhs, a, n) and !(forbid_alias_reuse and self.wideIsAlias(bin.lhs, n)));
+                    const scratch_n = scratch_results and self.scratchConsumerOk(body, idx);
+                    const d = if (reuse_n) a else if (scratch_n) try self.allocScratch(n, inst) else try self.allocWide(n);
+                    if (account_wide and !reuse_n) std.debug.print("WIDE inst={d} base={d} n={d} last={d} scratch={}\n", .{ @backingInt(inst), d, n, self.airLastRead(inst), scratch_n });
                     const is_add = switch (tag) {
                         .add, .add_safe, .add_wrap => true,
                         else => false,
@@ -2531,7 +3060,8 @@ const Lower = struct {
                 if (n > 1) {
                     const a = try self.wideOperand(bin.lhs, n);
                     const b = try self.wideOperand(bin.rhs, n);
-                    const d = try self.allocWide(n);
+                    const reuse_o = (self.reuseWideDst(body, idx, bin.lhs, a, n) and !(forbid_alias_reuse and self.wideIsAlias(bin.lhs, n)));
+        const d = if (reuse_o) a else try self.allocWide(n);
                     var k: u8 = 0;
                     while (k < n) : (k += 1) {
                         try self.ops.append(self.gpa, switch (tag) {
@@ -2659,7 +3189,8 @@ const Lower = struct {
                 }
                 const nw = info.bytes;
                 const a = try self.wideOperand(bin.lhs, nw);
-                const d = try self.allocWide(nw);
+                const reuse_s = (self.reuseWideDst(body, idx, bin.lhs, a, nw) and !(forbid_alias_reuse and self.wideIsAlias(bin.lhs, nw)));
+                const d = if (reuse_s) a else try self.allocWide(nw);
                 var sign_ext: ?u8 = null;
                 if (!left and info.signed) {
                     const e = try self.allocVreg();
@@ -2699,6 +3230,22 @@ const Lower = struct {
                 }
                 self.vals[@backingInt(inst)] = mcsmir.v(d);
                 self.wide[@backingInt(inst)] = @as(u16, d) | (@as(u16, nw) << 8);
+            },
+
+            // 指针类型转换（`[*]u8` → `*[8]u8` 之类）：位模式不变，2 字节原样透传，
+            // 并把「运行期基址」信息带过去（否则后面 p[i] 就找不到基址了）。
+            .ptr_cast => {
+                const base = try self.wideOperand(data.ty_op.operand, 2);
+                self.vals[@backingInt(inst)] = mcsmir.v(base);
+                self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, 2) << 8);
+                if (self.ptrRefOf(data.ty_op.operand)) |pr| switch (pr) {
+                    // 运行期基址跟着**新槽**走（旧槽可能已经被当临时槽回收）
+                    .rt, .rt_elem => self.ptr_vals[@backingInt(inst)] = .{ .rt = .{
+                        .lo = mcsmir.v(base),
+                        .hi = mcsmir.v(base + 1),
+                    } },
+                    else => self.ptr_vals[@backingInt(inst)] = pr,
+                };
             },
 
             // 整数转换：≤16 位一律透传（本后端只跟踪 8 位值；下标被当作 u8 使用）。
@@ -2801,7 +3348,8 @@ const Lower = struct {
                     };
                     var k2: u8 = 0;
                     while (k2 < rn) : (k2 += 1) {
-                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dbase + k2), .src = mcsmir.v(sbase + k2) } });
+                        if (dbase + k2 != sbase + k2)
+                            try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dbase + k2), .src = mcsmir.v(sbase + k2) } });
                     }
                     continue;
                 }
@@ -2869,17 +3417,15 @@ const Lower = struct {
                         continue;
                     }
                 }
-                const idx_loc = try self.refLoc(bin.rhs);
-                const indexed: PtrRef = switch (pr) {
-                    .fixed => |b| blk: {
-                        if (b <= 0xFF) return self.fail("直址（≤0xFF）暂不支持运行期下标：需要 @r0/@r1 间接寻址", .{});
-                        if (b > 0xFFFF) return self.fail("下标基址 0x{X} 超出 51 可寻址范围", .{b});
-                        break :blk .{ .elem = .{ .base = b, .idx = idx_loc, .scale = n } };
-                    },
-                    .sym_off => |s| .{ .elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = n } },
-                    .code_sym => |s| .{ .code_elem_sym = .{ .sym = s.sym, .off = s.off, .idx = idx_loc, .scale = n } },
-                    .elem, .elem_sym, .code_elem_sym => return self.fail("多级下标（链式指针运算）暂不支持", .{}),
-                };
+                const idx_slot = try self.indexLoc(bin.rhs);
+                // 步长 = 基址指针所指整块的大小（多维时就是子数组大小，不是元素宽）
+                const lhs_ty = self.air.typeOf(bin.lhs, &self.zcu.intern_pool);
+                const stride: u32 = if (lhs_ty.zigTypeTag(self.zcu) == .pointer)
+                    try self.pointeeBytes(lhs_ty.childType(self.zcu), "下标步长")
+                else
+                    n;
+                if (stride == 0) return self.fail("下标步长为 0", .{});
+                const indexed: PtrRef = try self.indexedRef(pr, idx_slot.lo, idx_slot.hi, stride);
                 const r: u8 = if (n > 1) try self.allocWide(n) else try self.allocVreg();
                 var k3: u8 = 0;
                 while (k3 < n) : (k3 += 1) try self.emitLoadByte(indexed, k3, r + k3);
@@ -2899,6 +3445,10 @@ const Lower = struct {
                     while (k < ln_b) : (k += 1) try self.emitLoadByte(pr, k, wb + k);
                     self.vals[@backingInt(inst)] = mcsmir.v(wb);
                     if (ln_b > 1) self.wide[@backingInt(inst)] = @as(u16, wb) | (@as(u16, ln_b) << 8);
+                    if (lty.zigTypeTag(self.zcu) == .pointer) self.ptr_vals[@backingInt(inst)] = .{ .rt = .{
+                        .lo = mcsmir.v(wb),
+                        .hi = mcsmir.v(wb + 1),
+                    } };
                     continue;
                 }
                 if (ln_b > 1) {
@@ -2910,6 +3460,11 @@ const Lower = struct {
                     };
                     self.vals[@backingInt(inst)] = mcsmir.v(base);
                     self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, ln_b) << 8);
+                    // 指针值（`p` 从参数槽搬回局部槽时走这条）：记成运行期基址
+                    if (lty.zigTypeTag(self.zcu) == .pointer) self.ptr_vals[@backingInt(inst)] = .{ .rt = .{
+                        .lo = mcsmir.v(base),
+                        .hi = mcsmir.v(base + 1),
+                    } };
                     continue;
                 }
                 const src = try self.refLoc(ty_op.operand);
@@ -2935,11 +3490,18 @@ const Lower = struct {
             },
 
             .ret, .ret_safe => {
+                // 尾调用已经 ljmp 走了：这条 ret 是死代码，别再发 ret（否则会多弹一次栈）。
+                if (self.tail_ret) |tr| if (tr == inst) {
+                    self.tail_ret = null;
+                    self.saw_ret = true;
+                    return true;
+                };
                 if (self.is_isr) {
                     // ISR 尾声：恢复现场（逆序）+ reti。诊断开关同序言。
                     const no_save = no_isr_save;
                     if (!no_save) {
                         try self.ops.appendSlice(self.gpa, &.{
+                            .{ .pop = .{ .dst = .{ .dir = 0xF0 } } }, // B
                             .{ .pop = .{ .dst = .{ .dir = 0x83 } } }, // DPH
                             .{ .pop = .{ .dst = .{ .dir = 0x82 } } }, // DPL
                             .{ .pop = .{ .dst = .{ .dir = 0xD0 } } }, // PSW
@@ -3160,12 +3722,16 @@ const Lower = struct {
                 defer self.gpa.free(bases);
                 const widths = try self.gpa.alloc(u8, nargs);
                 defer self.gpa.free(widths);
+                // 常量实参不用物化成槽：直接按字节写进 ABI 位置（省 n 个槽）。
+                const consts = try self.gpa.alloc(?u32, nargs);
+                defer self.gpa.free(consts);
                 for (ci.args, 0..) |arg_ref, ai| {
                     const aty = self.air.typeOf(arg_ref, ip);
                     const an = try self.storageBytes(aty, "调用参数");
                     if (an > 4) return self.fail("参数超过 4 字节（多字节结构体）尚未支持", .{});
                     widths[ai] = an;
-                    bases[ai] = try self.wideOperand(arg_ref, an);
+                    consts[ai] = self.constWide(arg_ref);
+                    bases[ai] = if (consts[ai] != null) 0 else try self.wideOperand(arg_ref, an);
                 }
                 // ② 再统一摆到 ABI 位置：arg0 进 ABI 寄存器，其余进 _被调短名_PARM_2 起的连续字节
                 var spill: usize = 2;
@@ -3183,9 +3749,25 @@ const Lower = struct {
                             .{ .dir = mcsmir.abi.arg_regs[k] }
                         else
                             .{ .sym = kept };
-                        try self.ops.append(self.gpa, .{ .mov = .{ .dst = dst, .src = mcsmir.v(base + k) } });
+                        if (consts[ai]) |cv| {
+                            const byte: u8 = @truncate(cv >> @intCast(8 * @as(u32, k)));
+                            try self.ops.append(self.gpa, .{ .imm = .{ .dst = dst, .value = byte } });
+                        } else {
+                            try self.ops.append(self.gpa, .{ .mov = .{ .dst = dst, .src = mcsmir.v(base + k) } });
+                        }
                     }
                     if (ai > 0) spill += an;
+                }
+                // **尾调用**：调用结果被紧接的 ret 原样返回 → 参数摆好后直接 ljmp，
+                // 不再压返回地址。8051 没有栈帧，被调方的 ret 直接回到**我们的**调用方；
+                // 自递归因此变成循环（栈深度不再增长）。ISR 里禁用：必须以 reti 收尾。
+                if (!self.is_isr) {
+                    if (self.tailRetOf(body, idx, inst, ret_n > 0)) |ri| {
+                        try self.ops.append(self.gpa, .{ .ljmp = .{ .sym = sym } });
+                        self.tail_ret = ri;
+                        self.saw_ret = true;
+                        continue;
+                    }
                 }
                 try self.ops.append(self.gpa, .{ .lcall = .{ .sym = sym } });
                 // 取返回值：DPL/DPH/B/A（低字节序）→ 新槽。
@@ -3225,6 +3807,26 @@ const Lower = struct {
                     const wide_cmp = if (self.intInfo(oty)) |oi| (oi.bytes > 1 or oi.signed) else false;
                     if (wide_cmp) {
                         const oi = self.intInfo(oty).?;
+                        // 有符号 x < 0 / x >= 0：只看最高字节的符号位，不需要把常量 0
+                        // 物化成一整块再去跑 4 字节比较（absU 的 4 个 cmp 槽就是这么来的）。
+                        // 这是从 SDCC 的 jnb acc.7 抄来的。
+                        const rhs_zero = if (self.constWide(bin.rhs)) |v| v == 0 else false;
+                        const is_lt = tag == .cmp_lt or tag == .cmp_lt_optimized;
+                        const is_gte = tag == .cmp_gte or tag == .cmp_gte_optimized;
+                        if (oi.signed and rhs_zero and (is_lt or is_gte)) {
+                            const lhs = try self.wideOperand(bin.lhs, oi.bytes);
+                            const tmp = try self.allocVreg();
+                            try self.movTo(tmp, mcsmir.v(lhs + oi.bytes - 1));
+                            try self.ops.append(self.gpa, .{ .clr_c = {} });
+                            try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(tmp), .src = mcsmir.v(tmp) } });
+                            const l_skip = self.tempLabel();
+                            // lt：C=1（负）时写 1；gte：C=0 时写 1。跳到 l_skip 表示保持 0。
+                            try self.ops.append(self.gpa, .{ .br_c = .{ .target = l_skip, .on_set = !is_lt } });
+                            try self.ops.append(self.gpa, .{ .imm = .{ .dst = d, .value = 1 } });
+                            try self.ops.append(self.gpa, .{ .label = l_skip });
+                            self.vals[@backingInt(inst)] = d;
+                            continue;
+                        }
                         const lhs = try self.wideOperand(bin.lhs, oi.bytes);
                         const rhs = try self.wideOperand(bin.rhs, oi.bytes);
                         const tmp = try self.allocVreg();
@@ -3385,13 +3987,17 @@ pub fn generate(
     lw.dump_air = std.mem.indexOf(u8, short_name, "airdump") != null;
 
     if (is_isr and !no_isr_save) {
-        // 现场保存：A/PSW/DPTR（M1 指令集用到的全部硬件寄存器；B 未用）。
+        // 现场保存：A/PSW/DPTR/**B**。
+        // B 也存：mcs2 用到 B —— arg0 的第 3 字节、MUL/DIV 的结果高半、间接调用。
+        // 早期注释写「B 未用」是错的：ISR 里只要出现一次 16 位乘除（或调用会乘除的函数），
+        // 被打断的主程序 B 就被踩坏（主程序若正拿 B 当 arg2 / 乘法高位，回来就错）。
         // 注意顺序与尾声严格相反。诊断开关 MCS2_NO_ISR_SAVE=1 可跳过。
         try lw.ops.appendSlice(gpa, &.{
             .{ .push = .{ .src = .{ .dir = 0xE0 } } }, // ACC
             .{ .push = .{ .src = .{ .dir = 0xD0 } } }, // PSW
             .{ .push = .{ .src = .{ .dir = 0x82 } } }, // DPL
             .{ .push = .{ .src = .{ .dir = 0x83 } } }, // DPH
+            .{ .push = .{ .src = .{ .dir = 0xF0 } } }, // B
         });
     }
 
@@ -3407,7 +4013,15 @@ pub fn generate(
     lw.foldBitTests();
 
     // M2.4：循环旋转（top-test + 底部递减 → djnz）。
+    // 安全网：这个改写历史上会把同一临时标签定义两遍（sqrt32/hypot 因此在硅上返回 0）。
+    // 先快照，改完自检；一旦发现重复标签就整段回退 —— 宁可不优化，也不能发坏代码。
+    const pre_rotate = try gpa.dupe(mcsmir.Op, lw.ops.items);
+    defer gpa.free(pre_rotate);
     try lw.rotateDjnz();
+    if (lw.hasDupLabels()) {
+        lw.ops.clearRetainingCapacity();
+        try lw.ops.appendSlice(gpa, pre_rotate);
+    }
 
     // 部分求值（切片 A）：无参 + 纯内部计算 → 编译期算完，只留常量写回。
     // 激进优化必须显式开启：函数名以 `_fold` 结尾（如 fact_fold / sum_to_fold）。
@@ -3416,17 +4030,14 @@ pub fn generate(
         if (try lw.foldPure()) lw.saw_ret = true;
     }
 
+    // M2.14：先做基本块内槽位复用，再挑可驻留工作寄存器的热点值。
+    // 宽块的定义、读取、重命名与邻接约束必须完整，否则比较和间接调用会读旧槽。
+    lw.reuseSlots();
     // M2.13：寄存器分配（PE 折叠成功时不必——常量写回没有热点值）。
-    // M2.14 切片 1（基本块内槽位复用）**还没打通**，先关掉。已修掉的两个坑：
-    //   ① 复用槽号落进 0–7 会被 `byteText` 渲染成 `rN` → 发出不存在的 `mov rN,rM`
-    //      （现在复用槽从 8 号开始）；
-    //   ② `.dec` 的载荷是裸 vreg 编号，`mapOpVregs` 不映射它 → 改名后编号越界
-    //      （现在单独补一次映射）。
-    // 但 `cat45` 仍然算错（值被提前复用），说明还有别的寿命/别名漏洞没堵——
-    // 要专门一轮把 liveness 做扎实（含 .dec/.dec_br_nz/wide 块/调用点的边界）再开。
-    // 指令内临时槽回收（`flushTempsKeep`）是安全的那部分，已保留。
-    // lw.reuseSlots();
-    lw.assignRegisters();
+    // **ISR 一律不做**：被映射到 r0–r7 的值会被中断打断的那段主程序共用，
+    // 而 ISR 现场只保存 A/PSW/DPTR/B —— 回来 rN 就错了（真机上表现为「主循环不再打印」）。
+    // ISR 的槽全部留在 DSEG，就不会碰 rN。
+    if (!is_isr) lw.assignRegisters();
 
     // 没有 ret 也允许：只要 body 以 br 终结（如 while(true)），控制流不会落空。
     if (!lw.saw_ret and !body_terminated) {
@@ -3444,6 +4055,7 @@ pub fn generate(
         .vreg_base = session_vreg_base - lw.nregs,
         .ops = try lw.ops.toOwnedSlice(gpa),
         .parms = try lw.parms.toOwnedSlice(gpa),
+        .b_live = lw.b_is_arg,
     };
 
     // compile 之后 Op 序列与符号名都不再需要，就地释放（Debug SafeAllocator 门禁）。
@@ -3476,6 +4088,8 @@ pub fn generate(
     }
     return mir;
 }
+
+
 
 /// 延迟符号（编译器内置函数）暂不支持。
 pub fn generateLazy(

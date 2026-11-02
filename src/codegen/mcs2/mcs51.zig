@@ -20,6 +20,9 @@ const Byte = mir.Byte;
 
 /// 间接调用要自己造「返回地址」标签：模块级序列，保证跨函数唯一。
 var ind_label_seq: u32 = 0;
+/// 跳转松弛在各函数内分别执行，skip 标签不能从本函数最大编号重新起算。
+/// 使用独立的保留编号段 + 模块级序列，避免前一个函数的 skip 与后一个函数撞号。
+var relax_label_seq: u32 = 0;
 
 /// 条目流元素：窥孔操作的最小结构。
 /// `line.jump` 非空表示这是跳转指令，文本 = `{text} L{jump}`。
@@ -195,13 +198,16 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .shr => |x| if (touchesDplDph(x.dst)) null else prev,
         .xor_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .load_dir => |x| if (touchesDplDph(x.dst)) null else prev,
+        // 这两个 op 用的 DPTR 是前面 add/addc 现算的：缓存里没有它，一律当未知。
+        .load_xdata_dptr, .store_xdata_dptr, .dptr_add_scaled => null,
         .store_dir => |x| if (x.addr == 0x82 or x.addr == 0x83) null else prev,
         .push => |x| if (touchesDplDph(x.src)) null else prev,
         .pop => |x| if (touchesDplDph(x.dst)) null else prev,
         .dec => prev,
         .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .bit_br, .ret, .reti, .halt,
         // lcall / 间接调用都会踩 DPL/DPH（被调方的 arg0 就在那儿）→ 之后的 xdata 访问必须重建 DPTR。
-        .sex, .cmp_wide_br, .mul16, .br_c, .lcall, .lcall_ind => null,
+        // ljmp 是尾调用：跳走以后不再回来，DPTR 状态无所谓（保守清掉）。
+        .sex, .cmp_wide_br, .mul16, .br_c, .lcall, .lcall_ind, .ljmp => null,
     };
 }
 
@@ -278,6 +284,9 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_dir => |x| .{ .store_dir = .{ .addr = x.addr, .src = byteOf(x.src, f.vreg_base) } },
             .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = byteOf(x.src, f.vreg_base) } },
             .mov => |x| .{ .mov = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
+            .load_xdata_dptr => |x| .{ .load_xdata_dptr = .{ .dst = byteOf(x.dst, f.vreg_base) } },
+            .dptr_add_scaled => |x| .{ .dptr_add_scaled = .{ .idx = byteOf(x.idx, f.vreg_base), .scale = x.scale } },
+            .store_xdata_dptr => |x| .{ .store_xdata_dptr = .{ .src = byteOf(x.src, f.vreg_base) } },
             .br_ifnz => |x| .{ .br_ifnz = .{ .cond = byteOf(x.cond, f.vreg_base), .target = x.target } },
             .br_ifz => |x| .{ .br_ifz = .{ .cond = byteOf(x.cond, f.vreg_base), .target = x.target } },
             .dec_br_nz => |x| .{ .dec_br_nz = .{ .dst = byteOf(x.dst, f.vreg_base), .target = x.target } },
@@ -365,7 +374,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             } },
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
-            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c, .lcall, .lea_dptr_sym => op,
+            .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c, .lcall, .ljmp, .lea_dptr_sym => op,
             .lcall_ind => |x| .{ .lcall_ind = .{
                 .target = f.vreg_base + x.target,
                 .save = byteOf(x.save, f.vreg_base),
@@ -637,15 +646,68 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 }
                 try items.append(gpa, .{ .line = .{ .text = "    movx @dptr,a", .jump = null } });
             },
-            .lea_dptr_sym => |x| try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
-                gpa,
-                "    mov dptr,#{s}",
-                .{x.sym},
-            ), .jump = null } }),
+            // 运行期指针做基址：DPL/DPH 已由前面的 add/addc 加好，这里只做 movx。
+            .load_xdata_dptr => |x| {
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            .store_xdata_dptr => |x| {
+                const s = try byteText(gpa, x.src);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
+                    .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
+                });
+            },
+            // 符号基址（可带常量偏移：多维下标的基址装载）
+            .lea_dptr_sym => |x| try items.append(gpa, .{ .line = .{ .text = try emitSymReloc(gpa, x.sym, x.off), .jump = null } }),
+            // dptr += idx*scale：多维下标的第二、第三维。
+            // scale==1 只需 8 位加 + 进位；否则一次 MUL AB 拿 16 位积（scale 拆成高/低字节）。
+            .dptr_add_scaled => |x| {
+                const it = try byteText(gpa, x.idx);
+                if (x.scale == 1) {
+                    try items.appendSlice(gpa, &.{
+                        .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{it}), .jump = null } },
+                        .{ .line = .{ .text = "    add a,dpl", .jump = null } },
+                        .{ .line = .{ .text = "    mov dpl,a", .jump = null } },
+                        .{ .line = .{ .text = "    mov a,dph", .jump = null } },
+                        .{ .line = .{ .text = "    addc a,#0x00", .jump = null } },
+                        .{ .line = .{ .text = "    mov dph,a", .jump = null } },
+                    });
+                } else {
+                    const lo: u8 = @truncate(x.scale);
+                    const hi: u8 = @truncate(x.scale >> 8);
+                    if (f.b_live) try items.append(gpa, .{ .line = .{ .text = "    push 0xF0", .jump = null } });
+                    if (lo != 0) {
+                        try items.appendSlice(gpa, &.{
+                            .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{it}), .jump = null } },
+                            .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,#0x{X:0>2}", .{lo}), .jump = null } },
+                            .{ .line = .{ .text = "    mul ab", .jump = null } },
+                            .{ .line = .{ .text = "    add a,dpl", .jump = null } },
+                            .{ .line = .{ .text = "    mov dpl,a", .jump = null } },
+                            .{ .line = .{ .text = "    mov a,b", .jump = null } },
+                            .{ .line = .{ .text = "    addc a,dph", .jump = null } },
+                            .{ .line = .{ .text = "    mov dph,a", .jump = null } },
+                        });
+                    }
+                    if (hi != 0) {
+                        try items.appendSlice(gpa, &.{
+                            .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{it}), .jump = null } },
+                            .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,#0x{X:0>2}", .{hi}), .jump = null } },
+                            .{ .line = .{ .text = "    mul ab", .jump = null } },
+                            .{ .line = .{ .text = "    add a,dph", .jump = null } },
+                            .{ .line = .{ .text = "    mov dph,a", .jump = null } },
+                        });
+                    }
+                    if (f.b_live) try items.append(gpa, .{ .line = .{ .text = "    pop 0xF0", .jump = null } });
+                }
+            },
             .load_xdata_idx => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale);
+                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
@@ -654,7 +716,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata_idx => |x| {
                 const s = try byteText(gpa, x.src);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale);
+                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
                     .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
@@ -664,7 +726,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .load_xdata_idx_sym => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale);
+                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
@@ -673,7 +735,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata_idx_sym => |x| {
                 const s = try byteText(gpa, x.src);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale);
+                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
                     .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
@@ -708,7 +770,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .load_code_idx_sym => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale);
+                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    clr a", .jump = null } },
                     .{ .line = .{ .text = "    movc a,@a+dptr", .jump = null } },
@@ -919,6 +981,12 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 "    lcall {s}",
                 .{x.sym},
             ), .jump = null } }),
+            // 尾调用：参数已摆好，直接跳过去；被调方的 ret 回到**我们的**调用方。
+            .ljmp => |x| try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
+                gpa,
+                "    ljmp {s}",
+                .{x.sym},
+            ), .jump = null } }),
             .lcall_ind => |x| {
                 // 8051 没有 "lcall @a+dptr"：压一个假返回地址 + 压目标地址，再 ret 跳过去。
                 // **RET 先弹高字节**（实测：先弹 (SP)，当高字节用）→ 所以每个 16 位值必须
@@ -959,6 +1027,9 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
 
     compactJumpToNext(&items);
 
+    // 同一标签不许定义两次：lowering 偶尔会在「终止指令之后的死代码」里再发一遍
+    // （cordic_sqrt 的 csqrt1m 就是），这里把重复的定义改名成无人引用的新 id。
+    try uniquifyLabels(gpa, &items);
     try relaxJumps(gpa, &items);
 
     return items;
@@ -1036,7 +1107,9 @@ fn emitCmpWide(
                     try add(gpa, items, "    mov {s},a", .{tmp_t}, null);
                 }
             }
-            if (n > 1) try add(gpa, items, "    mov a,{s}", .{tmp_t}, null);
+            // 最后一字节的异或仍在 A 中，必须与此前累计值取或；若改回 mov，
+            // 会只检查低 n-1 字节，把 0x40000000 这类值误判成零。
+            if (n > 1) try add(gpa, items, "    orl a,{s}", .{tmp_t}, null);
             if (x.cc == .eq) {
                 try add(gpa, items, "    jz", .{}, x.target);
             } else {
@@ -1061,19 +1134,36 @@ fn sfrBitAddr(addr: u8, mask: u8) ?u8 {
     return (addr - 0x20) * 8 + n;
 }
 
-/// dptr = base + idx（16 位常量基址 + 8 位运行期下标）。
-/// lo == 0 时不可能进位，直接 `mov dpl,idx`；否则用 add/addc 传播进位。
-/// dptr = base + idx*scale。scale > 1 时把「16 位加 idx」重复 scale 次
-/// （idx 是 8 位、base 是 16 位常量，逐次加不会溢出 16 位加法链）。
+/// dptr = base + idx*scale（16 位常量基址 + 8 位运行期下标）。
+///
+/// scale == 1：lo == 0 时不可能进位，直接 `mov dpl,idx`；否则用 add/addc 传播进位。
+/// scale > 1：把 idx*scale 一次乘成 16 位积（`mul ab`，idx 8 位、scale ≤ 4，
+///   积 ≤ 1020 绝不溢出），基址低字节直接折进那条 `add`，共 16 字节；
+///   旧写法是「16 位加 idx」重复 scale 次 —— scale=2 要 26 字节、scale=4 要 38 字节。
+///   MUL 会踩 B(0xF0)，而 B 可能正载着本函数的 arg2 → `b_live` 时 push/pop 保护。
 fn emitDptrIndex(
     gpa: std.mem.Allocator,
     items: *std.ArrayListUnmanaged(Item),
     base: u16,
     idx_text: []const u8,
     scale: u8,
+    b_live: bool,
 ) !void {
     const lo: u8 = @truncate(base);
     const hi: u8 = @truncate(base >> 8);
+    if (scale > 1) {
+        if (b_live) try items.append(gpa, .{ .line = .{ .text = "    push 0xF0", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{idx_text}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,#0x{X:0>2}", .{scale}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mul ab", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    add a,#0x{X:0>2}", .{lo}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov dpl,a", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov a,b", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    addc a,#0x{X:0>2}", .{hi}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
+        if (b_live) try items.append(gpa, .{ .line = .{ .text = "    pop 0xF0", .jump = null } });
+        return;
+    }
     if (lo == 0 and scale == 1) {
         try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(
             gpa,
@@ -1106,20 +1196,13 @@ fn emitDptrIndex(
     ), .jump = null } });
     try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
     try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
-    // 其余 scale-1 遍：dptr += idx（16 位加法，进位往 dph 传）
-    var pass: u8 = 1;
-    while (pass < scale) : (pass += 1) {
-        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{idx_text}), .jump = null } });
-        try items.append(gpa, .{ .line = .{ .text = "    add a,dpl", .jump = null } });
-        try items.append(gpa, .{ .line = .{ .text = "    mov dpl,a", .jump = null } });
-        try items.append(gpa, .{ .line = .{ .text = "    mov a,dph", .jump = null } });
-        try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
-        try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
-    }
 }
 
 /// dptr = _sym（符号 16 位绝对地址）+ off + idx*scale。
-/// 符号基址要 3 字节 `mov dptr,#_sym`；off 与每遍的 idx 各走一次 16 位加。
+///
+/// off 直接折进重定位表达式 `mov dptr,#(_sym+off)`（sdas8051 接受带加数的 16 位重定位，
+/// 省掉「装符号 + 运行时 16 位加」的 12 字节）；scale > 1 的 idx*scale 一次 `mul ab`
+/// 算成 16 位积再与 dptr 相加，见 emitDptrIndex 的同段注释（B 同样要按 b_live 保护）。
 fn emitDptrSymIndex(
     gpa: std.mem.Allocator,
     items: *std.ArrayListUnmanaged(Item),
@@ -1127,45 +1210,48 @@ fn emitDptrSymIndex(
     off: u16,
     idx_text: []const u8,
     scale: u8,
+    b_live: bool,
 ) !void {
-    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov dptr,#{s}", .{sym}), .jump = null } });
-    if (off != 0) try emitDptrAdd(gpa, items, @truncate(off), @truncate(off >> 8));
-    var pass: u8 = 0;
-    while (pass < scale) : (pass += 1) {
+    try items.append(gpa, .{ .line = .{ .text = try emitSymReloc(gpa, sym, off), .jump = null } });
+    if (scale > 1) {
+        if (b_live) try items.append(gpa, .{ .line = .{ .text = "    push 0xF0", .jump = null } });
         try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{idx_text}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov b,#0x{X:0>2}", .{scale}), .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mul ab", .jump = null } });
         try items.append(gpa, .{ .line = .{ .text = "    add a,dpl", .jump = null } });
         try items.append(gpa, .{ .line = .{ .text = "    mov dpl,a", .jump = null } });
-        try items.append(gpa, .{ .line = .{ .text = "    mov a,dph", .jump = null } });
-        try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    mov a,b", .jump = null } });
+        try items.append(gpa, .{ .line = .{ .text = "    addc a,dph", .jump = null } });
         try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
+        if (b_live) try items.append(gpa, .{ .line = .{ .text = "    pop 0xF0", .jump = null } });
+        return;
     }
-}
-
-/// dptr += (hi:lo)（16 位立即数加，进位往 DPH 传）。
-fn emitDptrAdd(
-    gpa: std.mem.Allocator,
-    items: *std.ArrayListUnmanaged(Item),
-    lo: u8,
-    hi: u8,
-) !void {
-    try items.append(gpa, .{ .line = .{ .text = "    mov a,dpl", .jump = null } });
-    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    add a,#0x{X:0>2}", .{lo}), .jump = null } });
+    // scale == 1：dptr += idx（16 位加法，进位往 dph 传）
+    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{idx_text}), .jump = null } });
+    try items.append(gpa, .{ .line = .{ .text = "    add a,dpl", .jump = null } });
     try items.append(gpa, .{ .line = .{ .text = "    mov dpl,a", .jump = null } });
     try items.append(gpa, .{ .line = .{ .text = "    mov a,dph", .jump = null } });
-    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    addc a,#0x{X:0>2}", .{hi}), .jump = null } });
+    try items.append(gpa, .{ .line = .{ .text = "    addc a,#0x00", .jump = null } });
     try items.append(gpa, .{ .line = .{ .text = "    mov dph,a", .jump = null } });
 }
 
-/// dptr = _sym + off（符号基址 + 常量偏移）。
+/// dptr = _sym + off（符号基址 + 常量偏移），**一条指令**：
+/// off 折进重定位加数 `mov dptr,#(_sym+0x0012)`。原来要「mov dptr,#_sym」+
+/// 12 字节的运行时 16 位加，16 字节降到 3 字节；sdas8051 与 sdld 都能正确处理
+/// 带加数的 16 位绝对重定位（已用探针汇编+链接确认）。
 fn emitDptrSym(
     gpa: std.mem.Allocator,
     items: *std.ArrayListUnmanaged(Item),
     sym: []const u8,
     off: u16,
 ) !void {
-    try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov dptr,#{s}", .{sym}), .jump = null } });
-    if (off == 0) return;
-    try emitDptrAdd(gpa, items, @truncate(off), @truncate(off >> 8));
+    try items.append(gpa, .{ .line = .{ .text = try emitSymReloc(gpa, sym, off), .jump = null } });
+}
+
+/// `    mov dptr,#_sym` 或 `    mov dptr,#(_sym+0x00XX)`。
+fn emitSymReloc(gpa: std.mem.Allocator, sym: []const u8, off: u16) ![]const u8 {
+    if (off == 0) return std.fmt.allocPrint(gpa, "    mov dptr,#{s}", .{sym});
+    return std.fmt.allocPrint(gpa, "    mov dptr,#({s}+0x{X:0>4})", .{ sym, off });
 }
 
 /// 指令字节数（M2.3 松弛用）。只覆盖本后端会发出的形态；
@@ -1235,6 +1321,23 @@ fn instrBytes(text: []const u8) usize {
 
 /// M2.2：删掉「跳到紧邻的下一个标签」的跳转（布局期 fallthrough 优化）。
 /// 只处理 sjmp/ljmp 且目标就是下一条 label 的情形。
+/// 汇编器不允许同一标签定义两次。被重名的那个副本是死代码（所有跳转仍解析到第一次定义），
+/// 语义不变；真正的清理（终止指令后的 DCE）留给后续 pass。
+fn uniquifyLabels(gpa: std.mem.Allocator, items: *std.ArrayListUnmanaged(Item)) !void {
+    var seen = std.AutoHashMapUnmanaged(u32, void){};
+    defer seen.deinit(gpa);
+    var seq: u32 = 0;
+    for (items.items) |*it| switch (it.*) {
+        .label => |id| {
+            if (seen.contains(id)) {
+                seq += 1;
+                it.* = .{ .label = 0xF000_0000 +% seq };
+            } else try seen.put(gpa, id, {});
+        },
+        else => {},
+    };
+}
+
 fn compactJumpToNext(items: *std.ArrayListUnmanaged(Item)) void {
     var w: usize = 0;
     var r: usize = 0;
@@ -1296,11 +1399,6 @@ fn relaxJumps(gpa: std.mem.Allocator, items: *std.ArrayListUnmanaged(Item)) !voi
         };
 
         // 2) 条件跳转越界 → 展开（结构变更）
-        var max_label: u32 = 0;
-        for (items.items) |item| switch (item) {
-            .label => |n| max_label = @max(max_label, n),
-            else => {},
-        };
         var expanded = false;
         {
             var out: std.ArrayListUnmanaged(Item) = .empty;
@@ -1322,8 +1420,8 @@ fn relaxJumps(gpa: std.mem.Allocator, items: *std.ArrayListUnmanaged(Item)) !voi
                         if (l.jump) |target| if (label_off.get(target)) |toff| {
                             const delta: isize = @as(isize, @intCast(toff)) - @as(isize, @intCast(off + size));
                             if (delta < -128 or delta > 127) {
-                                max_label += 1;
-                                const skip = max_label;
+                                relax_label_seq +%= 1;
+                                const skip: u32 = 0x2000_0000 +% relax_label_seq;
                                 try out.append(gpa, .{ .line = .{ .text = inv, .jump = skip } });
                                 try out.append(gpa, .{ .line = .{ .text = "ljmp", .jump = target } });
                                 try out.append(gpa, .{ .label = skip });

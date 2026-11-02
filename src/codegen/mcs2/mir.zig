@@ -141,8 +141,8 @@ pub const Op = union(enum) {
     load_dir: struct { dst: Byte, addr: u8 },
     /// dst <- xdata mem[addr]（16 位，`mov dptr,#imm` + `movx a,@dptr` + `mov dst,a`）。
     load_xdata: struct { dst: Byte, addr: u16 },
-    /// dptr = _sym（把符号地址装进 DPTR：函数地址当值的起步动作）。
-    lea_dptr_sym: struct { sym: []const u8 },
+    /// dptr = _sym + off（把符号地址装进 DPTR：函数地址当值/多维下标的基址装载）。
+    lea_dptr_sym: struct { sym: []const u8, off: u16 = 0 },
     /// 压栈/出栈（操作数为直接地址；ISR 现场保存用，`push 0xE0` 合法）。
     push: struct { src: Byte },
     pop: struct { dst: Byte },
@@ -202,6 +202,20 @@ pub const Op = union(enum) {
     /// arg0 → DPL/DPH/B/A（≤4 字节），其余 → 被调方 _短名_PARM_2+ 静态区；
     /// 返回值同样走 DPL/DPH/B/A。因为所有值都住在 DSEG 静态槽，调用不需要保存现场。
     lcall: struct { sym: []const u8 },
+    /// **尾调用**（`return f(x)` 且 f 的返回值就是本函数的返回值）：参数已摆好，
+    /// 直接 `ljmp _f` —— 不压返回地址，f 的 `ret` 直接回到**我们的**调用方。
+    /// 8051 上完全合法：本后端所有值都在 DSEG 静态槽，没有栈帧要拆。
+    /// 自递归走这条就变成循环（栈深度不变）。ISR 里禁用（要以 `reti` 收尾）。
+    ljmp: struct { sym: []const u8 },
+    /// DPTR 已经由前面的 add/addc 序列算好，这里只发 `movx a,@dptr`。
+    /// 用于「运行期指针做基址」：地址 = base(16 位槽) + off + idx*scale，
+    /// 逐步加到 DPL/DPH 上，再取值。
+    load_xdata_dptr: struct { dst: Byte },
+    /// 同上，写回：`mov a,src` + `movx @dptr,a`。
+    store_xdata_dptr: struct { src: Byte },
+    /// `dptr += idx * scale`（16 位常量 scale；多维下标的第二、第三维）。
+    /// scale == 1 走 8 位加 + 进位；> 1 用 `mul ab`（B 由发射层按 b_live 保护）。
+    dptr_add_scaled: struct { idx: Byte, scale: u16 },
     /// 函数返回（51: `ret`；返回值由调用方先放好，见 `abi`）。
     ret,
     /// 停机；当前切片不建立调用栈。
@@ -218,6 +232,9 @@ pub const Function = struct {
     /// 边界 ABI 的静态参数区符号（`_name_PARM_n`），DSEG 段各 `.ds 1`。
     /// 空表 = 无静态参数（M1 的 u8 单参函数即空）。
     parms: []const []const u8 = &.{},
+    /// 本函数的 arg2 落在 B(0xF0)。MUL/DIV 以及「表下标乘 scale」都会踩 B，
+    /// 用到时须先 push/pop 保护（否则返回后 arg2 被改）。
+    b_live: bool = false,
 };
 
 /// 一个极小的自检程序：

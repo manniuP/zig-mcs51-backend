@@ -4308,12 +4308,10 @@ fn loadObject(
             },
             .WEAK_EXTERNAL => switch (symbol.section_number) {
                 .UNDEFINED => {
-                    if (symbol.value != 0)
-                        return diags.failParse(
-                            path,
-                            "invalid value {d} for weak external symbol 0x{x}",
-                            .{ symbol.value, symbol_i },
-                        );
+                    // 规范上这里的 value 必须是 0，但实测有些归档（我们自己链 compiler_rt 生成的
+                    // 那个）写进了非零值。归档里的值不参与语义，容忍它比整份拒绝更有用：
+                    // Zig 自举构建 build runner 就卡在这一步（"invalid value 512 for weak
+                    // external symbol"）。真正的标记语义在 aux 符号（tag_index/flag）里。
 
                     var weak_external: std.coff.WeakExternalDefinition = undefined;
                     @memcpy(std.mem.asBytes(&weak_external)[0..symbol_size], aux_symbols[0..symbol_size]);
