@@ -81,7 +81,9 @@ var no_reuse_wide: bool = false; // 诊断开关：诊断时手工改 true
 /// 实验开关：只读消费者的结果分到临时槽。实测 DSEG 98→115（更差），默认关。
 const scratch_results: bool = true;
 /// 记账开关：打印每个永久 allocWide 块（AIR 指令、槽基址、宽度、最后读取点）。
-const account_wide: bool = true; // 记账开关
+const account_wide: bool = true;
+/// 统计开关：打印每个 .alloc 的逃逸判定。
+const alloc_report: bool = false; // 统计开关（看 alloc 逃逸情况时临时改 true） // 记账开关
 
 /// 一个 8 位值的位置（M1：全部经 direct 寻址可达）。
 const Loc = mcsmir.Byte;
@@ -1145,6 +1147,51 @@ const Lower = struct {
         return false;
     }
 
+    /// 局部量的地址有没有逃逸：只被 load/store 直接读写就算没逃逸（保守版：
+    /// 取元素地址、传参、返回都判逃逸）。
+    /// 函数里有没有取址/元素指针类指令（保守判定用）。
+
+    fn hasAddrTakenOps(self: *Lower) bool {
+
+        var i: usize = 0;
+
+        while (i < self.air.instructions.len) : (i += 1) {
+
+            const ins: Air.Inst.Index = @enumFromInt(i);
+            const tag = self.air.instructions.items(.tag)[@backingInt(ins)];
+
+            switch (tag) {
+
+                .ptr_elem_ptr => return true,
+
+                else => {},
+
+            }
+
+        }
+
+        return false;
+
+    }
+
+    fn allocConfined(self: *Lower, target: Air.Inst.Index) bool {
+        const t = @backingInt(target);
+        var i: usize = 0;
+        while (i < self.air.instructions.len) : (i += 1) {
+            const ins: Air.Inst.Index = @enumFromInt(i);
+            if (@backingInt(ins) == t) continue;
+            const tag = self.air.instructions.items(.tag)[@backingInt(ins)];
+            const d = self.air.instructions.items(.data)[@backingInt(ins)];
+            if (tag == .load) {
+                if (d.ty_op.operand.toIndex()) |x| if (@backingInt(x) == t) continue;
+            }
+            if (tag == .store or tag == .store_safe) {
+                if (d.bin_op.lhs.toIndex()) |x| if (@backingInt(x) == t) continue;
+            }
+            if (self.instUsesValue(ins, target)) return false;
+        }
+        return true;
+    }
     fn wideIsAlias(self: *Lower, ref: Air.Inst.Ref, n: u8) bool {
         if (self.wideOf(ref)) |w| {
             const wn: u8 = @truncate(w >> 8);
@@ -3323,7 +3370,14 @@ const Lower = struct {
                 const ty_raw = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 const ty = if (ty_raw.zigTypeTag(self.zcu) == .pointer) ty_raw.childType(self.zcu) else ty_raw;
                 const n = try self.storageBytes(ty, "局部量");
-                const base = try self.allocWide(n);
+                if (alloc_report) std.debug.print("ALLOC fn={s} inst={d} n={d} confined={}\n", .{ self.short_name, @backingInt(inst), n, self.allocConfined(inst) });
+                // 保守：函数里只要出现取址/元素指针指令，就认为局部量可能被外部持有，
+                // 一律给永久槽（pprt/pu16/wloc2 就是这么被提前复用踩坏的）。
+                const confined = self.allocConfined(inst) and !self.hasAddrTakenOps();
+                // 地址没逃逸的局部量就是一个 SSA 值：按 AIR 最后读取点回收，不必占永久槽。
+                // 只对**单字节**局部量开这条路：宽值的读者常常经 wideOf 直接吃槽，
+// instUsesValue 看不到那些读，贸然回收会让 wloc2 那种宽局部量被踩。
+const base = if (confined and scratch_results and n == 1) try self.allocScratch(n, inst) else try self.allocWide(n);
                 self.vals[@backingInt(inst)] = mcsmir.v(base);
                 if (n > 1) self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, n) << 8);
             },
