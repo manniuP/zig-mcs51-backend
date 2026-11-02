@@ -6,43 +6,59 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-    runs-on: ${{ matrix.os }}
+  # Windows：用仓库里自举好的编译器当引导（bootstrap/ 下的 zip），不依赖外部 zig 版本
+  windows:
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
-      # 引导用的上游 Zig：本树是 0.17.1-dev（0.17.1 尚未发版），只能用 master
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: master
+      - name: 解出自举引导编译器
+        shell: pwsh
+        run: |
+          Expand-Archive bootstrap/zig-0.17.1-windows-x86_64.zip -DestinationPath bootstrap/zig -Force
+          bootstrap/zig/zig.exe version
 
       - name: 构建编译器（ReleaseFast）
         shell: bash
         env:
-          # 关键：用**本树的** lib（含 mcs51/mcs251 目标定义），不是引导 zig 自带的
           ZIG_LIB_DIR: ${{ github.workspace }}/lib
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
         run: |
-          zig version
-          zig build -Doptimize=ReleaseFast -Dno-lib --summary all
+          ./bootstrap/zig/zig.exe build -Doptimize=ReleaseFast -Dno-lib --summary all
 
-      - name: 冒烟：用产物编一个示例
+      - name: 冒烟：用产物编示例
         shell: bash
+        env:
+          ZIG_LIB_DIR: ${{ github.workspace }}/lib
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
         run: |
-          BIN=$(ls zig-out/bin/zig* | head -1)
-          echo "compiler: $BIN"
           cd examples/mcs51
-          ZIG_LIB_DIR=$PWD/../../lib "$PWD/../../$BIN" build || true
+          ../../zig-out/bin/zig.exe build
+          ls zig-out/asm | wc -l
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zig-mcs51-${{ matrix.name }}
-          path: |
-            zig-out/bin/zig*
+          name: zig-mcs51-windows-x86_64
+          path: zig-out/bin/zig.exe
+
+  # Linux：仓库里的引导是 Windows 版，跑不了；只能拿上游 master 试（0.17.1 未发版，可能失败）
+  linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: master
+      - name: 构建编译器（ReleaseFast）
+        env:
+          ZIG_LIB_DIR: ${{ github.workspace }}/lib
+          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
+        run: |
+          zig version
+          zig build -Doptimize=ReleaseFast -Dno-lib --summary all
+      - uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: zig-mcs51-linux-x86_64
+          path: zig-out/bin/zig
