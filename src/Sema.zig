@@ -29647,6 +29647,9 @@ fn callconvCoerceAllowed(
                 std.lang.CallingConvention.MipsInterruptOptions => {
                     if (src_data.mode != dest_data.mode) return false;
                 },
+                std.lang.CallingConvention.McsInterruptOptions => {
+                    if (src_data.vector != dest_data.vector) return false;
+                },
                 std.lang.CallingConvention.RiscvInterruptOptions => {
                     if (src_data.mode != dest_data.mode) return false;
                 },

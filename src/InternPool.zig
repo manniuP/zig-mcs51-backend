@@ -12615,6 +12615,11 @@ const PackedCallingConvention = packed struct(u18) {
                     .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
                     .extra = @backingInt(pl.save),
                 },
+                std.lang.CallingConvention.McsInterruptOptions => .{
+                    .tag = tag,
+                    .incoming_stack_alignment = .fromByteUnits(pl.incoming_stack_alignment orelse 0),
+                    .extra = @intCast(pl.vector), // 1..13（8051 向量号），u4 足够
+                },
                 std.lang.CallingConvention.SpirvKernelOptions => .{
                     .tag = tag,
                     .incoming_stack_alignment = .none,
@@ -12656,6 +12661,10 @@ const PackedCallingConvention = packed struct(u18) {
                     std.lang.CallingConvention.X86RegparmOptions => .{
                         .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
                         .register_params = @intCast(cc.extra),
+                    },
+                    std.lang.CallingConvention.McsInterruptOptions => .{
+                        .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),
+                        .vector = @intCast(cc.extra),
                     },
                     std.lang.CallingConvention.ArcInterruptOptions => .{
                         .incoming_stack_alignment = cc.incoming_stack_alignment.toByteUnits(),

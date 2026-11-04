@@ -2403,6 +2403,7 @@ pub fn genFunc(f: *Function, fwd_decl_writer: *Writer, header_writer: *Writer) E
             std.lang.CallingConvention.ShInterruptOptions,
             std.lang.CallingConvention.MicroblazeInterruptOptions,
             std.lang.CallingConvention.MipsInterruptOptions,
+            std.lang.CallingConvention.McsInterruptOptions,
             std.lang.CallingConvention.CommonOptions,
             std.lang.CallingConvention.X86RegparmOptions,
             => pl.incoming_stack_alignment,

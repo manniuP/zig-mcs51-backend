@@ -6,17 +6,23 @@ on:
   workflow_dispatch:
 
 jobs:
-  # Windows：用仓库里自举好的编译器当引导（bootstrap/ 下的 zip），不依赖外部 zig 版本
-  windows:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: 解出自举引导编译器
-        shell: pwsh
-        run: |
-          Expand-Archive bootstrap/zig-0.17.1-windows-x86_64.zip -DestinationPath bootstrap/zig -Force
-          bootstrap/zig/zig.exe version
+      # 引导：官方 0.17.0 发布版（本树已能直接用它自举）
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
 
       - name: 构建编译器（ReleaseFast）
         shell: bash
@@ -24,7 +30,8 @@ jobs:
           ZIG_LIB_DIR: ${{ github.workspace }}/lib
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
         run: |
-          ./bootstrap/zig/zig.exe build -Doptimize=ReleaseFast -Dno-lib --summary all
+          zig version
+          zig build -Doptimize=ReleaseFast -Dno-lib --summary all
 
       - name: 冒烟：用产物编示例
         shell: bash
@@ -32,33 +39,13 @@ jobs:
           ZIG_LIB_DIR: ${{ github.workspace }}/lib
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
         run: |
+          BIN=$(ls zig-out/bin/zig*)
+          echo "compiler: $BIN"
           cd examples/mcs51
-          ../../zig-out/bin/zig.exe build
+          "$GITHUB_WORKSPACE/$BIN" build
           ls zig-out/asm | wc -l
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zig-mcs51-windows-x86_64
-          path: zig-out/bin/zig.exe
-
-  # Linux：仓库里的引导是 Windows 版，跑不了；只能拿上游 master 试（0.17.1 未发版，可能失败）
-  linux:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: master
-      - name: 构建编译器（ReleaseFast）
-        env:
-          ZIG_LIB_DIR: ${{ github.workspace }}/lib
-          ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
-        run: |
-          zig version
-          zig build -Doptimize=ReleaseFast -Dno-lib --summary all
-      - uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: zig-mcs51-linux-x86_64
-          path: zig-out/bin/zig
+          name: zig-mcs51-${{ matrix.name }}
+          path: zig-out/bin/zig*
