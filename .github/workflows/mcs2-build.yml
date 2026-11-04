@@ -39,8 +39,10 @@ jobs:
           ZIG_LIB_DIR: ${{ github.workspace }}/lib
           ZIG_GLOBAL_CACHE_DIR: ${{ github.workspace }}/.zig-global-cache
         run: |
-          BIN=$(ls zig-out/bin/zig*)
+          # Windows 上是 zig.exe（还有 zig.pdb），Linux 上是 zig —— 只取可执行文件
+          BIN=$(ls zig-out/bin/zig.exe 2>/dev/null || ls zig-out/bin/zig)
           echo "compiler: $BIN"
+          chmod +x "$BIN" 2>/dev/null || true
           cd examples/mcs51
           "$GITHUB_WORKSPACE/$BIN" build
           ls zig-out/asm | wc -l
@@ -48,4 +50,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: zig-mcs51-${{ matrix.name }}
-          path: zig-out/bin/zig*
+          path: |
+            zig-out/bin/zig
+            zig-out/bin/zig.exe
