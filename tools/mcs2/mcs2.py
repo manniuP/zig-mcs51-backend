@@ -206,14 +206,15 @@ def assemble(asm: Path, name: str, dseg: int, cseg: int = 0x0000) -> Path:
     return _assemble(asm, BUILD, name, dseg_base=dseg, cseg_base=cseg)
 
 
-def emit_asm(src: Path, tag: str) -> tuple[Path, str]:
+def emit_asm(src: Path, tag: str, opt: str = "ReleaseSmall") -> tuple[Path, str]:
     """zig build-obj -> 汇编文本。产物缺 CSEG 视为编译器异常。
 
+    默认尺寸档；安全档用例传 opt="ReleaseSafe"，用来验溢出检查与停机路径。
     固定注入命名模块 `cordic`（= tools/mcs2/lib/cordic.zig）：用例里 `@import("cordic")`
     就能用定点数学库；不 import 的用例不受影响（模块不会被分析）。
     """
     asm = BUILD / f"{tag}.asm"
-    run([str(ZIG_EXE), "build-obj", "-OReleaseSmall", "-target", TARGET,
+    run([str(ZIG_EXE), "build-obj", f"-O{opt}", "-target", TARGET,
          "--dep", "cordic", f"-Mroot={src}", f"-Mcordic={CORDIC}",
          "-femit-bin=" + str(asm)], env=zig_env())
     text = asm.read_text(encoding="utf-8")
@@ -251,13 +252,19 @@ def sim(ihx: Path, steps: int, slots: int = 4, base: int = 0x8000,
 
 
 def driver_call(fn: str, args: list[tuple[str, int]], slot: int = 0x8000,
-                ret_bytes: int = 1) -> str:
+                ret_bytes: int = 1, sentinel: int | None = None) -> str:
     """摆参 -> lcall -> 结果写 xdata 槽 -> 停机。
 
     ret_bytes=1：返回值在 DPL，写一个字节。
     ret_bytes=2：返回值在 DPL(低)/DPH(高)，写两个字节（u16 ABI）。
+    sentinel：调用前先把结果槽写成该值。安全档溢出时后端停机、不写结果，
+    槽里就还是哨兵；正常返回则被结果覆盖。用来区分「停机」与「算出 0」。
     """
     out = "    .area CSEG (CODE)\n    mov sp,#0x7F\n"
+    if sentinel is not None:
+        out += (f"    mov dptr,#0x{slot:04X}\n"
+                f"    mov a,#0x{sentinel:02X}\n"
+                "    movx @dptr,a\n")
     for pos, val in args:
         if pos in ("DPL", "DPH", "B", "ACC"):
             out += f"    mov {pos.lower()},#0x{val:02X}\n"
@@ -587,6 +594,29 @@ CASES: dict[str, dict] = {
     "argcall3": dict(kind="call", src="argcall.zig", fn="after", args=[("DPL", 0x34)], want=0x69, steps=2000),
     # kfifo 式环形缓冲：u8 索引 + 掩码（and）替代取模。
     "ringdemo": dict(kind="call", src="ring.zig", fn="ringdemo", args=[("DPL", 5)], want=15, steps=5000),
+
+    # ---- 安全档（ReleaseSafe）溢出检查 ----
+    # 溢出用例用哨兵判停机：调用前把结果槽写成 0x55，正常返回会覆盖它，
+    # 溢出停机则保持 0x55。尺寸档不编这些用例（那里本就不该有检查）。
+    "safe_add_ok": dict(kind="call", src="safe.zig", fn="safe_add", args=[("DPL", 3), ("PARM2", 4)], want=0x07, opt="ReleaseSafe"),
+    "safe_add_ov": dict(kind="call", src="safe.zig", fn="safe_add", args=[("DPL", 250), ("PARM2", 10)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
+    "safe_sub_ok": dict(kind="call", src="safe.zig", fn="safe_sub", args=[("DPL", 10), ("PARM2", 3)], want=0x07, opt="ReleaseSafe"),
+    "safe_sub_ov": dict(kind="call", src="safe.zig", fn="safe_sub", args=[("DPL", 3), ("PARM2", 10)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
+    "safe_mul_ok": dict(kind="call", src="safe.zig", fn="safe_mul", args=[("DPL", 3), ("PARM2", 4)], want=0x0C, opt="ReleaseSafe"),
+    "safe_mul_ov": dict(kind="call", src="safe.zig", fn="safe_mul", args=[("DPL", 20), ("PARM2", 20)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
+    # 有符号走 OV 判据（PSW.2），不是进位判据。
+    "safe_sadd_ok": dict(kind="call", src="safe.zig", fn="safe_sadd", args=[("DPL", 10), ("PARM2", 20)], want=30, opt="ReleaseSafe"),
+    "safe_sadd_ov": dict(kind="call", src="safe.zig", fn="safe_sadd", args=[("DPL", 100), ("PARM2", 100)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
+    # 数组越界走 trap，诊断标记 0xA5 与溢出的 0x5A 区分。
+    "safe_bounds_ok": dict(kind="call", src="safe.zig", fn="safe_bounds", args=[("DPL", 2)], want=3, opt="ReleaseSafe"),
+    "safe_bounds_ov": dict(kind="call", src="safe.zig", fn="safe_bounds", args=[("DPL", 9)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0xA5}),
+    # 非尾递归必须编译期拒绝（静态参数区不可重入）。
+    "safe_rec_reject": dict(kind="reject", src="rec.zig", opt="ReleaseSafe", want_err="非尾递归不受支持", want_code="rec_bad__tail(n, 0)"),
+    # 改写建议：错误信息里必须出现可直接粘贴的 Zig 代码，而不只是中文说明。
+    "diag_mul_reject": dict(kind="reject", src="diag_mul.zig", opt="ReleaseSafe", want_err="乘法溢出检查", want_code="a *% b"),
+    "diag_addr_reject": dict(kind="reject", src="diag_addr.zig", opt="ReleaseSafe", want_err="数据指针的地址", want_code="@ptrFromInt(BUF_ADDR)"),
+    "diag_switch_reject": dict(kind="reject", src="diag_switch.zig", opt="ReleaseSafe", want_err="switch 的判定值", want_code="handlers[op](arg)"),
+    "diag_dim_reject": dict(kind="reject", src="diag_dim.zig", opt="ReleaseSafe", want_err="多维下标", want_code="row * COLS + col"),
 }
 
 ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big",
@@ -611,7 +641,11 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "ifx1", "ifx0", "ifr1", "ifr0", "swx2", "swx9", "ifw1", "ifw0",
          "wloc1", "wloc2", "s16r", "u16l", "u32l",
          "csin90", "csin45", "csin180", "ccos0", "cat90", "cat45",
-         "csqrt1m", "chyp", "ringdemo"]
+         "csqrt1m", "chyp", "ringdemo",
+         "safe_add_ok", "safe_add_ov", "safe_sub_ok", "safe_sub_ov",
+         "safe_mul_ok", "safe_mul_ov", "safe_sadd_ok", "safe_sadd_ov",
+         "safe_bounds_ok", "safe_bounds_ov", "safe_rec_reject",
+         "diag_mul_reject", "diag_addr_reject", "diag_switch_reject", "diag_dim_reject"]
 
 
 def check_selftest() -> bool:
@@ -643,7 +677,7 @@ def check_selftest() -> bool:
 def check_call(name: str, spec: dict) -> bool:
     dseg = spec.get("dseg", 0x30)
     steps = spec.get("steps", 400)
-    _, text = emit_asm(TESTS / spec["src"], name)
+    _, text = emit_asm(TESTS / spec["src"], name, opt=spec.get("opt", "ReleaseSmall"))
     if spec.get("want_ljmp") and "ljmp" not in text:
         print("FAIL: 期望长跳（ljmp）但产物里没有——跳转松弛没生效")
         return False
@@ -653,7 +687,8 @@ def check_call(name: str, spec: dict) -> bool:
         ret_bytes = 2
     if spec.get("want32") is not None:
         ret_bytes = 4
-    merged = merge(name, driver_call(spec["fn"], spec["args"], ret_bytes=ret_bytes), text)
+    merged = merge(name, driver_call(spec["fn"], spec["args"], ret_bytes=ret_bytes,
+                                     sentinel=spec.get("sentinel")), text)
     ihx = assemble(merged, name, dseg=dseg)
     expect_mem: dict[int, int] = spec.get("expect_mem") or {}
     if want_wide is not None:
@@ -742,6 +777,48 @@ def size_gate() -> bool:
     return ok
 
 
+def check_interop() -> bool:
+    """C(SDCC) ↔ Zig(mcs2) 混链门禁。
+
+    边界 ABI 与 SDCC `--model-small` 逐字节对齐是「C 互操作」的底线；
+    只改后端不改 ABI 也必须保证这条链不散。脚本同时核对 C 侧参数摆放
+    与 Zig 侧导出符号，用 SDCC 当链接器生成 .ihx。
+    """
+    script = HERE / "interop" / "build.py"
+    if not script.exists():
+        print("  SKIP: 没有混链脚本")
+        return True
+    r = subprocess.run([sys.executable, str(script)], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace")
+    output = (r.stdout or "") + (r.stderr or "")
+    ok = r.returncode == 0 and "OK:" in output
+    if not ok:
+        print(output[-1200:])
+    print(f"  {'PASS' if ok else 'FAIL'}: C↔Zig 混链（SDCC 链接器）")
+    return ok
+
+
+def check_reject(name: str, spec: dict) -> bool:
+    """期望编译失败的用例：必须给出明确中文错误，而不是静默生成错误代码。"""
+    src = TESTS / spec["src"]
+    out = BUILD / f"{name}.asm"
+    r = subprocess.run(
+        [str(ZIG_EXE), "build-obj", f"-O{spec.get('opt', 'ReleaseSmall')}",
+         "-target", TARGET, "--dep", "cordic", f"-Mroot={src}",
+         f"-Mcordic={CORDIC}", "-femit-bin=" + str(out)],
+        env=zig_env(), capture_output=True, text=True, encoding="utf-8", errors="replace")
+    output = (r.stdout or "") + (r.stderr or "")
+    err_ok = r.returncode != 0 and spec["want_err"] in output
+    code_ok = spec.get("want_code") is None or spec["want_code"] in output
+    ok = err_ok and code_ok
+    if not ok:
+        print(output[-800:])
+    print(f"  {'PASS' if ok else 'FAIL'}: {name} 编译期拒绝（含「{spec['want_err']}」）")
+    if spec.get("want_code"):
+        print(f"  {'PASS' if code_ok else 'FAIL'}: 改写建议含代码「{spec['want_code']}」")
+    return ok
+
+
 def check(names: list[str]) -> int:
     need_compiler()
     BUILD.mkdir(parents=True, exist_ok=True)
@@ -753,6 +830,8 @@ def check(names: list[str]) -> int:
             ok = check_selftest()
         elif name == "interrupt":
             ok = check_interrupt(name)
+        elif name in CASES and CASES[name]["kind"] == "reject":
+            ok = check_reject(name, CASES[name])
         elif name in CASES:
             ok = check_call(name, CASES[name])
         else:
@@ -764,6 +843,11 @@ def check(names: list[str]) -> int:
         print("== 尺寸门禁")
         if not size_gate():
             failed.append("size")
+    # 只在全量验收跑混链：单项调试不必每次都重编 C 侧。
+    if not names and not failed:
+        print("== C 互操作门禁")
+        if not check_interop():
+            failed.append("interop")
     print()
     if failed:
         print(f"FAIL: {', '.join(failed)}")

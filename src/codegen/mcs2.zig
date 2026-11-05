@@ -18,6 +18,7 @@ const Type = @import("../Type.zig");
 const Value = @import("../Value.zig");
 const mcsmir = @import("mcs2/mir.zig");
 const mcs51 = @import("mcs2/mcs51.zig");
+const diag = @import("mcs2/diag.zig");
 
 pub const Mir = struct {
     text: std.ArrayListUnmanaged(u8) = .empty,
@@ -81,7 +82,8 @@ var no_reuse_wide: bool = false; // 诊断开关：诊断时手工改 true
 /// 实验开关：只读消费者的结果分到临时槽。实测 DSEG 98→115（更差），默认关。
 const scratch_results: bool = true;
 /// 记账开关：打印每个永久 allocWide 块（AIR 指令、槽基址、宽度、最后读取点）。
-const account_wide: bool = true;
+/// 默认关：诊断输出会混进编译错误信息，干扰「改写建议」的可读性。
+const account_wide: bool = false;
 /// 统计开关：打印每个 .alloc 的逃逸判定。
 const alloc_report: bool = false; // 统计开关（看 alloc 逃逸情况时临时改 true） // 记账开关
 
@@ -190,6 +192,13 @@ const Lower = struct {
     needs_dptr: bool = false,
     /// MCS2_DUMP_AIR 环境变量：打印 AIR 指令序列（诊断用）。
     dump_air: bool = false,
+    /// 当前函数类型：生成「改写建议」时要拿真实的形参类型与返回类型。
+    fn_ty: Type = undefined,
+    /// 安全档（`ReleaseSafe`）的共享停机块标签：溢出检查命中就跳到这里。
+    /// 懒分配——只有真正发过检查的函数才有这块尾代码，尺寸档零开销。
+    panic_label: ?u32 = null,
+    /// 安全档越界 / unreachable 的停机块（与溢出停机分用不同诊断标记）。
+    trap_label: ?u32 = null,
 
     /// 存储宽度（**不是**算术宽度）：≤8 位一律 1 字节容器（u1/u5 这类只能当值存放），
     /// 16/32 按宽度。算术闸门仍然是 requireIntWidth（只认 8/16/32），
@@ -396,7 +405,7 @@ const Lower = struct {
             .elem_sym => |e| try self.chainAppend(.{ .sym = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
             .rt_elem => |e| try self.chainAppend(.{ .rt = .{ .lo = e.lo, .hi = e.hi, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
             .chain => |c| try self.chainAppend(c.base, c.terms[0..c.n], idx, sc, idx_hi),
-            .code_sym, .code_elem_sym => return self.fail("const 表的多维下标暂不支持（只有一维）", .{}),
+            .code_sym, .code_elem_sym => return self.failFix(.const_multi_dim, "const 表的多维下标暂不支持（只有一维）", .{}),
         };
         return switch (pr) {
             .fixed => |b| .{ .elem = .{ .base = b, .idx = idx, .scale = @intCast(sc) } },
@@ -407,7 +416,7 @@ const Lower = struct {
             .elem_sym => |e| try self.chainAppend(.{ .sym = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
             .rt_elem => |e| try self.chainAppend(.{ .rt = .{ .lo = e.lo, .hi = e.hi, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
             .chain => |c| try self.chainAppend(c.base, c.terms[0..c.n], idx, sc, null),
-            .code_elem_sym => return self.fail("const 表的多维下标暂不支持（只有一维）", .{}),
+            .code_elem_sym => return self.failFix(.const_multi_dim, "const 表的多维下标暂不支持（只有一维）", .{}),
         };
     }
 
@@ -1121,7 +1130,7 @@ const Lower = struct {
                 if (d.bin_op.lhs.toIndex()) |x| if (@backingInt(x) == t) return true;
                 if (d.bin_op.rhs.toIndex()) |x| if (@backingInt(x) == t) return true;
             },
-            .mul, .mul_wrap, .div_trunc, .rem => {
+            .mul, .mul_safe, .mul_wrap, .div_trunc, .rem => {
                 if (d.bin_op.lhs.toIndex()) |x| if (@backingInt(x) == t) return true;
                 if (d.bin_op.rhs.toIndex()) |x| if (@backingInt(x) == t) return true;
             },
@@ -1237,6 +1246,58 @@ const Lower = struct {
         return self.zcu.codegenFail(self.nav, "mcs2: " ++ fmt, args);
     }
 
+    /// 类型名（只覆盖后端认得的形态）：把改写建议里的签名写实。
+    fn typeName(self: *Lower, ty: Type) []const u8 {
+        return switch (ty.zigTypeTag(self.zcu)) {
+            .int => blk: {
+                const ii = self.intInfo(ty) orelse break :blk "usize";
+                break :blk switch (ii.bytes) {
+                    1 => if (ii.signed) "i8" else "u8",
+                    2 => if (ii.signed) "i16" else "u16",
+                    4 => if (ii.signed) "i32" else "u32",
+                    else => "usize",
+                };
+            },
+            .bool => "bool",
+            .pointer => "*u8",
+            .void => "void",
+            else => "usize",
+        };
+    }
+
+    /// 带「可直接粘贴的 Zig 改写代码」的拒绝：错误里用真实函数名、形参类型与返回类型。
+    fn failFix(self: *Lower, kind: diag.Kind, comptime fmt: []const u8, args: anytype) codegen.Error {
+        const ip = &self.zcu.intern_pool;
+        const ft = ip.indexToKey(self.fn_ty.toIntern()).func_type;
+        const pts = ft.param_types.get(ip);
+        const names = self.gpa.alloc([]const u8, pts.len) catch return error.OutOfMemory;
+        defer self.gpa.free(names);
+        for (pts, 0..) |pi, i| names[i] = self.typeName(Type.fromInterned(pi));
+
+        // 尽量用源码里的真实参数名（n / m），拿不到才退回 a0 / a1。
+        var pnames: ?[]const []const u8 = null;
+        defer if (pnames) |pn| self.gpa.free(pn);
+        const lazy = self.zcu.navSrcLoc(self.nav);
+        if (lazy.baseline.resolve(self.zcu)) |resolved| {
+            const file_idx, const base_node = resolved;
+            _ = base_node;
+            const file = self.zcu.fileByIndex(file_idx);
+            if (file.getSource(self.zcu)) |src| {
+                pnames = diag.paramNamesFromSource(self.gpa, src[0..src.len],
+                    self.short_name, pts.len) catch null;
+            } else |_| {}
+        }
+
+        const fix = diag.render(self.gpa, kind, self.short_name, names, pnames,
+            self.typeName(self.fn_ty.fnReturnType(self.zcu))) catch return error.OutOfMemory;
+        defer self.gpa.free(fix);
+        const head = std.fmt.allocPrint(self.gpa, "mcs2: " ++ fmt, args) catch return error.OutOfMemory;
+        defer self.gpa.free(head);
+        const full = std.fmt.allocPrint(self.gpa, "{s}\n\n{s}", .{ head, fix }) catch return error.OutOfMemory;
+        defer self.gpa.free(full);
+        return self.zcu.codegenFail(self.nav, "{s}", .{full});
+    }
+
     fn allocVreg(self: *Lower) !u8 {
         return self.allocSlots(1, false);
     }
@@ -1281,6 +1342,9 @@ const Lower = struct {
             .br_ifz => |x| if (x.target == id) return true,
             .cmp_br => |x| if (x.target == id) return true,
             .dec_br_nz => |x| if (x.target == id) return true,
+            // 溢出检查也引用标签：漏了这两条会把停机尾块当死代码删掉。
+            .bit_br => |x| if (x.target == id) return true,
+            .br_c => |x| if (x.target == id) return true,
             else => {},
         };
         return false;
@@ -1300,6 +1364,43 @@ const Lower = struct {
         return l;
     }
 
+    /// 溢出检查的目标标签：懒分配，走模块级临时标签域（跨函数不撞号）。
+    fn panicTarget(self: *Lower) u32 {
+        if (self.panic_label) |l| return l;
+        const l = self.tempLabel();
+        self.panic_label = l;
+        return l;
+    }
+
+    /// 发一条溢出检查：无符号看进位 C（PSW.7 = 0xD7），有符号看溢出 OV
+    /// （PSW.2 = 0xD2）。标志必须紧贴算术指令之后有效，所以调用点要避开
+    /// `inc/dec` 那条不改标志的发射捷径（见 8 位加减分支）。
+    fn trapTarget(self: *Lower) u32 {
+        if (self.trap_label) |l| return l;
+        const l = self.tempLabel();
+        self.trap_label = l;
+        return l;
+    }
+
+    /// 停机块：先往诊断槽写一个标记（溢出 0x5A、越界 0xA5），再 `sjmp .`。
+    /// 地址取 xdata 0x8100，避开验收用的 0x8000 结果槽；尺寸档不生成这块代码。
+    fn appendPanicBlock(self: *Lower, gpa: std.mem.Allocator, label: u32, mark: u8) codegen.Error!void {
+        try self.ops.appendSlice(gpa, &.{
+            .{ .label = label },
+            .{ .imm = .{ .dst = .{ .dir = 0xE0 }, .value = mark } },
+            .{ .store_xdata = .{ .addr = 0x8100, .src = .{ .dir = 0xE0 } } },
+            .halt,
+        });
+    }
+
+    fn emitOverflowCheck(self: *Lower, signed: bool) codegen.Error!void {
+        try self.ops.append(self.gpa, .{ .bit_br = .{
+            .bit = if (signed) 0xD2 else 0xD7,
+            .target = self.panicTarget(),
+            .on_set = true,
+        } });
+    }
+
     /// 这个块是否有结果槽（带返回值的块）；没有就是普通块。
     fn slotForBlock(self: *Lower, blk: Air.Inst.Index) ?BlockSlot {
         for (self.block_slots.items) |s| if (s.inst == blk) return s;
@@ -1314,7 +1415,7 @@ const Lower = struct {
         const us = self.air.unwrapSwitch(inst);
         const cond_ty = self.air.typeOf(us.operand, &self.zcu.intern_pool);
         const n = try self.storageBytes(cond_ty, "switch 判定值");
-        if (n != 1) return self.fail("switch 的判定值暂时只支持 8 位（u8 / ≤256 的 enum）", .{});
+        if (n != 1) return self.failFix(.switch_wide, "switch 的判定值暂时只支持 8 位（u8 / ≤256 的 enum）", .{});
         const cond = try self.refLoc(us.operand);
 
         const CaseRec = struct {
@@ -1416,7 +1517,7 @@ const Lower = struct {
             // 早期只列了 add/sub/cmp，漏掉 shr/mul/bit_and ... 会让 useCountWholeAir
             // 误判「值已死」，原地写回提前覆盖源槽（sqrt32 的 res >> 1 就是这么错的）。
             .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap,
-            .mul, .mul_wrap, .div_trunc, .rem,
+            .mul, .mul_safe, .mul_wrap, .div_trunc, .rem,
             .bit_and, .bit_or, .xor, .shl, .shr, .shl_exact, .shr_exact,
             .store, .store_safe,
             .cmp_lt, .cmp_lte, .cmp_gt, .cmp_gte, .cmp_eq, .cmp_neq,
@@ -1453,7 +1554,9 @@ const Lower = struct {
                     }
                 }
             },
-            .int_cast, .int_cast_safe, .trunc, .not, .bit_cast => {
+            // `.load` 的 operand 就是局部量的 `.alloc` 结果；漏了它，宽局部量
+            // 的最后读取点会被算成 0，scratch 一回收就把变量槽让给别人。
+            .int_cast, .int_cast_safe, .trunc, .not, .bit_cast, .load => {
                 if (d.ty_op.operand.toIndex()) |x| {
                     if (@backingInt(x) == @backingInt(target)) return true;
                 }
@@ -2341,7 +2444,9 @@ const Lower = struct {
             };
             const nxt = self.ops.items[i + 1];
             const boundary = switch (nxt) {
-                .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .ret, .reti, .halt => true,
+                .label, .br, .br_ifnz, .br_ifz, .cmp_br, .dec_br_nz, .ret, .reti, .halt,
+                // 溢出检查读的是标志位，不能跨它折叠拷贝（会改变 C/OV 的来源）。
+                .bit_br, .br_c => true,
                 else => false,
             };
             if (boundary or !readsVreg(nxt, d) or readCountVreg(self.ops.items, d) != 1) {
@@ -2867,7 +2972,7 @@ const Lower = struct {
         self.cur_inst = inst;
         self.cur_scratch_ok = switch (self.air.instructions.items(.tag)[@backingInt(inst)]) {
             .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap,
-            .mul, .mul_wrap, .div_trunc, .rem, .bit_and, .bit_or, .xor,
+            .mul, .mul_safe, .mul_wrap, .div_trunc, .rem, .bit_and, .bit_or, .xor,
             .shl, .shr, .shl_exact, .shr_exact, .not,
             // 转换**结果**也可以 scratch：转换若分配新块，那它是全新的；只要它的消费者都只读
             // （典型是 ret），这块就可以在最后读取点之后还池。恒等转换本来就不分配，走不到这里。
@@ -3008,13 +3113,17 @@ const Lower = struct {
             .add, .add_safe, .add_wrap, .sub, .sub_safe, .sub_wrap => {
                 const bin = data.bin_op;
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
-                const n = (try self.requireIntWidth(ty, "加减法")).bytes;
+                const wi = try self.requireIntWidth(ty, "加减法");
+                const n = wi.bytes;
+                // 安全档：Sema 发 `_safe` 标签（ReleaseSafe），溢出必须停机而不是回绕。
+                const checked = tag == .add_safe or tag == .sub_safe;
                 // 多字节：固定模板 = clr c + addc/subb 逐字节（低字节在前）。
                 if (n > 1) {
                     // ① 0 - x 直接走二补码取负：省掉「把常量 0 物化成 n 个槽」。
                     // absU（if (v < 0) return -v）这类形态原来光零常量就占 4 槽。
+                    // 安全档不走这条捷径：取负不发进位链，没有可用的溢出标志。
                     const is_sub_tag = tag == .sub or tag == .sub_safe or tag == .sub_wrap;
-                    if (is_sub_tag) {
+                    if (is_sub_tag and !checked) {
                         if (self.constWide(bin.lhs)) |lv| {
                             if (lv == 0) {
                                 const bneg = try self.wideOperand(bin.rhs, n);
@@ -3045,6 +3154,9 @@ const Lower = struct {
                     }
                     self.vals[@backingInt(inst)] = mcsmir.v(d);
                     self.wide[@backingInt(inst)] = @as(u16, d) | (@as(u16, n) << 8);
+                    // 链尾最后一条 addc/subb 的 C（无符号）或 OV（有符号）就是整块的
+                    // 溢出标志；发射层里的 mov dst,a 不动标志。
+                    if (checked) try self.emitOverflowCheck(wi.signed);
                     continue;
                 }
                 const lhs = try self.refLoc(bin.lhs);
@@ -3052,7 +3164,9 @@ const Lower = struct {
                 // 「ret 前看一眼」：下一非调试指令若是 ret 且操作数是本指令，
                 // 结果直接写 DPL（扩展访问优化的最小版：省一次 vreg 往返）。
                 var consumed_by_ret = false;
-                if (self.ret_byte != null and idx + 1 < body.len) {
+                // 安全档禁用「结果直写返回寄存器」：那会让 dst 与 lhs 同址，
+                // 发射层改发 inc/dec 而**不动标志位**，溢出检查就会读到旧 C/OV。
+                if (!checked and self.ret_byte != null and idx + 1 < body.len) {
                     const nxt = body[idx + 1];
                     const nxt_tag = self.air.instructions.items(.tag)[@backingInt(nxt)];
                     if (nxt_tag == .ret or nxt_tag == .ret_safe) {
@@ -3070,7 +3184,7 @@ const Lower = struct {
                     mcsmir.v(try self.allocVreg());
 
                 // P1：结果紧接着写回某个本地槽 → 直接写那个槽，store 整条省掉。
-                if (!consumed_by_ret) {
+                if (!consumed_by_ret and !checked) {
                     if (self.nextRealIdx(body, idx)) |nxt| {
                         const ntag = self.air.instructions.items(.tag)[@backingInt(body[nxt])];
                         if (ntag == .store or ntag == .store_safe) {
@@ -3095,6 +3209,8 @@ const Lower = struct {
                     .{ .add = .{ .dst = dst, .lhs = lhs, .rhs = rhs } }
                 else
                     .{ .sub = .{ .dst = dst, .lhs = lhs, .rhs = rhs } });
+                // dst 是新槽（!= lhs），发射层走 add/subb 而非 inc/dec，C/OV 有效。
+                if (checked) try self.emitOverflowCheck(wi.signed);
                 self.vals[@backingInt(inst)] = dst;
             },
 
@@ -3134,9 +3250,15 @@ const Lower = struct {
 
             // 乘/除/取余/取反（u8）。8051 用 MUL AB / DIV AB，B 是结果高字节或余数，
             // 而 B(0xF0) 同时是 arg2 的 ABI 位置 —— 用到了就保存/恢复。
-            .mul, .mul_wrap, .div_trunc, .rem, .not => {
+            .mul, .mul_safe, .mul_wrap, .div_trunc, .rem, .not => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 const info = try self.requireIntWidth(ty, "乘除/取反");
+                // 安全档乘法：8 位无符号能靠 MUL AB 的高半（B）判溢出；多字节/有符号
+                // 走的是移位加法模板，没有现成溢出标志。宁可明确报错也不静默回绕——
+                // 需要回绕语义请写 `*%`（详见改写建议）。
+                if (tag == .mul_safe and (info.bytes > 1 or info.signed)) {
+                    return self.failFix(.mul_safe, "ReleaseSafe 的多字节/有符号乘法溢出检查尚未实现", .{});
+                }
                 if (tag == .not) {
                     if (info.bytes > 1) {
                         const s = try self.wideOperand(data.ty_op.operand, info.bytes);
@@ -3196,6 +3318,16 @@ const Lower = struct {
                     .rem => .{ .rem_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                     else => .{ .mul = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                 });
+                // MUL AB 之后 B 就是积的高字节，非零即 8 位无符号溢出。
+                // 必须放在恢复 arg2 的 B 之前——那一步会把高字节盖掉。
+                if (tag == .mul_safe) {
+                    try self.ops.append(self.gpa, .{ .cmp_br = .{
+                        .lhs = .{ .dir = 0xF0 },
+                        .rhs = .{ .imm = 0 },
+                        .cc = .ne,
+                        .target = self.panicTarget(),
+                    } });
+                }
                 if (saved_b) |sv| {
                     try self.ops.append(self.gpa, .{ .mov = .{ .dst = .{ .dir = 0xF0 }, .src = mcsmir.v(sv) } });
                 }
@@ -3340,7 +3472,7 @@ const Lower = struct {
             .int_from_ptr => {
                 const ty_op = data.ty_op;
                 const sym = self.fnNavSym(ty_op.operand) orelse
-                    return self.fail("只支持把**函数**地址转成整数（数据指针的地址暂不支持）", .{});
+                    return self.failFix(.data_addr, "只支持把函数地址转成整数（数据指针的地址暂不支持）", .{});
                 const w = try self.allocWide(2);
                 try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = sym } });
                 try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(w), .src = .{ .dir = 0x82 } } });
@@ -3375,9 +3507,14 @@ const Lower = struct {
                 // 一律给永久槽（pprt/pu16/wloc2 就是这么被提前复用踩坏的）。
                 const confined = self.allocConfined(inst) and !self.hasAddrTakenOps();
                 // 地址没逃逸的局部量就是一个 SSA 值：按 AIR 最后读取点回收，不必占永久槽。
-                // 只对**单字节**局部量开这条路：宽值的读者常常经 wideOf 直接吃槽，
-// instUsesValue 看不到那些读，贸然回收会让 wloc2 那种宽局部量被踩。
-const base = if (confined and scratch_results and n == 1) try self.allocScratch(n, inst) else try self.allocWide(n);
+                // 只对**单字节**局部量开这条路。宽值（n>1）试过三次：补 `.load` 引用、
+                // 统一回收尺度、按引用所在块收敛，均让 `wloc2` 的高字节被提前回收的槽踩掉。
+                // 根因是「全 AIR 下标 / body 下标」两套生命周期尺度混用，需要真正的
+                // 活跃期分析重做，不能靠加判据修。宽局部量继续用永久槽。
+                const base = if (confined and scratch_results and n == 1)
+                    try self.allocScratch(n, inst)
+                else
+                    try self.allocWide(n);
                 self.vals[@backingInt(inst)] = mcsmir.v(base);
                 if (n > 1) self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, n) << 8);
             },
@@ -3682,7 +3819,8 @@ const base = if (confined and scratch_results and n == 1) try self.allocScratch(
                     for (ci.args) |arg_ref| {
                         total += try self.storageBytes(self.air.typeOf(arg_ref, ip), "调用参数");
                     }
-                    if (total > 4) return self.fail(
+                    if (total > 4) return self.failFix(
+                        .ind_call_args,
                         "间接调用（函数指针）只支持 ≤4 字节参数（合计），当前 {d} 字节——间接调用拿不到被调方的 PARM 区",
                         .{total},
                     );
@@ -3720,6 +3858,8 @@ const base = if (confined and scratch_results and n == 1) try self.allocScratch(
                 const key = ip.indexToKey(callee_ip.?);
                 var sym: []const u8 = undefined;
                 var short: []const u8 = undefined;
+                // 被调函数的 nav：用来识别直接自递归（非尾时静态槽不可重入）。
+                var callee_nav: ?InternPool.Nav.Index = null;
                 // 取函数地址再调用（callee 是 .ptr 指向具名函数）→ 解出符号走直调，
                 // 比物化 2 字节地址再间接调更省。
                 var resolved = false;
@@ -3728,6 +3868,7 @@ const base = if (confined and scratch_results and n == 1) try self.allocScratch(
                         .nav => |n| n,
                         else => return self.fail("取地址调用的目标不是具名函数", .{}),
                     };
+                    callee_nav = nav;
                     const mangled = try mangleNavSymbol(self.gpa, ip, nav);
                     defer self.gpa.free(mangled);
                     // 符号进符号池：调用符号要活到 mcs51 发射完，统一在 generate 末尾释放
@@ -3740,6 +3881,7 @@ const base = if (confined and scratch_results and n == 1) try self.allocScratch(
                     switch (key) {
                         .func => |fi| {
                             const nav = fi.owner_nav;
+                            callee_nav = nav;
                             const mangled = try mangleNavSymbol(self.gpa, ip, nav);
                             defer self.gpa.free(mangled);
                             sym = self.internSym(mangled) orelse return error.OutOfMemory;
@@ -3782,7 +3924,7 @@ const base = if (confined and scratch_results and n == 1) try self.allocScratch(
                 for (ci.args, 0..) |arg_ref, ai| {
                     const aty = self.air.typeOf(arg_ref, ip);
                     const an = try self.storageBytes(aty, "调用参数");
-                    if (an > 4) return self.fail("参数超过 4 字节（多字节结构体）尚未支持", .{});
+                    if (an > 4) return self.failFix(.param_over4, "参数超过 4 字节（多字节结构体）尚未支持", .{});
                     widths[ai] = an;
                     consts[ai] = self.constWide(arg_ref);
                     bases[ai] = if (consts[ai] != null) 0 else try self.wideOperand(arg_ref, an);
@@ -3821,6 +3963,17 @@ const base = if (confined and scratch_results and n == 1) try self.allocScratch(
                         self.tail_ret = ri;
                         self.saw_ret = true;
                         continue;
+                    }
+                }
+                // 非尾直接递归：参数区与局部槽都是静态分配，内层调用会覆盖外层，
+                // 结果错却不报错。尾递归上面已转成 ljmp（等价于循环），只拒绝非尾形态。
+                if (callee_nav) |cn| {
+                    if (cn == self.nav) {
+                        return self.failFix(
+                            .tail_rec,
+                            "非尾递归不受支持（静态参数区与局部槽不可重入）",
+                            .{},
+                        );
                     }
                 }
                 try self.ops.append(self.gpa, .{ .lcall = .{ .sym = sym } });
@@ -3907,6 +4060,13 @@ const base = if (confined and scratch_results and n == 1) try self.allocScratch(
                     try self.ops.append(self.gpa, .{ .label = l_true });
                     self.vals[@backingInt(inst)] = d;
                 }
+            },
+
+            // 安全档的运行时违规（数组越界、unreachable 等）：前端发 `trap`，
+            // 后端跳共享停机块，用与溢出检查不同的标记区分停因。
+            .trap => {
+                try self.ops.append(self.gpa, .{ .br = self.trapTarget() });
+                return true;
             },
 
             else => return self.zcu.codegenFail(
@@ -4009,6 +4169,7 @@ pub fn generate(
         .short_name = short_name,
         .ret_byte = lower_ret_byte,
         .label_base = label_base,
+        .fn_ty = func_ty,
     };
     defer lw.ops.deinit(gpa);
     defer lw.parms.deinit(gpa);
@@ -4056,6 +4217,12 @@ pub fn generate(
     }
 
     const body_terminated = try lw.emitBody(body);
+
+    // 安全档：把共享停机块接在函数体之后。停机前往 xdata 0x8100 写诊断标记
+    // （溢出 0x5A / 越界 0xA5），再 `sjmp .`；freestanding 上没有可调用的 panic 运行时。
+    // 尺寸档不发检查，两个 label 都是 null，这里零开销。
+    if (lw.panic_label) |pl| try lw.appendPanicBlock(gpa, pl, 0x5A);
+    if (lw.trap_label) |tl| try lw.appendPanicBlock(gpa, tl, 0xA5);
 
     // M2.12：相邻拷贝折叠（去掉 mov vd,vs 的纯中转）。
     lw.foldCopies();

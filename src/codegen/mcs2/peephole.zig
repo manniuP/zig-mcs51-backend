@@ -35,7 +35,7 @@ const Stats = struct {
     rounds: usize = 0,
 };
 
-fn isUncondSjmp(item: Item) bool {
+fn isSjmpText(item: Item) bool {
     return switch (item) {
         // 只认文本前缀：`jnz` 是条件跳，绝不能因为带 jump 字段就算无条件。
         .line => |l| std.mem.startsWith(
@@ -47,9 +47,25 @@ fn isUncondSjmp(item: Item) bool {
     };
 }
 
+fn isUncondSjmp(item: Item) bool {
+    // 可穿线的无条件跳转必须有目标标签。`sjmp .`（安全档停机）没有 jump，
+    // 放行它去取 `.jump.?` 会让编译器崩溃（实测：ReleaseSafe 溢出检查命中）。
+    return switch (item) {
+        .line => |l| l.jump != null and isSjmpText(item),
+        else => false,
+    };
+}
+
+fn isHalt(item: Item) bool {
+    return switch (item) {
+        .line => |l| l.jump == null and isSjmpText(item),
+        else => false,
+    };
+}
+
 fn isTransfer(item: Item) bool {
-    // 本切片唯一的控制流终结指令是 sjmp（含 `sjmp .`）。
-    return isUncondSjmp(item);
+    // 控制流终结：可穿线的 sjmp 与停机 `sjmp .` 都算。
+    return isUncondSjmp(item) or isHalt(item);
 }
 
 fn threadJumps(items: []Item, stats: *Stats) bool {

@@ -114,6 +114,32 @@ fn sameDptr(st: ?DptrState, want: DptrState) bool {
     };
 }
 
+/// 目标地址是否正好是「当前 DPTR + 1」：基址形态、符号与运行期下标全同，
+/// 只有常量偏移（或固定基址）多 1。此时一条 `inc dptr`（1B）就能代替
+/// 重新装基址 + 重算 idx*scale 的整段序列（16B 起）。
+fn dptrIsNext(st: ?DptrState, want: DptrState) bool {
+    const s = st orelse return false;
+    return switch (s) {
+        .fixed => |a| switch (want) {
+            .fixed => |b| b == a +% 1,
+            else => false,
+        },
+        .sym => |a| switch (want) {
+            .sym => |b| b.off == a.off +% 1 and std.mem.eql(u8, a.sym, b.sym),
+            else => false,
+        },
+        .idx => |a| switch (want) {
+            .idx => |b| b.base == a.base +% 1 and a.scale == b.scale and sameByte(a.idx, b.idx),
+            else => false,
+        },
+        .idx_sym => |a| switch (want) {
+            .idx_sym => |b| b.off == a.off +% 1 and a.scale == b.scale and
+                std.mem.eql(u8, a.sym, b.sym) and sameByte(a.idx, b.idx),
+            else => false,
+        },
+    };
+}
+
 fn touchesDplDph(b: Byte) bool {
     return switch (b) {
         .dir => |d| d == 0x82 or d == 0x83,
@@ -395,6 +421,13 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             else => null,
         };
         const reuse_dptr = if (want_dptr) |w| sameDptr(dptr, w) else false;
+        // 元素内相邻字节（base+1..+3）：DPTR 只差 +1 时发一条 `inc dptr`，
+        // 不必重建地址。表下标用例（table16/table32）的尺寸大头就在这里。
+        const inc_dptr = !reuse_dptr and (if (want_dptr) |w| dptrIsNext(dptr, w) else false);
+        const skip_addr_setup = reuse_dptr or inc_dptr;
+        if (inc_dptr) {
+            try items.append(gpa, .{ .line = .{ .text = "    inc dptr", .jump = null } });
+        }
 
         switch (m_op) {
             .imm => |x| {
@@ -598,7 +631,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             },
             .load_xdata => |x| {
                 const d = try byteText(gpa, x.dst);
-                if (!reuse_dptr) {
+                if (!skip_addr_setup) {
                     try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov dptr,#0x{X:0>4}", .{x.addr}), .jump = null } });
                 }
                 try items.appendSlice(gpa, &.{
@@ -641,7 +674,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata => |x| {
                 const s = try byteText(gpa, x.src);
                 try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } });
-                if (!reuse_dptr) {
+                if (!skip_addr_setup) {
                     try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov dptr,#0x{X:0>4}", .{x.addr}), .jump = null } });
                 }
                 try items.append(gpa, .{ .line = .{ .text = "    movx @dptr,a", .jump = null } });
@@ -707,7 +740,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .load_xdata_idx => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale, f.b_live);
+                if (!skip_addr_setup) try emitDptrIndex(gpa, &items, x.base, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
@@ -716,7 +749,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata_idx => |x| {
                 const s = try byteText(gpa, x.src);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrIndex(gpa, &items, x.base, it, x.scale, f.b_live);
+                if (!skip_addr_setup) try emitDptrIndex(gpa, &items, x.base, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
                     .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
@@ -726,7 +759,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .load_xdata_idx_sym => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
+                if (!skip_addr_setup) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
@@ -735,7 +768,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata_idx_sym => |x| {
                 const s = try byteText(gpa, x.src);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
+                if (!skip_addr_setup) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
                     .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
@@ -743,7 +776,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             },
             .load_xdata_sym => |x| {
                 const d = try byteText(gpa, x.dst);
-                if (!reuse_dptr) try emitDptrSym(gpa, &items, x.sym, x.off);
+                if (!skip_addr_setup) try emitDptrSym(gpa, &items, x.sym, x.off);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
@@ -751,7 +784,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             },
             .store_xdata_sym => |x| {
                 const s = try byteText(gpa, x.src);
-                if (!reuse_dptr) try emitDptrSym(gpa, &items, x.sym, x.off);
+                if (!skip_addr_setup) try emitDptrSym(gpa, &items, x.sym, x.off);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov a,{s}", .{s}), .jump = null } },
                     .{ .line = .{ .text = "    movx @dptr,a", .jump = null } },
@@ -760,7 +793,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             // ---- 代码段常量表：`clr a` + `movc a,@a+dptr`（A 是 DPTR 的低字节偏移，这里置 0）----
             .load_code_sym => |x| {
                 const d = try byteText(gpa, x.dst);
-                if (!reuse_dptr) try emitDptrSym(gpa, &items, x.sym, x.off);
+                if (!skip_addr_setup) try emitDptrSym(gpa, &items, x.sym, x.off);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    clr a", .jump = null } },
                     .{ .line = .{ .text = "    movc a,@a+dptr", .jump = null } },
@@ -770,7 +803,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .load_code_idx_sym => |x| {
                 const d = try byteText(gpa, x.dst);
                 const it = try byteText(gpa, x.idx);
-                if (!reuse_dptr) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
+                if (!skip_addr_setup) try emitDptrSymIndex(gpa, &items, x.sym, x.off, it, x.scale, f.b_live);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    clr a", .jump = null } },
                     .{ .line = .{ .text = "    movc a,@a+dptr", .jump = null } },
