@@ -235,6 +235,7 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         // 这两个 op 用的 DPTR 是前面 add/addc 现算的：缓存里没有它，一律当未知。
         .load_xdata_dptr, .store_xdata_dptr, .dptr_add_scaled => null,
         .store_dir => |x| if (x.addr == 0x82 or x.addr == 0x83) null else prev,
+        .lea_r_vreg => |x| if (touchesDplDph(x.dst)) null else prev,
         .push => |x| if (touchesDplDph(x.src)) null else prev,
         .pop => |x| if (touchesDplDph(x.dst)) null else prev,
         .dec => prev,
@@ -409,6 +410,10 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .or_ => |x| .{ .or_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .xor_ => |x| .{ .xor_ = .{ .dst = byteOf(x.dst, f.vreg_base), .lhs = byteOf(x.lhs, f.vreg_base), .rhs = byteOf(x.rhs, f.vreg_base) } },
             .label, .br, .ret, .reti, .halt, .bit_br, .clr_c, .br_c, .lcall, .ljmp, .lea_dptr_sym => op,
+            .lea_r_vreg => |x| .{ .lea_r_vreg = .{
+                .dst = byteOf(x.dst, f.vreg_base),
+                .src = byteOf(x.src, f.vreg_base),
+            } },
             .lcall_ind => |x| .{ .lcall_ind = .{
                 .target = f.vreg_base + x.target,
                 .save = byteOf(x.save, f.vreg_base),
@@ -704,6 +709,13 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             },
             // 符号基址（可带常量偏移：多维下标的基址装载）
             .lea_dptr_sym => |x| try items.append(gpa, .{ .line = .{ .text = try emitSymReloc(gpa, x.sym, x.off), .jump = null } }),
+            // 槽地址的低字节装进工作寄存器：`mov r1,#<(_mcs_v3)`。
+            // `@Ri` 间接寻址只能寻 8 位 IDATA，而 DSEG 槽（0x30–0x7F）就在那儿。
+            .lea_r_vreg => |x| {
+                const d = try byteText(gpa, x.dst);
+                const s = try byteText(gpa, x.src);
+                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},#<({s})", .{ d, s }), .jump = null } });
+            },
             // dptr += idx*scale：多维下标的第二、第三维。
             // scale==1 只需 8 位加 + 进位；否则一次 MUL AB 拿 16 位积（scale 拆成高/低字节）。
             .dptr_add_scaled => |x| {

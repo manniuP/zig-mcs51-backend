@@ -352,7 +352,12 @@ CASES: dict[str, dict] = {
                      want32=0x7FFFFFFF),
     "sar32":    dict(kind="call", src="sar.zig", fn="sar32",
                      args=[("DPL", 0xF0), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF)],
-                     want32=0xFFFFFFFE),
+                     want32=0xFFFFFFFE, want_rt=1),
+    # 运行期移位次数：必须仍走内联循环（次数进 r0 时 djnz 先减后判，0 会转 256 次）。
+    "sar32v":   dict(kind="call", src="rtvar.zig", fn="sar32v",
+                     args=[("DPL", 0xBE), ("DPH", 0xBA), ("B", 0xFE), ("ACC", 0xCA),
+                           ("PARM2", 11)],
+                     want32=0xFFF95FD7, want_no_rt=True),
     "sar8":     dict(kind="call", src="sar.zig", fn="sar8", args=[("DPL", 0xF0)], want=0xFC),
     "ucmp_eq":  dict(kind="call", src="wide.zig", fn="ucmp32",
                      args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x01), ("ACC", 0x00)], want=2),
@@ -664,7 +669,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "safe_mul_ok", "safe_mul_ov", "safe_sadd_ok", "safe_sadd_ov",
          "safe_bounds_ok", "safe_bounds_ov", "safe_rec_reject",
          "diag_mul_reject", "diag_addr_reject", "diag_switch_reject", "diag_dim_reject",
-         "factor_a", "factor_b", "factor_c", "factor_cheap"]
+         "factor_a", "factor_b", "factor_c", "factor_cheap", "sar32v"]
 
 
 def check_selftest() -> bool:
@@ -719,6 +724,22 @@ def check_call(name: str, spec: dict) -> bool:
             print("FAIL: 加减/位运算这类廉价序列不应生成共享子程序")
             return False
         print(f"  PASS: {name} 廉价运算保持内联（无共享调用）")
+    if spec.get("want_rt"):
+        # rtlib 门禁：模板调用次数够，且**模板文本只出现一次**——符号是汇编
+        # 单元局部的，重复定义会让链接直接失败；而调用退化成内联则白丢体积。
+        n = text.count("lcall _mcs_rt_")
+        if n < spec["want_rt"]:
+            print(f"FAIL: 期望至少 {spec['want_rt']} 处 rtlib 模板调用，实际 {n} 处")
+            return False
+        if text.count("\n_mcs_rt_sar32:") != 1:
+            print("FAIL: rtlib 模板文本应恰好出现一次（符号单元局部，重复定义会链接失败）")
+            return False
+        print(f"  PASS: {name} rtlib 模板调用 {n} 处，模板本体 1 份")
+    if spec.get("want_no_rt"):
+        if "lcall _mcs_rt_" in text:
+            print("FAIL: 运行期移位次数不应套固定模板（djnz 先减后判，0 会转 256 次）")
+            return False
+        print(f"  PASS: {name} 运行期次数保持内联")
     if spec.get("no_site_shift"):
         # 站点槽重绑定门禁：非拥有者站点必须把输入直接写进拥有者槽，
         # 产物里不应再出现「vreg → vreg」的 `mov _mcs_vX,_mcs_vY` 搬运。

@@ -233,6 +233,8 @@ fn touches(op: Op, v: u8) bool {
         .clr_c, .ret, .reti, .halt, .label, .br, .br_c, .bit_br,
         .lcall, .ljmp, .lea_dptr_sym,
         => false,
+        // 取槽地址：只读槽、不改值，但保守起见按「触碰」处理（见 touches）。
+        .lea_r_vreg => true,
     };
 }
 

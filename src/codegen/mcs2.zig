@@ -20,6 +20,7 @@ const mcsmir = @import("mcs2/mir.zig");
 const mcs51 = @import("mcs2/mcs51.zig");
 const diag = @import("mcs2/diag.zig");
 const factor = @import("mcs2/factor.zig");
+const rtlib = @import("mcs2/rtlib.zig");
 const air_expr = @import("mcs2/air_expr.zig");
 
 pub const Mir = struct {
@@ -88,6 +89,8 @@ const scratch_results: bool = true;
 const account_wide: bool = false;
 /// 重复复杂算法压缩总开关：改 false 重编即可得到「全部内联」的尺寸基线。
 const enable_factor: bool = true;
+/// 运行时模板库（手写汇编标准算子）总开关，同款用法。
+const enable_rtlib: bool = true;
 /// 统计开关：打印每个 .alloc 的逃逸判定。
 const alloc_report: bool = false; // 统计开关（看 alloc 逃逸情况时临时改 true） // 记账开关
 
@@ -173,6 +176,10 @@ const Lower = struct {
     tail_ret: ?Air.Inst.Index = null,
     /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
     label_base: u32 = 0,
+    /// 本函数第一次启用、需要把模板文本带出去的 rtlib 模板位图。
+    /// 模板符号是汇编单元局部的，所以每个单元各自带一份，靠 `rtlib.take`
+    /// 保证单元内只发一次。
+    rt_new: u64 = 0,
     /// 源码里的真实参数名（改写建议用，`n` / `m` 而不是 `a0` / `a1`）。
     /// 拿不到时保持 null，渲染退回 a0/a1。
     param_names: ?[]const []const u8 = null,
@@ -2195,6 +2202,7 @@ const Lower = struct {
             .store_dir => |x| .{ .store_dir = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
             .load_xdata => |x| .{ .load_xdata = .{ .dst = mapByteVreg(x.dst, map), .addr = x.addr } },
             .lea_dptr_sym => op,
+            .lea_r_vreg => |x| .{ .lea_r_vreg = .{ .dst = mapByteVreg(x.dst, map), .src = mapByteVreg(x.src, map) } },
             .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = mapByteVreg(x.src, map) } },
             .load_xdata_idx => |x| .{ .load_xdata_idx = .{ .dst = mapByteVreg(x.dst, map), .base = x.base, .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
             .store_xdata_idx => |x| .{ .store_xdata_idx = .{ .base = x.base, .idx = mapByteVreg(x.idx, map), .src = mapByteVreg(x.src, map), .scale = x.scale } },
@@ -3630,6 +3638,50 @@ const Lower = struct {
                     self.wide[@backingInt(inst)] = @as(u16, d_rt) | (@as(u16, nw) << 8);
                     continue;
                 };
+
+                // 32 位算术右移改走 rtlib 手写模板。
+                //
+                // 内联版把值在 4 个槽之间逐位搬：每轮 4 对 `mov a,槽` / `rrc a` /
+                // `mov 槽,a`，4 字节移 3 位要 124 B。模板用 `@r1` 直连槽、`djnz`
+                // 循环，站点只剩 7 B（装指针 + 装次数 + lcall），见 mcs2/rtlib.zig。
+                //
+                // 只在「常量次数 1..31」时走：`djnz` 是先减后判，次数 0 会转 256
+                // 次；次数 ≥32 在 Zig 里是未定义行为，保持原路径让安全档介入。
+                if (tag == .shr and info.bytes == 4 and info.signed and
+                    cnt >= 1 and cnt <= 31 and rtlib.enabled)
+                {
+                    const a_rt = try self.wideOperand(bin.lhs, 4);
+                    // 模板原地改槽，所以只有在 lhs 此后不再被读时才能直接复用；
+                    // 否则先复制一份到新槽（12 B），别把还活着的值改掉。
+                    // `airLastRead` 返回最后一个使用 lhs 的 AIR 编号（当前指令自身
+                    // 也算使用者，所以用 <=）。等于当前指令就是「它到此为止」。
+                    const reuse_rt = self.reuseWideDst(body, idx, bin.lhs, a_rt, 4) or blk: {
+                        const li = bin.lhs.toIndex() orelse break :blk false;
+                        break :blk self.airLastRead(li) <= @backingInt(inst);
+                    };
+                    var d_rt = a_rt;
+                    if (!reuse_rt) {
+                        d_rt = try self.allocWide(4);
+                        var k: u8 = 0;
+                        while (k < 4) : (k += 1) try self.movTo(d_rt + k, mcsmir.v(a_rt + k));
+                    }
+                    // 槽基址 +3 = 最高字节，模板从高到低逐字节右移。
+                    try self.ops.append(self.gpa, .{ .lea_r_vreg = .{
+                        .dst = .{ .dir = 0x01 },
+                        .src = mcsmir.v(d_rt + 3),
+                    } });
+                    try self.ops.append(self.gpa, .{ .mov = .{
+                        .dst = .{ .dir = 0x00 },
+                        .src = .{ .imm = cnt },
+                    } });
+                    try self.ops.append(self.gpa, .{ .lcall = .{ .sym = rtlib.sym(.sar32) } });
+                    // 模板符号是汇编单元局部的：本单元第一次用到时才把文本带出去。
+                    if (rtlib.take(.sar32)) self.rt_new |= 1;
+                    self.vals[@backingInt(inst)] = mcsmir.v(d_rt);
+                    self.wide[@backingInt(inst)] = @as(u16, d_rt) | (@as(u16, 4) << 8);
+                    continue;
+                }
+
                 if (info.bytes == 1 and (left or !info.signed)) {
                     const lhs = try self.refLoc(bin.lhs);
                     const d = mcsmir.v(try self.allocVreg());
@@ -4558,6 +4610,9 @@ pub fn generate(
     // （与 no_reuse_wide 等诊断开关同款口径）。
     const factor_base = session_vreg_base;
     factor.enabled = !is_isr and enable_factor;
+    // rtlib 模板用 r0–r4：中断现场只保存 A/PSW/DPTR/B，被模板占着的这几位
+    // 会被打断方踩坏，所以 ISR 内一律不套模板，退回内联。
+    rtlib.enabled = !is_isr and enable_rtlib;
     var fac = try factor.run(gpa, &lw.ops, factor_base, short_name);
     defer fac.deinit(gpa);
 
@@ -4607,6 +4662,17 @@ pub fn generate(
     // 同模板站点只发 lcall，符号在同一汇编单元可见（sdas8051 会解析）。
     if (fac.defs.items.len != 0) try mir.text.appendSlice(gpa, fac.defs.items);
     factor.dumpStats();
+
+    // 本函数首次用到的 rtlib 模板。符号是汇编单元局部的（不加 .globl），
+    // 所以文本就追加在这个函数体后面，同单元里后续函数只发 lcall。
+    if (lw.rt_new != 0) {
+        var ti: usize = 0;
+        while (ti < rtlib.count) : (ti += 1) {
+            if (lw.rt_new & (@as(u64, 1) << @intCast(ti)) != 0) {
+                try mir.text.appendSlice(gpa, rtlib.textAt(ti));
+            }
+        }
+    }
 
     // 中断向量跳板：绝对段 VECTORS 内 .org 到向量地址发 ljmp（函数体在 CSEG 别处）。
     if (is_isr) {

@@ -143,6 +143,11 @@ pub const Op = union(enum) {
     load_xdata: struct { dst: Byte, addr: u16 },
     /// dptr = _sym + off（把符号地址装进 DPTR：函数地址当值/多维下标的基址装载）。
     lea_dptr_sym: struct { sym: []const u8, off: u16 = 0 },
+    /// `mov rN,#<(_mcs_vK)`：把静态槽的**低字节地址**装进工作寄存器，供 `@Ri`
+    /// 间接寻址用。rtlib 模板靠它直连槽——省掉「参数槽 → DPL/DPH/B/A」和
+    /// 「返回值 → 结果槽」两次逐字节往返（4 字节共 24 B）。
+    /// 槽地址由链接器按 DSEG 基址定，汇编期只知道符号，所以取低字节。
+    lea_r_vreg: struct { dst: Byte, src: Byte },
     /// 压栈/出栈（操作数为直接地址；ISR 现场保存用，`push 0xE0` 合法）。
     push: struct { src: Byte },
     pop: struct { dst: Byte },
