@@ -26,6 +26,14 @@ from pathlib import Path
 
 import mcs2
 
+# AiCube 的自动下载只监视它**界面底部路径框里那个文件**，不是固定文件名。
+# 这里只读地问出来，省掉每次手工 --live（2026-11-06 因为默认路径对不上，
+# 写入后静默不烧，看起来像固件有问题，白查一轮）。非 Windows 或没装就跳过。
+try:
+    import aicube
+except Exception:  # noqa: BLE001 - 非 Windows 平台没有 user32
+    aicube = None
+
 HERE = Path(__file__).resolve().parent
 BUILD = mcs2.BUILD
 FW_DIR = mcs2.WORKSPACE / "build" / "fw"
@@ -324,8 +332,9 @@ def main() -> int:
                     help="只发一次触发字节让固件软复位进 ISP（AiCube 点下载前/后都行）")
     ap.add_argument("--auto", metavar="PORT",
                     help="全自动：逐组写 AiCube 监视的 .ihx（文件一变它自己烧）+ 轮询收数")
-    ap.add_argument("--live", default=str(FW_DIR / "real_live_ai8051u_115200.ihx"),
-                    help="--auto 用的「被监视」文件路径（要与 AiCube 里选的同一个）")
+    ap.add_argument("--live", default=None,
+                    help="--auto 用的「被监视」文件路径。不给就自动从 AiCube 窗口读"
+                         "（读不到才退回 build/fw/real_live_*.ihx）")
     ap.add_argument("--per-group", type=float, default=8.0,
                     help="--auto 每次读窗口（秒）")
     ap.add_argument("--flash-wait", type=float, default=14.0,
@@ -353,6 +362,14 @@ def main() -> int:
     if args.watch:
         return watch(args.watch, args.baud, args.seconds, args.open, args.close)
     if args.auto:
+        if args.live is None:
+            got = aicube.loaded_ihx() if aicube else None
+            args.live = got or str(FW_DIR / "real_live_ai8051u_115200.ihx")
+            if got:
+                print(f"--live 未指定：用 AiCube 当前装载的 {args.live}")
+            else:
+                print(f"--live 未指定，且读不到 AiCube 路径，退回 {args.live}")
+                print("（若 AiCube 监视的是别的文件，写它不会触发下载）")
         by_src2: dict[str, list[str]] = {}
         order2: list[str] = []
         for c in (args.cases or REAL_CASES):
@@ -567,8 +584,14 @@ def auto(live: Path, port: str, baud: int, order: list[str],
             continue
         # 按「源文件名」找固件，不按组号：用例表增删后组号会平移，组号写死会让
         # 「只补跑几组」（--cases）找不到文件。
+        #
+        # 同一源文件会留下多份历史固件（组号平移后旧的不删），**必须按 mtime 取最新**。
+        # 按文件名排序看着也行，但 "real_g9_" 排在 "real_g12_" 后面（字符串比较），
+        # 会挑到旧的那份——旧的可能不带 --isp 那段，烧上去之后芯片就不能再自动
+        # 进 ISP，后续每组都要断电，症状是「热起来好好的，跑一半全失败」。
         stem = src.split(".")[0]
-        cands = sorted(FW_DIR.glob(f"real_g*_{stem}_ai8051u_{baud}.ihx"))
+        cands = sorted(FW_DIR.glob(f"real_g*_{stem}_ai8051u_{baud}.ihx"),
+                       key=lambda p: p.stat().st_mtime)
         if not cands:
             print(f"缺固件 real_g*_{stem}_ai8051u_{baud}.ihx：先跑 python realcheck.py --build --baud {baud}")
             return 2
