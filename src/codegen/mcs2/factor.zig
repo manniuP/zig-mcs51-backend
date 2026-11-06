@@ -214,6 +214,7 @@ fn touches(op: Op, v: u8) bool {
         .load_xdata_idx_sym => |x| isVregByte(x.dst, v) or isVregByte(x.idx, v),
         .load_code_idx_sym => |x| isVregByte(x.dst, v) or isVregByte(x.idx, v),
         .load_xdata_dptr => |x| isVregByte(x.dst, v),
+        .load_code_dptr => |x| isVregByte(x.dst, v),
         .store_xdata_dptr => |x| isVregByte(x.src, v),
         .dptr_add_scaled => |x| isVregByte(x.idx, v),
         .push => |x| isVregByte(x.src, v),

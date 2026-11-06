@@ -176,6 +176,9 @@ pub const Op = union(enum) {
     load_code_sym: struct { dst: Byte, sym: []const u8, off: u16 = 0 },
     /// dst <- 代码段 mem[_sym + off + idx*scale]（const 表 + 运行期下标）。
     load_code_idx_sym: struct { dst: Byte, sym: []const u8, off: u16 = 0, idx: Byte, scale: u8 = 1 },
+    /// dst <- 代码段 mem[DPTR]：`clr a` + `movc a,@a+dptr`。
+    /// 多维 const 表（`tbl[i][j]`）的 DPTR 已经在链里算好，只差最后这一读。
+    load_code_dptr: struct { dst: Byte },
     /// 局部标签定义，供 br/br_ifnz 引用。
     label: u32,
     /// 无条件跳转到标签。

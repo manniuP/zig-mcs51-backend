@@ -233,7 +233,7 @@ fn dptrAfter(op: mir.Op, prev: ?DptrState) ?DptrState {
         .xor_ => |x| if (touchesDplDph(x.dst)) null else prev,
         .load_dir => |x| if (touchesDplDph(x.dst)) null else prev,
         // 这两个 op 用的 DPTR 是前面 add/addc 现算的：缓存里没有它，一律当未知。
-        .load_xdata_dptr, .store_xdata_dptr, .dptr_add_scaled => null,
+        .load_xdata_dptr, .store_xdata_dptr, .dptr_add_scaled, .load_code_dptr => null,
         .store_dir => |x| if (x.addr == 0x82 or x.addr == 0x83) null else prev,
         .lea_r_vreg => |x| if (touchesDplDph(x.dst)) null else prev,
         .push => |x| if (touchesDplDph(x.src)) null else prev,
@@ -320,6 +320,7 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
             .store_xdata => |x| .{ .store_xdata = .{ .addr = x.addr, .src = byteOf(x.src, f.vreg_base) } },
             .mov => |x| .{ .mov = .{ .dst = byteOf(x.dst, f.vreg_base), .src = byteOf(x.src, f.vreg_base) } },
             .load_xdata_dptr => |x| .{ .load_xdata_dptr = .{ .dst = byteOf(x.dst, f.vreg_base) } },
+            .load_code_dptr => |x| .{ .load_code_dptr = .{ .dst = byteOf(x.dst, f.vreg_base) } },
             .dptr_add_scaled => |x| .{ .dptr_add_scaled = .{ .idx = byteOf(x.idx, f.vreg_base), .scale = x.scale } },
             .store_xdata_dptr => |x| .{ .store_xdata_dptr = .{ .src = byteOf(x.src, f.vreg_base) } },
             .br_ifnz => |x| .{ .br_ifnz = .{ .cond = byteOf(x.cond, f.vreg_base), .target = x.target } },
@@ -697,6 +698,16 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const d = try byteText(gpa, x.dst);
                 try items.appendSlice(gpa, &.{
                     .{ .line = .{ .text = "    movx a,@dptr", .jump = null } },
+                    .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
+                });
+            },
+            // 代码段（const 表）的 DPTR 直接寻址：`clr a` + `movc a,@a+dptr`。
+            // 多维 const 表的最后一读；DPTR 已由前面的 add/addc 序列算好。
+            .load_code_dptr => |x| {
+                const d = try byteText(gpa, x.dst);
+                try items.appendSlice(gpa, &.{
+                    .{ .line = .{ .text = "    clr a", .jump = null } },
+                    .{ .line = .{ .text = "    movc a,@a+dptr", .jump = null } },
                     .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    mov {s},a", .{d}), .jump = null } },
                 });
             },

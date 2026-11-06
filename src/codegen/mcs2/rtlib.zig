@@ -82,6 +82,41 @@ pub const templates = [_]Template{
 
 pub const count = templates.len;
 
+/// 全局停机出口（`_mcs_panic`）。
+///
+/// 为什么必须是**全局符号**：安全档的溢出/除零检查、以及模板内部的错误分支
+/// 都要跳到这里。以前每个函数在末尾各发一份 `mov A,#mark / mov dptr,#0x8100 /
+/// movx / sjmp .`（8 B），既费 Flash 又**没法被模板引用**——模板是单元级文本，
+/// 引不到函数内的私有标签。
+///
+/// 语义：A = 标记字节（0x5A 算术溢出 / 0xA5 越界或指针错），
+/// 写到 xdata 0x8100 留痕，然后死循环（停机）。保留 A 与 xdata 落点是为了
+/// 用调试器/示波器一眼看出死于哪一类检查。
+pub const panic_sym = "_mcs_panic";
+
+const panic_text =
+    \\
+    \\    .area CSEG (CODE)
+    \\_mcs_panic:
+    \\    mov dptr,#0x8100
+    \\    movx @dptr,a
+    \\    sjmp .
+    \\
+;
+
+var panic_emitted: bool = false;
+
+/// 本单元是否首次需要 `_mcs_panic`（true 表示调用方要把文本追加出去）。
+pub fn takePanic() bool {
+    if (panic_emitted) return false;
+    panic_emitted = true;
+    return true;
+}
+
+pub fn panicText() []const u8 {
+    return panic_text;
+}
+
 /// 总开关（与 `enable_factor`、`no_reuse_wide` 同款：做尺寸对照时手工改 false）。
 pub var enabled: bool = true;
 
@@ -112,6 +147,7 @@ pub fn textAt(i: usize) []const u8 {
 /// 单元开始时清账（同一进程内编译多个单元时，各单元都要带一份自己的模板）。
 pub fn reset() void {
     emitted = @splat(false);
+    panic_emitted = false;
 }
 
 test "模板表自洽：符号名不重复、文本以换行结尾" {

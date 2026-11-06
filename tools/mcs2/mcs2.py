@@ -262,9 +262,11 @@ def driver_call(fn: str, args: list[tuple[str, int]], slot: int = 0x8000,
     """
     out = "    .area CSEG (CODE)\n    mov sp,#0x7F\n"
     if sentinel is not None:
-        out += (f"    mov dptr,#0x{slot:04X}\n"
-                f"    mov a,#0x{sentinel:02X}\n"
-                "    movx @dptr,a\n")
+        out += f"    mov dptr,#0x{slot:04X}\n"
+        for _k in range(ret_bytes):
+            out += (f"    mov a,#0x{sentinel:02X}\n"
+                    "    movx @dptr,a\n"
+                    "    inc dptr\n")
     for pos, val in args:
         if pos in ("DPL", "DPH", "B", "ACC"):
             out += f"    mov {pos.lower()},#0x{val:02X}\n"
@@ -543,6 +545,15 @@ CASES: dict[str, dict] = {
     "sympair": dict(kind="call", src="symtab.zig", fn="sympair",
                     args=[("DPL", 1), ("PARM_2", 0x11), ("PARM_3", 0x11),
                           ("PARM_4", 0x22), ("PARM_5", 0x22)], want16=0x3333, steps=6000),
+    # `@intFromPtr(&数据)`：地址本身变成 16 位值（DMA 描述符 / 缓冲区指针表）
+    "daddr0": dict(kind="call", src="daddr.zig", fn="daddr0", args=[],
+                   want=0x33, steps=4000),
+    "daddr1": dict(kind="call", src="daddr.zig", fn="daddr1", args=[("DPL", 3)],
+                   want=0x5A, steps=4000),
+    "daddr2": dict(kind="call", src="daddr.zig", fn="daddr2", args=[("DPL", 1)],
+                   want=0x5D, steps=6000),
+    "daddr3": dict(kind="call", src="daddr.zig", fn="daddr3", args=[],
+                   want=0x02, steps=4000),
     # 宽局部量（u16/u32 局部必须占够槽）
     "wloc1": dict(kind="call", src="wide3.zig", fn="wloc1",
                   args=[("DPL", 0x34), ("DPH", 0x12), ("PARM_2", 0x20), ("PARM_3", 0x00)],
@@ -590,6 +601,11 @@ CASES: dict[str, dict] = {
     "cgeti": dict(kind="call", src="consttab.zig", fn="cgeti", args=[("DPL", 5)], want=0x66, steps=1000),
     "wgeti": dict(kind="call", src="consttab.zig", fn="wgeti",
                   args=[("DPL", 1)], want16=0x3344, steps=2000),
+    # 多维 const 表（GRID[i][j]）：链式地址 + movc
+    "g2":  dict(kind="call", src="consttab.zig", fn="g2",
+                args=[("DPL", 2), ("PARM2", 3)], want=0x23, steps=2000),
+    "g2c": dict(kind="call", src="consttab.zig", fn="g2c", args=[("DPL", 1)], want=0x12, steps=2000),
+    "g2r": dict(kind="call", src="consttab.zig", fn="g2r", args=[("DPL", 2)], want=0x32, steps=2000),
     # 函数指针表：填表（@intFromPtr）+ table[i] + @ptrFromInt + 间接调用
     "fpt_all": dict(kind="call", src="fptab.zig", fn="fpt_all",
                     args=[("DPL", 10)], want=0x14, steps=10000),
@@ -615,6 +631,22 @@ CASES: dict[str, dict] = {
     # 数组越界走 trap，诊断标记 0xA5 与溢出的 0x5A 区分。
     "safe_bounds_ok": dict(kind="call", src="safe.zig", fn="safe_bounds", args=[("DPL", 2)], want=3, opt="ReleaseSafe"),
     "safe_bounds_ov": dict(kind="call", src="safe.zig", fn="safe_bounds", args=[("DPL", 9)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0xA5}),
+    # 除零：安全档必须进 _mcs_panic（标记 0x3C），尺寸档一点代码都不加。
+    "safe_div8":  dict(kind="call", src="safe.zig", fn="safe_div8",
+                       args=[("DPL", 12), ("PARM2", 3)], want=4, opt="ReleaseSafe"),
+    "safe_div8z": dict(kind="call", src="safe.zig", fn="safe_div8",
+                       args=[("DPL", 12), ("PARM2", 0)], want=0x55, opt="ReleaseSafe",
+                       sentinel=0x55, expect_mem={0x8100: 0xA5}),
+    "safe_div32z": dict(kind="call", src="safe.zig", fn="safe_div32",
+                        args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12),
+                              ("PARM_2", 0), ("PARM_3", 0), ("PARM_4", 0), ("PARM_5", 0)],
+                        want32=0x55555555, opt="ReleaseSafe",
+                        sentinel=0x55, expect_mem={0x8100: 0x3C}, steps=6000),
+    "safe_rem32z": dict(kind="call", src="safe.zig", fn="safe_rem32",
+                        args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12),
+                              ("PARM_2", 0), ("PARM_3", 0), ("PARM_4", 0), ("PARM_5", 0)],
+                        want32=0x55555555, opt="ReleaseSafe",
+                        sentinel=0x55, expect_mem={0x8100: 0x3C}, steps=6000),
     # 非尾递归必须编译期拒绝（静态参数区不可重入）。
     # want_code2 是 M1 的 AIR 还原门禁：建议里的表达式必须来自真实 AIR，
     # 而不是只剩占位符。降级成骨架时这条会立刻变红。
@@ -623,9 +655,10 @@ CASES: dict[str, dict] = {
                             want_code2="rec_bad((n - 1)) + 1"),
     # 改写建议：错误信息里必须出现可直接粘贴的 Zig 代码，而不只是中文说明。
     "diag_mul_reject": dict(kind="reject", src="diag_mul.zig", opt="ReleaseSafe", want_err="乘法溢出检查", want_code="a *% b"),
-    "diag_addr_reject": dict(kind="reject", src="diag_addr.zig", opt="ReleaseSafe", want_err="数据指针的地址", want_code="@ptrFromInt(BUF_ADDR)"),
+    "diag_addr": dict(kind="call", src="diag_addr.zig", fn="diag_addr", args=[], want16=3, steps=2000),
     "diag_switch_reject": dict(kind="reject", src="diag_switch.zig", opt="ReleaseSafe", want_err="switch 的判定值", want_code="handlers[op](arg)"),
-    "diag_dim_reject": dict(kind="reject", src="diag_dim.zig", opt="ReleaseSafe", want_err="多维下标", want_code="row * COLS + col"),
+    "diag_dim": dict(kind="call", src="diag_dim.zig", fn="diag_dim",
+                    args=[("DPL", 1), ("PARM2", 0)], want=3, steps=2000),
     # 重复复杂算法压缩：三个同构乘法必须压成一份共享子程序，且结果不变。
     # want_shared 是「压缩确实发生」的门禁，防止优化悄悄退化成全内联。
     "factor_a": dict(kind="call", src="factor.zig", fn="fac_a",
@@ -659,7 +692,9 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "t16rt", "t8rt", "t16pair", "t8pair", "t32rt", "t32pair", "bscale", "wg32", "wg16", "wginc", "wgcmp1", "wgcmp0", "trsum", "trev", "trod",
          "pprt", "pu16", "fb3d", "fbchk", "gfb", "p2d",
          "symconst", "symrt", "symb", "sympair", "fpt_all",
+         "daddr0", "daddr1", "daddr2", "daddr3",
          "argcall1", "argcall2", "argcall3", "cget2", "cgeti", "wgeti",
+         "g2", "g2c", "g2r",
          "sw1h", "sw1m", "sw2r", "sw2h", "sw2e", "sw3a", "sw3b",
          "ifx1", "ifx0", "ifr1", "ifr0", "swx2", "swx9", "ifw1", "ifw0",
          "wloc1", "wloc2", "s16r", "u16l", "u32l",
@@ -668,7 +703,8 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "safe_add_ok", "safe_add_ov", "safe_sub_ok", "safe_sub_ov",
          "safe_mul_ok", "safe_mul_ov", "safe_sadd_ok", "safe_sadd_ov",
          "safe_bounds_ok", "safe_bounds_ov", "safe_rec_reject",
-         "diag_mul_reject", "diag_addr_reject", "diag_switch_reject", "diag_dim_reject",
+         "safe_div8", "safe_div8z", "safe_div32z", "safe_rem32z",
+         "diag_mul_reject", "diag_addr", "diag_switch_reject", "diag_dim",
          "factor_a", "factor_b", "factor_c", "factor_cheap", "sar32v"]
 
 

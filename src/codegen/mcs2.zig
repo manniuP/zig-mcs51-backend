@@ -107,6 +107,9 @@ const ChainBase = union(enum) {
     fixed: u64,
     sym: struct { sym: []const u8, off: u64 = 0 },
     rt: struct { lo: Loc, hi: Loc, off: u64 = 0 },
+    /// `const` 表基址：地址算法与 `.sym` 完全一样，区别只在**最后那一读**
+    /// 是 `movc a,@a+dptr`（代码段）而不是 `movx a,@dptr`（xdata）。
+    code: struct { sym: []const u8, off: u64 = 0 },
 };
 
 const PtrRef = union(enum) {
@@ -225,6 +228,8 @@ const Lower = struct {
     panic_label: ?u32 = null,
     /// 安全档越界 / unreachable 的停机块（与溢出停机分用不同诊断标记）。
     trap_label: ?u32 = null,
+    /// 安全档除零的停机块（标记 0x3C，与前两者区分）。
+    div0_label: ?u32 = null,
 
     /// 存储宽度（**不是**算术宽度）：≤8 位一律 1 字节容器（u1/u5 这类只能当值存放），
     /// 16/32 按宽度。算术闸门仍然是 requireIntWidth（只认 8/16/32），
@@ -431,7 +436,9 @@ const Lower = struct {
             .elem_sym => |e| try self.chainAppend(.{ .sym = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
             .rt_elem => |e| try self.chainAppend(.{ .rt = .{ .lo = e.lo, .hi = e.hi, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
             .chain => |c| try self.chainAppend(c.base, c.terms[0..c.n], idx, sc, idx_hi),
-            .code_sym, .code_elem_sym => return self.failFix(.const_multi_dim, "const 表的多维下标暂不支持（只有一维）", .{}),
+            // const 表：升级成代码段基址的链（`movc` 读）
+            .code_sym => |s| try self.chainAppend(.{ .code = .{ .sym = s.sym, .off = s.off } }, &.{}, idx, sc, idx_hi),
+            .code_elem_sym => |e| try self.chainAppend(.{ .code = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, idx_hi),
         };
         return switch (pr) {
             .fixed => |b| .{ .elem = .{ .base = b, .idx = idx, .scale = @intCast(sc) } },
@@ -442,7 +449,7 @@ const Lower = struct {
             .elem_sym => |e| try self.chainAppend(.{ .sym = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
             .rt_elem => |e| try self.chainAppend(.{ .rt = .{ .lo = e.lo, .hi = e.hi, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
             .chain => |c| try self.chainAppend(c.base, c.terms[0..c.n], idx, sc, null),
-            .code_elem_sym => return self.failFix(.const_multi_dim, "const 表的多维下标暂不支持（只有一维）", .{}),
+            .code_elem_sym => |e| try self.chainAppend(.{ .code = .{ .sym = e.sym, .off = e.off } }, &.{.{ .idx = e.idx, .scale = e.scale }}, idx, sc, null),
         };
     }
 
@@ -455,6 +462,8 @@ const Lower = struct {
                 try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = 0x83, .src = .{ .imm = @truncate(a >> 8) } } });
             },
             .sym => |s| try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = s.sym, .off = @truncate(s.off + k) } }),
+            // const 表：地址算法与全局变量一样，只在读取时换 `movc`
+            .code => |s| try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = s.sym, .off = @truncate(s.off + k) } }),
             .rt => |r| {
                 try self.ops.append(self.gpa, .{ .add = .{ .dst = .{ .dir = 0x82 }, .lhs = r.lo, .rhs = .{ .imm = @truncate(r.off + k) } } });
                 try self.ops.append(self.gpa, .{ .addc = .{ .dst = .{ .dir = 0x83 }, .lhs = r.hi, .rhs = .{ .imm = @truncate((r.off + k) >> 8) } } });
@@ -464,6 +473,37 @@ const Lower = struct {
             try self.ops.append(self.gpa, .{ .dptr_add_scaled = .{ .idx = t.idx, .scale = @intCast(t.scale) } });
         }
     }
+    /// 把指针引用求值成 16 位线性地址放进 DPTR（`@intFromPtr(&x)` 用）。
+    /// 与 emitLoadByte 的区别：**只算地址、不访存**，所以 const 表（代码段）也可以取。
+    fn emitAddrToDptr(self: *Lower, pr: PtrRef) codegen.Error!void {
+        switch (pr) {
+            .fixed => |a| {
+                const x: u16 = @truncate(a);
+                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = 0x82, .src = .{ .imm = @truncate(x) } } });
+                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = 0x83, .src = .{ .imm = @truncate(x >> 8) } } });
+            },
+            .sym_off => |s| try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = s.sym, .off = @truncate(s.off) } }),
+            .code_sym => |s| try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = s.sym, .off = @truncate(s.off) } }),
+            .elem => |e| {
+                const x: u16 = @truncate(e.base);
+                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = 0x82, .src = .{ .imm = @truncate(x) } } });
+                try self.ops.append(self.gpa, .{ .store_dir = .{ .addr = 0x83, .src = .{ .imm = @truncate(x >> 8) } } });
+                try self.ops.append(self.gpa, .{ .dptr_add_scaled = .{ .idx = e.idx, .scale = e.scale } });
+            },
+            .elem_sym => |e| {
+                try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = e.sym, .off = @truncate(e.off) } });
+                try self.ops.append(self.gpa, .{ .dptr_add_scaled = .{ .idx = e.idx, .scale = e.scale } });
+            },
+            .code_elem_sym => |e| {
+                try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = e.sym, .off = @truncate(e.off) } });
+                try self.ops.append(self.gpa, .{ .dptr_add_scaled = .{ .idx = e.idx, .scale = e.scale } });
+            },
+            .rt => |r| try self.emitDptrFromRt(r.lo, r.hi, r.off, null, 1),
+            .rt_elem => |e| try self.emitDptrFromRt(e.lo, e.hi, e.off, e.idx, e.scale),
+            .chain => |c| try self.emitDptrChain(c.base, c.terms[0..c.n], 0),
+        }
+    }
+
     /// DPL/DPH = base(16 位，两个槽) + off [+ idx*scale]。
     /// 全部用 add/addc 逐字节搭：**不碰 B**（B 可能载着 arg2），也不需要 mul。
     fn emitDptrFromRt(self: *Lower, lo: Loc, hi: Loc, off: u64, idx: ?Loc, scale: u8) codegen.Error!void {
@@ -537,10 +577,18 @@ const Lower = struct {
                 try self.emitDptrFromRt(e.lo, e.hi, e.off + k, e.idx, e.scale);
                 try self.ops.append(self.gpa, .{ .load_xdata_dptr = .{ .dst = mcsmir.v(dst) } });
             },
-            // 多维（`fb[z][y][x]`）：基址 + 各维偏移，逐项加到 DPTR 上。
+            // 多维（`fb[z][y][x]` / const 表 `tbl[i][j]`）：基址 + 各维偏移，
+            // 逐项加到 DPTR 上；最后一步按基址所在空间选 movx / movc。
             .chain => |c| {
                 try self.emitDptrChain(c.base, c.terms[0..c.n], k);
-                try self.ops.append(self.gpa, .{ .load_xdata_dptr = .{ .dst = mcsmir.v(dst) } });
+                if (switch (c.base) {
+                    .code => true,
+                    else => false,
+                }) {
+                    try self.ops.append(self.gpa, .{ .load_code_dptr = .{ .dst = mcsmir.v(dst) } });
+                } else {
+                    try self.ops.append(self.gpa, .{ .load_xdata_dptr = .{ .dst = mcsmir.v(dst) } });
+                }
             },
             .code_sym => |s| try self.ops.append(self.gpa, .{ .load_code_sym = .{
                 .dst = mcsmir.v(dst),
@@ -599,6 +647,10 @@ const Lower = struct {
                 try self.ops.append(self.gpa, .{ .store_xdata_dptr = .{ .src = src } });
             },
             .chain => |c| {
+                if (switch (c.base) {
+                    .code => true,
+                    else => false,
+                }) return self.fail("`const` 表在代码段（movc 只读）：不能写入。要可变就声明成 var", .{});
                 try self.emitDptrChain(c.base, c.terms[0..c.n], k);
                 try self.ops.append(self.gpa, .{ .store_xdata_dptr = .{ .src = src } });
             },
@@ -1655,19 +1707,62 @@ const Lower = struct {
         return l;
     }
 
+    /// 除零的停机标签（懒分配）。
+    fn div0Target(self: *Lower) u32 {
+        if (self.div0_label) |l| return l;
+        const l = self.tempLabel();
+        self.div0_label = l;
+        return l;
+    }
+
+    /// 当前是否「要检查」的一档。
+    ///
+    /// 溢出类检查由 AIR 的 `_safe` 变体驱动（前端只在安全档发），但**除零没有
+    /// `_safe` 变体**——Zig 的 `AIR.div_trunc` 只有一个 tag，语言层把除零当 UB。
+    /// 所以这里直接看编译配置：Debug / ReleaseSafe 才发除零与除数为零的守卫，
+    /// ReleaseSmall / ReleaseFast 一点代码都不加（体积档的取舍写在这里）。
+    fn safeChecks(self: *Lower) bool {
+        return switch (self.zcu.comp.config.root_optimize_mode) {
+            .Debug, .ReleaseSafe => true,
+            .ReleaseSmall, .ReleaseFast => false,
+        };
+    }
+
     /// 停机块：先往诊断槽写一个标记（溢出 0x5A、越界 0xA5），再 `sjmp .`。
     /// 地址取 xdata 0x8100，避开验收用的 0x8000 结果槽；尺寸档不生成这块代码。
+    /// 安全档检查命中后的**本地跳板**：设标记字节，跳到单元级的 `_mcs_panic`。
+    ///
+    /// 以前这里直接内联「设 A + 装 DPTR + movx + sjmp .」（8 B，每函数一份），
+    /// 既费 Flash，又让模板（单元级文本）根本引不到——函数内的私有标签对
+    /// 模板不可见。改成全局出口后，模板里的错误分支只要 `ljmp _mcs_panic`。
     fn appendPanicBlock(self: *Lower, gpa: std.mem.Allocator, label: u32, mark: u8) codegen.Error!void {
         try self.ops.appendSlice(gpa, &.{
             .{ .label = label },
             .{ .imm = .{ .dst = .{ .dir = 0xE0 }, .value = mark } },
-            .{ .store_xdata = .{ .addr = 0x8100, .src = .{ .dir = 0xE0 } } },
-            .halt,
+            .{ .ljmp = .{ .sym = rtlib.panic_sym } },
         });
     }
 
-    fn emitOverflowCheck(self: *Lower, signed: bool) codegen.Error!void {
-        try self.ops.append(self.gpa, .{ .bit_br = .{
+    /// 除数为零的守卫（安全档）：把除数 n 个字节 or 进一个临时槽，
+    /// 全零就跳 `_mcs_panic`。比 n 次逐字节比较省，也不碰进位标志。
+    fn guardDivZero(self: *Lower, base: u8, n: u8) codegen.Error!void {
+        const acc = try self.allocVreg();
+        var k: u8 = 0;
+        while (k < n) : (k += 1) {
+            if (k == 0) {
+                try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(acc), .src = mcsmir.v(base) } });
+            } else {
+                try self.ops.append(self.gpa, .{ .or_ = .{
+                    .dst = mcsmir.v(acc),
+                    .lhs = mcsmir.v(acc),
+                    .rhs = mcsmir.v(base + k),
+                } });
+            }
+        }
+        try self.ops.append(self.gpa, .{ .br_ifz = .{ .cond = mcsmir.v(acc), .target = self.div0Target() } });
+    }
+
+    fn emitOverflowCheck(self: *Lower, signed: bool) codegen.Error!void {        try self.ops.append(self.gpa, .{ .bit_br = .{
             .bit = if (signed) 0xD2 else 0xD7,
             .target = self.panicTarget(),
             .on_set = true,
@@ -2183,6 +2278,7 @@ const Lower = struct {
             .subb => |x| .{ .subb = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .rhs = mapByteVreg(x.rhs, map) } },
             .clr_c, .ljmp => op,
             .load_xdata_dptr => |x| .{ .load_xdata_dptr = .{ .dst = mapByteVreg(x.dst, map) } },
+            .load_code_dptr => |x| .{ .load_code_dptr = .{ .dst = mapByteVreg(x.dst, map) } },
             .dptr_add_scaled => |x| .{ .dptr_add_scaled = .{ .idx = mapByteVreg(x.idx, map), .scale = x.scale } },
             .store_xdata_dptr => |x| .{ .store_xdata_dptr = .{ .src = mapByteVreg(x.src, map) } },
             .shl => |x| .{ .shl = .{ .dst = mapByteVreg(x.dst, map), .lhs = mapByteVreg(x.lhs, map), .n = x.n } },
@@ -3576,6 +3672,11 @@ const Lower = struct {
                             try self.mulWide(t, a, b2, n);
                             break :blk2 t;
                         }
+                        // 宽除法没有 DIV AB 的 OV 帮忙：安全档先判除数的 n 个字节
+                        // 是否全零，零就跳 `_mcs_panic`（标记 0x3C）。
+                        if (tag == .div_trunc or tag == .rem) {
+                            if (self.safeChecks()) try self.guardDivZero(b2, n);
+                        }
                         break :blk2 try self.divmodWide(a, b2, n, info.signed, tag == .div_trunc);
                     };
                     if (saved_bw) |sv| {
@@ -3600,6 +3701,10 @@ const Lower = struct {
                     .rem => .{ .rem_ = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                     else => .{ .mul = .{ .dst = d, .lhs = lhs, .rhs = rhs } },
                 });
+                // 8 位除零不用后端加检查：前端在 `/`、`%` 之前已经插了
+                // 「除数为 0 → trap」的分支（实测汇编是 `mov a,PARM_2 / jz L>trap`），
+                // 这里再判一次 OV 只是永远不触发的死代码。宽除法没有这份前端检查，
+                // 由 guardDivZero 负责（见下面的多字节分支）。
                 // MUL AB 之后 B 就是积的高字节，非零即 8 位无符号溢出。
                 // 必须放在恢复 arg2 的 B 之前——那一步会把高字节盖掉。
                 if (tag == .mul_safe) {
@@ -3793,14 +3898,20 @@ const Lower = struct {
                 }
             },
 
-            // 取函数地址当值（`@intFromPtr(&f)`）：函数指针表的「填表」动作。
-            // 地址就是 `_<fqn>` 这个 16 位符号，用 `mov dptr,#_sym` 装进 DPTR 再抄出来。
+            // 取地址当值（`@intFromPtr(&x)`）：函数指针表「填表」与
+            // 「把缓冲区地址存进表里」（DMA 描述符、环形队列、跳转表）都走这里。
+            // 函数地址 = `_<fqn>` 符号；数据地址 = `_<变量名>` 符号 + 常量偏移
+            // 或运行期下标（`&buf[i]`）。两种都先求进 DPTR，再抄成 2 字节整数。
             .int_from_ptr => {
                 const ty_op = data.ty_op;
-                const sym = self.fnNavSym(ty_op.operand) orelse
-                    return self.failFix(.data_addr, "只支持把函数地址转成整数（数据指针的地址暂不支持）", .{});
                 const w = try self.allocWide(2);
-                try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = sym } });
+                if (self.fnNavSym(ty_op.operand)) |sym| {
+                    try self.ops.append(self.gpa, .{ .lea_dptr_sym = .{ .sym = sym } });
+                } else if (self.ptrRefOf(ty_op.operand)) |pr| {
+                    try self.emitAddrToDptr(pr);
+                } else {
+                    return self.failFix(.data_addr, "取不到这个地址的基址（既不是函数也不是全局/静态变量）", .{});
+                }
                 try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(w), .src = .{ .dir = 0x82 } } });
                 try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(w + 1), .src = .{ .dir = 0x83 } } });
                 self.vals[@backingInt(inst)] = mcsmir.v(w);
@@ -3809,6 +3920,9 @@ const Lower = struct {
 
             // 地址装进整数再转指针（@ptrFromInt）：位模式不变，只把宽度信息带过去，
             // 间接调用靠它拿到 2 字节目标地址。
+            // **必须在 ptr_vals 里注册成运行期基址**：否则后面的 `q.*` / `q[i]`
+            // 查不到地址形态，会把「地址低字节」当成**值**读出来（0x82 = DPL，
+            // 症状是取地址往返后读到 130，而不是内存里的字节）。
             .ptr_from_int => {
                 const ty_op = data.ty_op;
                 const src_ty = self.air.typeOf(ty_op.operand, &self.zcu.intern_pool);
@@ -3818,6 +3932,10 @@ const Lower = struct {
                 const base = try self.wideOperand(ty_op.operand, 2);
                 self.vals[@backingInt(inst)] = mcsmir.v(base);
                 self.wide[@backingInt(inst)] = @as(u16, base) | (@as(u16, 2) << 8);
+                self.ptr_vals[@backingInt(inst)] = .{ .rt = .{
+                    .lo = mcsmir.v(base),
+                    .hi = mcsmir.v(base + 1),
+                } };
             },
 
             .alloc => {
@@ -4147,7 +4265,10 @@ const Lower = struct {
                     }
                     if (total > 4) return self.failFix(
                         .ind_call_args,
-                        "间接调用（函数指针）只支持 ≤4 字节参数（合计），当前 {d} 字节——间接调用拿不到被调方的 PARM 区",
+                        "间接调用（函数指针）只支持 ≤4 字节参数（合计），当前 {d} 字节——" ++
+                            "间接调用拿不到被调方的 PARM 区；SDCC 在非 reentrant 模型下同样拒绝" ++
+                            "（error 92：Functions called via pointers must be 'reentrant'）。" ++
+                            "改法：把多参数打包成结构体、传指针进去",
                         .{total},
                     );
                     // ③ 摆参：所有实参按字节顺序灌进 ABI 寄存器（合计 ≤4 字节，前面已校验）
@@ -4250,16 +4371,21 @@ const Lower = struct {
                 for (ci.args, 0..) |arg_ref, ai| {
                     const aty = self.air.typeOf(arg_ref, ip);
                     const an = try self.storageBytes(aty, "调用参数");
-                    if (an > 4) return self.failFix(.param_over4, "参数超过 4 字节（多字节结构体）尚未支持", .{});
                     widths[ai] = an;
                     consts[ai] = self.constWide(arg_ref);
                     bases[ai] = if (consts[ai] != null) 0 else try self.wideOperand(arg_ref, an);
                 }
-                // ② 再统一摆到 ABI 位置：arg0 进 ABI 寄存器，其余进 _被调短名_PARM_2 起的连续字节
-                var spill: usize = 2;
+                // ② 再统一摆到 ABI 位置：arg0 进 ABI 寄存器（≤4 字节），其余进
+                //    `_被调短名_PARM_2` 起的连续字节。
+                //    **arg0 超过 4 字节**（u64/8 字节结构体）寄存器装不下，SDCC 的约定是
+                //    整个参数放进 `_名_PARM_1`，后续参数从 PARM_{1+n} 接着排（实测
+                //    `sdcc -mmcs51 --model-small`：`_take6_PARM_1: .ds 6`）。
+                const arg0_big = nargs > 0 and widths[0] > 4;
+                var spill: usize = if (arg0_big) 1 else 2;
                 for (ci.args, 0..) |_, ai| {
                     const an = widths[ai];
                     const base = bases[ai];
+                    const use_reg = ai == 0 and !arg0_big;
                     var k: u8 = 0;
                     while (k < an) : (k += 1) {
                         // 调用点也要写被调方的 PARM 符号：名字进符号池（同一名字只留一份，
@@ -4267,7 +4393,7 @@ const Lower = struct {
                         const psym = try std.fmt.allocPrint(self.gpa, "_{s}_PARM_{d}", .{ short, spill + k });
                         defer self.gpa.free(psym);
                         const kept = self.internSym(psym) orelse return error.OutOfMemory;
-                        const dst: mcsmir.Byte = if (ai == 0)
+                        const dst: mcsmir.Byte = if (use_reg)
                             .{ .dir = mcsmir.abi.arg_regs[k] }
                         else
                             .{ .sym = kept };
@@ -4278,7 +4404,7 @@ const Lower = struct {
                             try self.ops.append(self.gpa, .{ .mov = .{ .dst = dst, .src = mcsmir.v(base + k) } });
                         }
                     }
-                    if (ai > 0) spill += an;
+                    if (ai > 0 or arg0_big) spill += an;
                 }
                 // **尾调用**：调用结果被紧接的 ret 原样返回 → 参数摆好后直接 ljmp，
                 // 不再压返回地址。8051 没有栈帧，被调方的 ret 直接回到**我们的**调用方；
@@ -4565,6 +4691,7 @@ pub fn generate(
     // 尺寸档不发检查，两个 label 都是 null，这里零开销。
     if (lw.panic_label) |pl| try lw.appendPanicBlock(gpa, pl, 0x5A);
     if (lw.trap_label) |tl| try lw.appendPanicBlock(gpa, tl, 0xA5);
+    if (lw.div0_label) |dl| try lw.appendPanicBlock(gpa, dl, 0x3C);
 
     // M2.12：相邻拷贝折叠（去掉 mov vd,vs 的纯中转）。
     lw.foldCopies();
@@ -4673,6 +4800,11 @@ pub fn generate(
             }
         }
     }
+
+    // 全局停机出口 `_mcs_panic`：本单元只要有一处检查跳板，就带一份。
+    // 单元级符号（不加 .globl），多单元各带一份，链接不撞名。
+    if ((lw.panic_label != null or lw.trap_label != null or lw.div0_label != null) and rtlib.takePanic())
+        try mir.text.appendSlice(gpa, rtlib.panicText());
 
     // 中断向量跳板：绝对段 VECTORS 内 .org 到向量地址发 ljmp（函数体在 CSEG 别处）。
     if (is_isr) {

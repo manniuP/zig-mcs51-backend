@@ -18,3 +18,27 @@ export fn cgeti(i: u8) u8 {
 export fn wgeti(i: u8) u16 {
     return WORDS[i];
 }
+
+// ---- 多维 const 表：tbl[i][j]（第二维下标在运行期，链式加到 DPTR 上）----
+// 4 行 × 4 列，值是 10*行+列，读出来能立刻看出行列有没有串。
+const GRID: [4][4]u8 = .{
+    .{ 0x00, 0x01, 0x02, 0x03 },
+    .{ 0x10, 0x11, 0x12, 0x13 },
+    .{ 0x20, 0x21, 0x22, 0x23 },
+    .{ 0x30, 0x31, 0x32, 0x33 },
+};
+
+// 两维都在运行期：地址 = _GRID + i*4 + j
+export fn g2(i: u8, j: u8) u8 {
+    return GRID[i][j];
+}
+
+// 行运行期、列常量：地址 = _GRID + i*4 + 2
+export fn g2c(i: u8) u8 {
+    return GRID[i][2];
+}
+
+// 行常量、列运行期：地址 = _GRID + 3*4 + j
+export fn g2r(j: u8) u8 {
+    return GRID[3][j];
+}

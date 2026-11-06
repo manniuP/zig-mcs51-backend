@@ -25,3 +25,20 @@ const bounds_tbl = [_]u8{ 1, 2, 3, 4 };
 export fn safe_bounds(i: u8) u8 {
     return bounds_tbl[i];
 }
+
+// ---- 除零：8 位（DIV AB 的 OV 标志）与 32 位（逐字节判除数为零）----
+// 除零在 Zig 语言层是 UB，前端不发 `_safe` 变体，所以这条检查由后端按
+// 编译档位自己加：Debug/ReleaseSafe 跳 `_mcs_panic`（标记 0x3C），
+// ReleaseSmall/ReleaseFast 一点代码都不加。
+
+export fn safe_div8(a: u8, b: u8) u8 {
+    return a / b;
+}
+
+export fn safe_div32(a: u32, b: u32) u32 {
+    return a / b;
+}
+
+export fn safe_rem32(a: u32, b: u32) u32 {
+    return a % b;
+}
