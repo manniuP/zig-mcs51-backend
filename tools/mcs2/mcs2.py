@@ -611,12 +611,30 @@ CASES: dict[str, dict] = {
     "safe_bounds_ok": dict(kind="call", src="safe.zig", fn="safe_bounds", args=[("DPL", 2)], want=3, opt="ReleaseSafe"),
     "safe_bounds_ov": dict(kind="call", src="safe.zig", fn="safe_bounds", args=[("DPL", 9)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0xA5}),
     # 非尾递归必须编译期拒绝（静态参数区不可重入）。
-    "safe_rec_reject": dict(kind="reject", src="rec.zig", opt="ReleaseSafe", want_err="非尾递归不受支持", want_code="rec_bad__tail(n, 0)"),
+    # want_code2 是 M1 的 AIR 还原门禁：建议里的表达式必须来自真实 AIR，
+    # 而不是只剩占位符。降级成骨架时这条会立刻变红。
+    "safe_rec_reject": dict(kind="reject", src="rec.zig", opt="ReleaseSafe",
+                            want_err="非尾递归不受支持", want_code="rec_bad__tail(n, 0)",
+                            want_code2="rec_bad((n - 1)) + 1"),
     # 改写建议：错误信息里必须出现可直接粘贴的 Zig 代码，而不只是中文说明。
     "diag_mul_reject": dict(kind="reject", src="diag_mul.zig", opt="ReleaseSafe", want_err="乘法溢出检查", want_code="a *% b"),
     "diag_addr_reject": dict(kind="reject", src="diag_addr.zig", opt="ReleaseSafe", want_err="数据指针的地址", want_code="@ptrFromInt(BUF_ADDR)"),
     "diag_switch_reject": dict(kind="reject", src="diag_switch.zig", opt="ReleaseSafe", want_err="switch 的判定值", want_code="handlers[op](arg)"),
     "diag_dim_reject": dict(kind="reject", src="diag_dim.zig", opt="ReleaseSafe", want_err="多维下标", want_code="row * COLS + col"),
+    # 重复复杂算法压缩：三个同构乘法必须压成一份共享子程序，且结果不变。
+    # want_shared 是「压缩确实发生」的门禁，防止优化悄悄退化成全内联。
+    "factor_a": dict(kind="call", src="factor.zig", fn="fac_a",
+                     args=[("DPL", 0x34), ("DPH", 0x12), ("PARM2", 0x20), ("PARM_3", 0x00)],
+                     want16=0x4680, want_shared=3, no_site_shift=True),
+    "factor_b": dict(kind="call", src="factor.zig", fn="fac_b",
+                     args=[("DPL", 0x12), ("DPH", 0x00), ("PARM2", 0x03), ("PARM_3", 0x00)],
+                     want16=0x0036, want_shared=3, no_site_shift=True),
+    "factor_c": dict(kind="call", src="factor.zig", fn="fac_c",
+                     args=[("DPL", 0xFF), ("DPH", 0xFF), ("PARM2", 0x02), ("PARM_3", 0x00)],
+                     want16=0xFFFE, want_shared=3, no_site_shift=True),
+    # 反例：单条加减/位运算被 lcall+ret 取代必然更大，两个同构函数也不许压缩。
+    "factor_cheap": dict(kind="call", src="cheap.zig", fn="cheap_a",
+                         args=[("DPL", 3), ("PARM2", 4)], want=0x5D, forbid_shared=True),
 }
 
 ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big",
@@ -645,7 +663,8 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "safe_add_ok", "safe_add_ov", "safe_sub_ok", "safe_sub_ov",
          "safe_mul_ok", "safe_mul_ov", "safe_sadd_ok", "safe_sadd_ov",
          "safe_bounds_ok", "safe_bounds_ov", "safe_rec_reject",
-         "diag_mul_reject", "diag_addr_reject", "diag_switch_reject", "diag_dim_reject"]
+         "diag_mul_reject", "diag_addr_reject", "diag_switch_reject", "diag_dim_reject",
+         "factor_a", "factor_b", "factor_c", "factor_cheap"]
 
 
 def check_selftest() -> bool:
@@ -654,9 +673,17 @@ def check_selftest() -> bool:
     if not zig:
         raise SystemExit("找不到系统 zig")
     selftest = SRC_TREE / "src" / "codegen" / "mcs2" / "selftest.zig"
-    r = run([zig, "run", str(selftest)], cwd=HERE, env=build_env(), check=False)
-    asm = (r.stderr or "") + (r.stdout or "")
-    if ".area CSEG (CODE)" not in asm:
+    # 冷缓存时 `zig run` 首次可能只输出编译过程、拿不到汇编（实测全量首跑偶发
+    # FAIL: selftest，单项与第二次全量都通过）。给一次重试，仍拿不到才判失败。
+    asm = ""
+    for attempt in range(2):
+        r = run([zig, "run", str(selftest)], cwd=HERE, env=build_env(), check=False)
+        asm = (r.stderr or "") + (r.stdout or "")
+        if r.returncode == 0 and ".area CSEG (CODE)" in asm:
+            break
+        if attempt == 0:
+            print("  RETRY: selftest 首次未拿到汇编（冷缓存），重跑一次")
+    else:
         print(asm[-1200:])
         print("FAIL: selftest 没有输出预期汇编")
         return False
@@ -681,6 +708,26 @@ def check_call(name: str, spec: dict) -> bool:
     if spec.get("want_ljmp") and "ljmp" not in text:
         print("FAIL: 期望长跳（ljmp）但产物里没有——跳转松弛没生效")
         return False
+    if spec.get("want_shared"):
+        n = text.count("lcall _mcs_sh_")
+        if n < spec["want_shared"]:
+            print(f"FAIL: 期望至少 {spec['want_shared']} 处共享算法调用，实际 {n} 处")
+            return False
+        print(f"  PASS: {name} 共享算法调用 {n} 处")
+    if spec.get("forbid_shared"):
+        if "lcall _mcs_sh_" in text:
+            print("FAIL: 加减/位运算这类廉价序列不应生成共享子程序")
+            return False
+        print(f"  PASS: {name} 廉价运算保持内联（无共享调用）")
+    if spec.get("no_site_shift"):
+        # 站点槽重绑定门禁：非拥有者站点必须把输入直接写进拥有者槽，
+        # 产物里不应再出现「vreg → vreg」的 `mov _mcs_vX,_mcs_vY` 搬运。
+        # 一旦重绑失效（比如块专用临时量的判定被改坏），这条会立刻变红。
+        hit = re.search(r"mov\s+_mcs_v\d+,_mcs_v\d+", text)
+        if hit:
+            print(f"FAIL: 站点仍在搬运共享槽（{hit.group(0)}）——重绑没生效")
+            return False
+        print(f"  PASS: {name} 站点零搬运（重绑生效）")
     want_wide = spec.get("want16") if spec.get("want16") is not None else spec.get("want32")
     ret_bytes = spec.get("ret_bytes", 1)
     if spec.get("want16") is not None:
@@ -810,12 +857,15 @@ def check_reject(name: str, spec: dict) -> bool:
     output = (r.stdout or "") + (r.stderr or "")
     err_ok = r.returncode != 0 and spec["want_err"] in output
     code_ok = spec.get("want_code") is None or spec["want_code"] in output
-    ok = err_ok and code_ok
+    code2_ok = spec.get("want_code2") is None or spec["want_code2"] in output
+    ok = err_ok and code_ok and code2_ok
     if not ok:
         print(output[-800:])
     print(f"  {'PASS' if ok else 'FAIL'}: {name} 编译期拒绝（含「{spec['want_err']}」）")
     if spec.get("want_code"):
         print(f"  {'PASS' if code_ok else 'FAIL'}: 改写建议含代码「{spec['want_code']}」")
+    if spec.get("want_code2"):
+        print(f"  {'PASS' if code2_ok else 'FAIL'}: 建议里还原出的真实表达式「{spec['want_code2']}」")
     return ok
 
 

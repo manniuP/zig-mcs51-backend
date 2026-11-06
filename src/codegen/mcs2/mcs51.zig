@@ -50,6 +50,14 @@ fn byteText(gpa: std.mem.Allocator, b: Byte) ![]const u8 {
     };
 }
 
+/// 直接地址操作数的**直址写法**（不折叠成 rN）。
+/// `anl/orl/xrl direct,#data` 是唯一存在的编码，工作寄存器区（0x00-0x07）
+/// 必须写 `0x0N`——8051 没有 `orl Rn,#data`，渲染成 `r7` 会被汇编器拒绝
+/// （槽回收让 vreg 编号变小、值落进 bank0 之后才暴露出来的既有 bug）。
+fn dirAddrText(gpa: std.mem.Allocator, addr: u8) ![]const u8 {
+    return std.fmt.allocPrint(gpa, "0x{X:0>2}", .{addr});
+}
+
 /// 操作数文本是不是工作寄存器（r0-r7）。
 fn isRegText(s: []const u8) bool {
     if (s.len != 2) return false;
@@ -824,7 +832,8 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                                     try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    clr 0x{X:0>2}", .{bit}), .jump = null } });
                                     continue;
                                 }
-                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    anl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
+                                const da = try dirAddrText(gpa, addr);
+                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    anl {s},#0x{X:0>2}", .{ da, v }), .jump = null } });
                                 continue;
                             },
                             else => {},
@@ -851,7 +860,8 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                                     try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    setb 0x{X:0>2}", .{bit}), .jump = null } });
                                     continue;
                                 }
-                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    orl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
+                                const da = try dirAddrText(gpa, addr);
+                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    orl {s},#0x{X:0>2}", .{ da, v }), .jump = null } });
                                 continue;
                             },
                             else => {},
@@ -871,9 +881,10 @@ pub fn lower(f: mir.Function, gpa: std.mem.Allocator, with_header: bool) !std.Ar
                 const d = try byteText(gpa, x.dst);
                 if (sameByte(x.dst, x.lhs)) {
                     switch (x.dst) {
-                        .dir => switch (x.rhs) {
+                        .dir => |addr| switch (x.rhs) {
                             .imm => |v| {
-                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    xrl {s},#0x{X:0>2}", .{ d, v }), .jump = null } });
+                                const da = try dirAddrText(gpa, addr);
+                                try items.append(gpa, .{ .line = .{ .text = try std.fmt.allocPrint(gpa, "    xrl {s},#0x{X:0>2}", .{ da, v }), .jump = null } });
                                 continue;
                             },
                             else => {},

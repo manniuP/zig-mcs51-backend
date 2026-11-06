@@ -104,6 +104,17 @@ pub fn paramNamesFromSource(
     return names;
 }
 
+/// M1：从 AIR 还原出来的现场信息。三处都是真实的源码片段，
+/// 推不出来就留空，对应位置退回占位符。
+pub const Extra = struct {
+    /// 整条 return 表达式的源码，例如 `f(n - 1) * 2`。
+    expr: []const u8 = "",
+    /// 递归调用**之后**的运算，例如 `* 2`（形如 `<运算符> <操作数>`）。
+    post: []const u8 = "",
+    /// 递归调用的实参源码，例如 `n - 1`。
+    args_src: []const u8 = "",
+};
+
 /// 生成完整建议文本。调用方负责释放返回值。
 pub fn render(
     gpa: std.mem.Allocator,
@@ -112,6 +123,7 @@ pub fn render(
     params: []const []const u8,
     pnames: ?[]const []const u8,
     ret: []const u8,
+    extra: ?Extra,
 ) ![]u8 {
     var out: Buf = .empty;
     errdefer out.deinit(gpa);
@@ -126,7 +138,20 @@ pub fn render(
     switch (kind) {
         .tail_rec => {
             try add(&out, gpa,
-                "非尾递归不受支持：参数区与局部槽是静态分配的，内层调用会覆盖外层的值，结果错且不报错。\n" ++
+                "非尾递归不受支持：参数区与局部槽是静态分配的，内层调用会覆盖外层的值，结果错且不报错。\n");
+            if (extra) |x| {
+                if (x.expr.len != 0) {
+                    try add(&out, gpa, "从 AIR 还原，这个函数实际写的是：\n    return ");
+                    try add(&out, gpa, x.expr);
+                    try add(&out, gpa, ";\n");
+                    if (x.post.len != 0) {
+                        try addf(&out, gpa,
+                            "调用之后还要做「{s}」，所以结尾的 ljmp 跳不回自己。\n", .{x.post});
+                    }
+                    try add(&out, gpa, "\n");
+                }
+            }
+            try add(&out, gpa,
                 "把「递归调用之后才做的运算」搬进累加器参数，让调用出现在 return 位置（mcs2 会把它编成循环）：\n\n");
             try addf(&out, gpa, "export fn {s}({s}) {s} {{\n", .{ name, decl, ret });
             if (params.len > 0) {
@@ -140,13 +165,28 @@ pub fn render(
                 try addf(&out, gpa, "{s}, ", .{decl});
             }
             try addf(&out, gpa, "acc: {s}) {s} {{\n", .{ ret, ret });
-            try add(&out, gpa,
-                "    if (/* 原基准条件 */) return acc + /* 原基准返回值 */;\n" ++
-                "    return ");
-            try addf(&out, gpa, "{s}__tail(/* 原递归实参 */, acc + /* 原调用后的运算 */);\n", .{name});
-            try add(&out, gpa,
-                "}\n\n" ++
-                "或者直接写成循环（代码更短，不用多一个函数）：\n\n");
+            try add(&out, gpa, "    if (/* 原基准条件 */) return acc;\n    return ");
+            try addf(&out, gpa, "{s}__tail(", .{name});
+            if (extra) |x| {
+                if (x.args_src.len != 0) {
+                    try add(&out, gpa, x.args_src);
+                } else {
+                    try add(&out, gpa, "/* 原递归实参 */");
+                }
+                try add(&out, gpa, ", acc");
+                if (x.post.len != 0) {
+                    // 递归调用之后的单一运算可以直接结合到累加器上：
+                    // f(n)=f(n-1) ⊕ X  ⟺  g(n,acc)=g(n-1, acc ⊕ X)，与 ⊕ 是否
+                    // 满足结合律无关（逐层降下来本就是同一运算的串接）。
+                    try addf(&out, gpa, " {s}", .{x.post});
+                } else {
+                    try add(&out, gpa, " /* 再 ⊕ 原调用后的运算 */");
+                }
+            } else {
+                try addf(&out, gpa, "/* 原递归实参 */, acc /* 再 ⊕ 原调用后的运算 */", .{});
+            }
+            try add(&out, gpa, ");\n}\n\n");
+            try add(&out, gpa, "或者直接写成循环（代码更短，不用多一个函数）：\n\n");
             try addf(&out, gpa, "export fn {s}({s}) {s} {{\n", .{ name, decl, ret });
             try addf(&out, gpa, "    var acc: {s} = 0;\n", .{ret});
             try addf(&out, gpa, "    var cur = {s};\n", .{first});

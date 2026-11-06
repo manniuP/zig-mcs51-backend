@@ -19,6 +19,8 @@ const Value = @import("../Value.zig");
 const mcsmir = @import("mcs2/mir.zig");
 const mcs51 = @import("mcs2/mcs51.zig");
 const diag = @import("mcs2/diag.zig");
+const factor = @import("mcs2/factor.zig");
+const air_expr = @import("mcs2/air_expr.zig");
 
 pub const Mir = struct {
     text: std.ArrayListUnmanaged(u8) = .empty,
@@ -84,6 +86,8 @@ const scratch_results: bool = true;
 /// 记账开关：打印每个永久 allocWide 块（AIR 指令、槽基址、宽度、最后读取点）。
 /// 默认关：诊断输出会混进编译错误信息，干扰「改写建议」的可读性。
 const account_wide: bool = false;
+/// 重复复杂算法压缩总开关：改 false 重编即可得到「全部内联」的尺寸基线。
+const enable_factor: bool = true;
 /// 统计开关：打印每个 .alloc 的逃逸判定。
 const alloc_report: bool = false; // 统计开关（看 alloc 逃逸情况时临时改 true） // 记账开关
 
@@ -129,6 +133,15 @@ const BlockSlot = struct { inst: Air.Inst.Index, base: u8, width: u8 };
 /// M1 的线性降级器。不做活跃分析：`.arg` 原地用 ABI 寄存器（零序言），
 /// 双目结果默认落新 vreg，唯一的单消费者优化是「ret 前看一眼」——
 /// 结果直接写 DPL，省一次 vreg 往返（`add8` 预算内的关键一招）。
+/// 到期自动回收的宽结果段。
+///
+/// `last` 用 **AIR 指令编号**（不是 body 下标），`body` 记住分配时所在 body——
+/// 嵌套块的指令编号与父 body 的下标不是一套尺度，跨 body 比对毫无意义。
+/// 早期就是拿「指令编号」去和「body 下标」比，导致该留的被提前回收、
+/// 该还的永远不还（宽局部量回收三次回退的根因）。跨 body 一律不回收，
+/// 由 `freeScratchOfBody` 在 body 退出时整段清掉。
+const ScratchRun = struct { base: u8 = 0, n: u8 = 0, last: usize = 0, body: usize = 0 };
+
 const Lower = struct {
     zcu: *Zcu,
     gpa: std.mem.Allocator,
@@ -160,6 +173,9 @@ const Lower = struct {
     tail_ret: ?Air.Inst.Index = null,
     /// 本函数的标签基址（跨函数不复用，避免汇编符号重名）。
     label_base: u32 = 0,
+    /// 源码里的真实参数名（改写建议用，`n` / `m` 而不是 `a0` / `a1`）。
+    /// 拿不到时保持 null，渲染退回 a0/a1。
+    param_names: ?[]const []const u8 = null,
     /// comptime 数组常量池：`const tbl = .{…}` 的 `tbl[i]`（运行期下标）在 AIR 里是
     /// `array_elem_val`，操作数是**聚合值**而不是符号 → 这里给它造一个代码段符号，
     /// 把字节原样发出去（每个函数各发一份；跨函数去重要跨函数状态，暂不做）。
@@ -178,8 +194,11 @@ const Lower = struct {
     /// 每个临时段属于哪条指令（生命周期判定用）：owner 还有后续读者就不能回收。
     temp_owner: [24]Air.Inst.Index = @splat(@enumFromInt(0)),
     /// 短寿命 scratch：按 AIR 最后读取点回收（Kimi 2026-11-02 的方案）。
-    scratch_runs: [32]struct { base: u8, n: u8, last: usize } = @splat(.{ .base = 0, .n = 0, .last = 0 }),
+    /// 到期自动回收的宽结果段（布局见 `ScratchRun`）。
+    scratch_runs: [32]ScratchRun = @splat(.{}),
     scratch_n: u8 = 0,
+    /// 当前正在发射的 body（scratch 生命周期按它分区）。
+    cur_body: []const Air.Inst.Index = &.{},
     /// 本条指令的结果是否允许放 scratch（由 emitBody 每条指令算好）。
     cur_scratch_ok: bool = false,
     /// 正在 lower 的指令（temp 分配时记录 owner）。
@@ -648,6 +667,223 @@ const Lower = struct {
         return ri;
     }
 
+    // ---- M1：AIR → Zig 源码（编译期改写建议用） ----
+    //
+    // 只覆盖整数算术 / 比较 / 转换的白名单，**任何一处不认识就整条返回 null**，
+    // 调用方据此退回带占位符的骨架。改写建议宁可少说，也不能给用户一段
+    // 语义不对的代码照着抄。
+
+    const MAX_SRC_DEPTH = 6;
+
+    /// 复合表达式加括号；原子（标识符 / 数字 / 已带括号的整体）原样返回。
+    /// 只在**顶层**看到运算符才包括号，避免 `f((n - 1))` 变成 `(f((n - 1)))`。
+    fn srcParen(gpa: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]u8 {
+        var depth: i32 = 0;
+        for (s) |c| switch (c) {
+            '(', '[' => depth += 1,
+            ')', ']' => depth -= 1,
+            ' ', '+', '-', '*', '/', '%', '&', '|', '^', '<', '>', '~' => {
+                if (depth == 0) return std.fmt.allocPrint(gpa, "({s})", .{s});
+            },
+            else => {},
+        };
+        return gpa.dupe(u8, s);
+    }
+
+    /// 二元运算的源码运算符；不是可渲染的算术/位运算返回 null。
+    fn binOpStr(tag: Air.Inst.Tag) ?[]const u8 {
+        return switch (tag) {
+            .add, .add_safe, .add_optimized => "+",
+            .add_wrap => "+%",
+            .sub, .sub_safe, .sub_optimized => "-",
+            .sub_wrap => "-%",
+            .mul, .mul_safe, .mul_optimized => "*",
+            .mul_wrap => "*%",
+            .div_trunc, .div_trunc_optimized => "/",
+            .rem, .rem_optimized => "%",
+            .bit_and => "&",
+            .bit_or => "|",
+            .xor => "^",
+            .shl, .shl_exact => "<<",
+            .shr, .shr_exact => ">>",
+            else => null,
+        };
+    }
+
+    fn isCallTag(tag: Air.Inst.Tag) bool {
+        return switch (tag) {
+            .call, .call_always_tail, .call_never_tail, .call_never_inline => true,
+            else => false,
+        };
+    }
+
+    fn renderBinSrc(
+        self: *Lower,
+        gpa: std.mem.Allocator,
+        lhs: Air.Inst.Ref,
+        rhs: Air.Inst.Ref,
+        tag: air_expr.Tag,
+        depth: u8,
+    ) std.mem.Allocator.Error!?[]u8 {
+        const l = (try self.renderRefSrc(gpa, lhs, depth + 1)) orelse return null;
+        defer gpa.free(l);
+        const r = (try self.renderRefSrc(gpa, rhs, depth + 1)) orelse return null;
+        defer gpa.free(r);
+        const lp = try srcParen(gpa, l);
+        defer gpa.free(lp);
+        const rp = try srcParen(gpa, r);
+        defer gpa.free(rp);
+        return air_expr.render(gpa, tag, .{ .lhs = lp, .rhs = rp });
+    }
+
+    /// 把一条 AIR 引用渲染成 Zig 表达式。返回新分配的字符串（调用方释放）。
+    /// 不支持的形态一律 null。
+    fn renderRefSrc(
+        self: *Lower,
+        gpa: std.mem.Allocator,
+        ref: Air.Inst.Ref,
+        depth: u8,
+    ) std.mem.Allocator.Error!?[]u8 {
+        if (depth > MAX_SRC_DEPTH) return null;
+        if (ref.toInterned()) |ip_index| {
+            const key = self.zcu.intern_pool.indexToKey(ip_index);
+            return switch (key) {
+                .int => |int| switch (int.storage) {
+                    .u64 => |v| try std.fmt.allocPrint(gpa, "{d}", .{v}),
+                    .i64 => |v| if (v < 0)
+                        try std.fmt.allocPrint(gpa, "-{d}", .{-v})
+                    else
+                        try std.fmt.allocPrint(gpa, "{d}", .{v}),
+                    else => null,
+                },
+                else => null,
+            };
+        }
+        const idx = ref.toIndex() orelse return null;
+        const tag = self.air.instructions.items(.tag)[@backingInt(idx)];
+        const d = self.air.instructions.items(.data)[@backingInt(idx)];
+        switch (tag) {
+            .arg => {
+                const a = d.arg;
+                if (self.param_names) |ns| {
+                    if (a.zir_param_index < ns.len) return try gpa.dupe(u8, ns[a.zir_param_index]);
+                }
+                return try std.fmt.allocPrint(gpa, "a{d}", .{a.zir_param_index});
+            },
+            // 递归调用本身：名字就是当前函数名（只在自递归场景里用，见调用方）。
+            .call, .call_always_tail, .call_never_tail, .call_never_inline => {
+                const ci = self.air.unwrapCall(idx);
+                var out: std.ArrayListUnmanaged(u8) = .empty;
+                errdefer out.deinit(gpa);
+                try out.appendSlice(gpa, self.short_name);
+                try out.append(gpa, '(');
+                for (ci.args, 0..) |a, i| {
+                    if (i > 0) try out.appendSlice(gpa, ", ");
+                    const s = (try self.renderRefSrc(gpa, a, depth + 1)) orelse return null;
+                    defer gpa.free(s);
+                    const p = try srcParen(gpa, s);
+                    defer gpa.free(p);
+                    try out.appendSlice(gpa, p);
+                }
+                try out.append(gpa, ')');
+                return try out.toOwnedSlice(gpa);
+            },
+            .int_cast, .int_cast_safe, .trunc => {
+                const s = (try self.renderRefSrc(gpa, d.ty_op.operand, depth + 1)) orelse return null;
+                defer gpa.free(s);
+                const p = try srcParen(gpa, s);
+                defer gpa.free(p);
+                return air_expr.render(gpa, if (tag == .trunc) .trunc else .int_cast, .{ .operand = p });
+            },
+            .not => {
+                const s = (try self.renderRefSrc(gpa, d.un_op, depth + 1)) orelse return null;
+                defer gpa.free(s);
+                const p = try srcParen(gpa, s);
+                defer gpa.free(p);
+                return air_expr.render(gpa, .not_, .{ .operand = p });
+            },
+            else => {},
+        }
+        // 二元：算术 / 位运算 / 比较都是 `bin_op` 载荷。
+        if (binOpStr(tag)) |ops| {
+            _ = ops;
+            const tag2: air_expr.Tag = switch (tag) {
+                .add, .add_safe, .add_optimized => .add,
+                .add_wrap => .add_wrap,
+                .sub, .sub_safe, .sub_optimized => .sub,
+                .sub_wrap => .sub_wrap,
+                .mul, .mul_safe, .mul_optimized => .mul,
+                .mul_wrap => .mul_wrap,
+                .div_trunc, .div_trunc_optimized => .div_trunc,
+                .rem, .rem_optimized => .rem,
+                .bit_and => .bit_and,
+                .bit_or => .bit_or,
+                .xor => .xor,
+                .shl, .shl_exact => .shl,
+                .shr, .shr_exact => .shr,
+                else => return null,
+            };
+            return try self.renderBinSrc(gpa, d.bin_op.lhs, d.bin_op.rhs, tag2, depth);
+        }
+        switch (tag) {
+            .cmp_lt, .cmp_lt_optimized => return try self.renderBinSrc(gpa, d.bin_op.lhs, d.bin_op.rhs, .cmp_lt, depth),
+            .cmp_lte, .cmp_lte_optimized => return try self.renderBinSrc(gpa, d.bin_op.lhs, d.bin_op.rhs, .cmp_lte, depth),
+            .cmp_gt, .cmp_gt_optimized => return try self.renderBinSrc(gpa, d.bin_op.lhs, d.bin_op.rhs, .cmp_gt, depth),
+            .cmp_gte, .cmp_gte_optimized => return try self.renderBinSrc(gpa, d.bin_op.lhs, d.bin_op.rhs, .cmp_gte, depth),
+            .cmp_eq, .cmp_eq_optimized => return try self.renderBinSrc(gpa, d.bin_op.lhs, d.bin_op.rhs, .cmp_eq, depth),
+            .cmp_neq, .cmp_neq_optimized => return try self.renderBinSrc(gpa, d.bin_op.lhs, d.bin_op.rhs, .cmp_neq, depth),
+            else => return null,
+        }
+    }
+
+    /// 非尾递归的现场还原：整条 return 表达式 + 递归实参 + 「调用之后的那一步」。
+    /// 只在函数**只有一条 ret** 时还原——多出口时最后一条未必是当前路径，
+    /// 说错了比不说更糟。
+    fn renderNontailExtra(
+        self: *Lower,
+        gpa: std.mem.Allocator,
+        call_inst: Air.Inst.Index,
+    ) std.mem.Allocator.Error!?diag.Extra {
+        const body = self.air.getMainBody();
+        var ret_inst: ?Air.Inst.Index = null;
+        var ret_n: usize = 0;
+        for (body) |bi| {
+            const t = self.air.instructions.items(.tag)[@backingInt(bi)];
+            if (t == .ret or t == .ret_safe) {
+                ret_n += 1;
+                ret_inst = bi;
+            }
+        }
+        if (ret_n != 1) return null;
+        const rop = self.air.instructions.items(.data)[@backingInt(ret_inst.?)].un_op;
+        const expr = (try self.renderRefSrc(gpa, rop, 0)) orelse return null;
+
+        var post: []const u8 = "";
+        if (rop.toIndex()) |ri| {
+            const t2 = self.air.instructions.items(.tag)[@backingInt(ri)];
+            const d2 = self.air.instructions.items(.data)[@backingInt(ri)];
+            if (binOpStr(t2)) |ops| {
+                const lhs_is_call = if (d2.bin_op.lhs.toIndex()) |li| li == call_inst else false;
+                if (lhs_is_call) {
+                    const r = (try self.renderRefSrc(gpa, d2.bin_op.rhs, 1)) orelse return null;
+                    const rp = try srcParen(gpa, r);
+                    post = try std.fmt.allocPrint(gpa, "{s} {s}", .{ ops, rp });
+                }
+            }
+        }
+
+        const ci = self.air.unwrapCall(call_inst);
+        var abuf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer abuf.deinit(gpa);
+        for (ci.args, 0..) |a, i| {
+            if (i > 0) try abuf.appendSlice(gpa, ", ");
+            const s = (try self.renderRefSrc(gpa, a, 1)) orelse return null;
+            const p = try srcParen(gpa, s);
+            try abuf.appendSlice(gpa, p);
+        }
+        return .{ .expr = expr, .post = post, .args_src = try abuf.toOwnedSlice(gpa) };
+    }
+
     // ---- 多字节（u16/u32）表示与固定模板 ----
     //
     // 约定：一个 u16 值放在**两个连续 vreg 槽**里（低字节在前），u32 四个；
@@ -1072,19 +1308,49 @@ const Lower = struct {
         var i: u8 = 0;
         while (i < n) : (i += 1) self.wide_blk[base + i] = true;
         if (self.scratch_n < self.scratch_runs.len) {
-            self.scratch_runs[self.scratch_n] = .{ .base = base, .n = n, .last = self.airLastRead(owner) };
+            self.scratch_runs[self.scratch_n] = .{
+                .base = base,
+                .n = n,
+                .last = self.airLastRead(owner),
+                .body = @intFromPtr(self.cur_body.ptr),
+            };
             self.scratch_n += 1;
         }
         return base;
     }
 
     /// 回收所有「最后读取点已经过去」的 scratch。
-    fn freeDeadScratch(self: *Lower, at: usize) void {
+    /// `cur` 是**当前 AIR 指令**（不是 body 下标）；只有同一 body 内才比。
+    fn freeDeadScratch(self: *Lower, cur: Air.Inst.Index) void {
+        const cur_id: usize = @backingInt(cur);
+        const cur_body: usize = @intFromPtr(self.cur_body.ptr);
         var w: u8 = 0;
         var i: u8 = 0;
         while (i < self.scratch_n) : (i += 1) {
             const r = self.scratch_runs[i];
-            if (r.last >= at) {
+            if (r.body != cur_body or r.last >= cur_id) {
+                self.scratch_runs[w] = r;
+                w += 1;
+                continue;
+            }
+            var k: u8 = 0;
+            while (k < r.n) : (k += 1) {
+                self.slot_used[@intCast(@as(u16, r.base) + k)] = false;
+                self.wide_blk[@intCast(@as(u16, r.base) + k)] = false;
+            }
+        }
+        self.scratch_n = w;
+    }
+
+    /// body 退出时回收它内部创建的所有 scratch：嵌套块展开完就该还槽，
+    /// 否则这些槽会跟着外层函数一直占着（DSEG 只有 80 字节）。
+    fn freeScratchOfBody(self: *Lower, body: []const Air.Inst.Index) void {
+        const id = @intFromPtr(body.ptr);
+        var w: u8 = 0;
+        var i: u8 = 0;
+        while (i < self.scratch_n) : (i += 1) {
+            const r = self.scratch_runs[i];
+            if (r.body != id) {
                 self.scratch_runs[w] = r;
                 w += 1;
                 continue;
@@ -1267,6 +1533,17 @@ const Lower = struct {
 
     /// 带「可直接粘贴的 Zig 改写代码」的拒绝：错误里用真实函数名、形参类型与返回类型。
     fn failFix(self: *Lower, kind: diag.Kind, comptime fmt: []const u8, args: anytype) codegen.Error {
+        return self.failFixCtx(kind, null, fmt, args);
+    }
+
+    /// 带 AIR 现场信息的版本：`extra` 里的源码片段会写进改写建议。
+    fn failFixCtx(
+        self: *Lower,
+        kind: diag.Kind,
+        extra: ?diag.Extra,
+        comptime fmt: []const u8,
+        args: anytype,
+    ) codegen.Error {
         const ip = &self.zcu.intern_pool;
         const ft = ip.indexToKey(self.fn_ty.toIntern()).func_type;
         const pts = ft.param_types.get(ip);
@@ -1275,21 +1552,10 @@ const Lower = struct {
         for (pts, 0..) |pi, i| names[i] = self.typeName(Type.fromInterned(pi));
 
         // 尽量用源码里的真实参数名（n / m），拿不到才退回 a0 / a1。
-        var pnames: ?[]const []const u8 = null;
-        defer if (pnames) |pn| self.gpa.free(pn);
-        const lazy = self.zcu.navSrcLoc(self.nav);
-        if (lazy.baseline.resolve(self.zcu)) |resolved| {
-            const file_idx, const base_node = resolved;
-            _ = base_node;
-            const file = self.zcu.fileByIndex(file_idx);
-            if (file.getSource(self.zcu)) |src| {
-                pnames = diag.paramNamesFromSource(self.gpa, src[0..src.len],
-                    self.short_name, pts.len) catch null;
-            } else |_| {}
-        }
+        const pnames: ?[]const []const u8 = self.param_names;
 
         const fix = diag.render(self.gpa, kind, self.short_name, names, pnames,
-            self.typeName(self.fn_ty.fnReturnType(self.zcu))) catch return error.OutOfMemory;
+            self.typeName(self.fn_ty.fnReturnType(self.zcu)), extra) catch return error.OutOfMemory;
         defer self.gpa.free(fix);
         const head = std.fmt.allocPrint(self.gpa, "mcs2: " ++ fmt, args) catch return error.OutOfMemory;
         defer self.gpa.free(head);
@@ -2959,6 +3225,14 @@ const Lower = struct {
     }
 
     fn emitBody(self: *Lower, body: []const Air.Inst.Index) codegen.Error!bool {
+    // scratch 的生命周期按 body 分区：进来记录、退出整段回收，嵌套块的槽
+    // 不会跟着外层函数一直占着。
+    const prev_body = self.cur_body;
+    self.cur_body = body;
+    defer {
+        self.freeScratchOfBody(body);
+        self.cur_body = prev_body;
+    }
     var skip_idx: ?usize = null;
     for (body, 0..) |inst, idx| {
         if (skip_idx) |s| {
@@ -2982,7 +3256,7 @@ const Lower = struct {
             => self.scratchConsumerOk(body, idx),
             else => false,
         };
-        self.freeDeadScratch(idx);
+        self.freeDeadScratch(inst);
         defer self.flushTempsKeep(self.resultSlot(inst));
         const tag = self.air.instructions.items(.tag)[@backingInt(inst)];
         const data = self.air.instructions.items(.data)[@backingInt(inst)];
@@ -3969,8 +4243,14 @@ const Lower = struct {
                 // 结果错却不报错。尾递归上面已转成 ljmp（等价于循环），只拒绝非尾形态。
                 if (callee_nav) |cn| {
                     if (cn == self.nav) {
-                        return self.failFix(
+                        // M1：从 AIR 还原真实写法（`return f(n-1) * 2`），让建议
+                        // 里的累加器版本带真实实参与真实运算，而不是全占位符。
+                        var arena = std.heap.ArenaAllocator.init(self.gpa);
+                        defer arena.deinit();
+                        const extra = self.renderNontailExtra(arena.allocator(), inst) catch null;
+                        return self.failFixCtx(
                             .tail_rec,
+                            extra,
                             "非尾递归不受支持（静态参数区与局部槽不可重入）",
                             .{},
                         );
@@ -4180,6 +4460,16 @@ pub fn generate(
     defer lw.const_lines.deinit(gpa);
     defer lw.block_slots.deinit(gpa);
 
+    // 改写建议里要用源码里的真实参数名（n / m），拿不到就退回 a0 / a1。
+    {
+        const fty = ip.indexToKey(func_ty.toIntern()).func_type;
+        const pts = fty.param_types.get(ip);
+        if (pts.len > 0) {
+            lw.param_names = sourceParamNames(gpa, zcu, func.owner_nav, short_name, pts.len) catch null;
+        }
+    }
+    defer if (lw.param_names) |pn| gpa.free(pn);
+
     const body = air.getMainBody();
     lw.vals = try gpa.alloc(?Loc, air.instructions.len);
     defer gpa.free(lw.vals);
@@ -4254,6 +4544,23 @@ pub fn generate(
     // M2.14：先做基本块内槽位复用，再挑可驻留工作寄存器的热点值。
     // 宽块的定义、读取、重命名与邻接约束必须完整，否则比较和间接调用会读旧槽。
     lw.reuseSlots();
+
+    // 重复复杂算法压缩：统计会话内反复出现的直线算术块，把块体压成一份
+    // 共享子程序，站点改发 lcall。
+    //
+    // **必须排在寄存器分配之前**：assignRegisters 会把 dst==lhs 的热点值搬进
+    // r5/r6/r7（`.vreg` 变成 `.dir`），块内的操作数就不再是纯 vreg，整块被
+    // 判定成「不可共享」而失效（槽回收把 vreg 编号压回 bank0 之后暴露）。
+    // 放在这里还有个附带好处：共享例程统一用 DSEG 槽，不会被映射到工作寄存器。
+    //
+    // ISR 不参与：中断可能打断拥有者函数，而共享例程复用的正是拥有者的静态槽。
+    // 做尺寸对照时，把下面的 enable_factor 手工改 false 再重编
+    // （与 no_reuse_wide 等诊断开关同款口径）。
+    const factor_base = session_vreg_base;
+    factor.enabled = !is_isr and enable_factor;
+    var fac = try factor.run(gpa, &lw.ops, factor_base, short_name);
+    defer fac.deinit(gpa);
+
     // M2.13：寄存器分配（PE 折叠成功时不必——常量写回没有热点值）。
     // **ISR 一律不做**：被映射到 r0–r7 的值会被中断打断的那段主程序共用，
     // 而 ISR 现场只保存 A/PSW/DPTR/B —— 回来 rN 就错了（真机上表现为「主循环不再打印」）。
@@ -4296,6 +4603,11 @@ pub fn generate(
     // comptime 常量表的数据块跟在函数体后面（同一个汇编单元，符号可见）。
     if (lw.const_lines.items.len != 0) try mir.text.appendSlice(gpa, lw.const_lines.items);
 
+    // 本函数首次出现的算法模板，把共享子程序定义接在后面。后续函数里的
+    // 同模板站点只发 lcall，符号在同一汇编单元可见（sdas8051 会解析）。
+    if (fac.defs.items.len != 0) try mir.text.appendSlice(gpa, fac.defs.items);
+    factor.dumpStats();
+
     // 中断向量跳板：绝对段 VECTORS 内 .org 到向量地址发 ljmp（函数体在 CSEG 别处）。
     if (is_isr) {
         const vec_addr: u16 = 0x0003 + 8 * isr_vector;
@@ -4330,6 +4642,24 @@ pub fn generateLazy(
         "mcs2: lazy symbols（编译器内置函数）尚未实现",
         .{},
     );
+}
+
+/// 从源码里抽出 `fn <name>(...)` 的真实参数名。任何一步拿不到就返回 null，
+/// 调用方退回 a0 / a1（改写建议的可读性退化，但不影响正确性）。
+fn sourceParamNames(
+    gpa: std.mem.Allocator,
+    zcu: *Zcu,
+    nav: InternPool.Nav.Index,
+    short_name: []const u8,
+    count: usize,
+) !?[]const []const u8 {
+    if (count == 0) return null;
+    const lazy = zcu.navSrcLoc(nav);
+    const resolved = lazy.baseline.resolve(zcu) orelse return null;
+    const file_idx, _ = resolved;
+    const file = zcu.fileByIndex(file_idx);
+    const src = file.getSource(zcu) catch return null;
+    return diag.paramNamesFromSource(gpa, src[0..src.len], short_name, count) catch null;
 }
 
 /// 函数符号修饰：`_<fqn>`，非标识符字符替换为 `_`。
