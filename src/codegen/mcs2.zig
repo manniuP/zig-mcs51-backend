@@ -3631,11 +3631,12 @@ const Lower = struct {
             .mul, .mul_safe, .mul_wrap, .div_trunc, .rem, .not => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 const info = try self.requireIntWidth(ty, "乘除/取反");
-                // 安全档乘法：8 位无符号能靠 MUL AB 的高半（B）判溢出；多字节/有符号
-                // 走的是移位加法模板，没有现成溢出标志。宁可明确报错也不静默回绕——
-                // 需要回绕语义请写 `*%`（详见改写建议）。
-                if (tag == .mul_safe and (info.bytes > 1 or info.signed)) {
-                    return self.failFix(.mul_safe, "ReleaseSafe 的多字节/有符号乘法溢出检查尚未实现", .{});
+                // 安全档乘法：8 位无符号靠 MUL AB 的高半（B）判溢出；**16 位无符号**
+                // 靠三次 MUL AB 的高字节累加进位判（见下面 n==2 的分支）。
+                // 32 位要 64 位积、有符号要处理 -2^15 / -2^31 边界，都还明确拒绝——
+                // 宁可报错也不静默回绕；需要回绕语义请写 `*%`（详见改写建议）。
+                if (tag == .mul_safe and (info.signed or info.bytes == 4)) {
+                    return self.failFix(.mul_safe, "ReleaseSafe 的 32 位/有符号乘法溢出检查尚未实现", .{});
                 }
                 if (tag == .not) {
                     if (info.bytes > 1) {
@@ -3667,6 +3668,32 @@ const Lower = struct {
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(saved_bw.?), .src = .{ .dir = 0xF0 } } });
                     }
                     const dw = blk2: {
+                        // 16 位无符号 mul_safe：三次 MUL AB 拼出 16×16→32。
+                        // 高 16 位 = (a0*b0 的高字节 + a0*b1 + a1*b0) + (a1*b1 << 8)，
+                        // 所以 **a1*b1 非零就一定溢出**（它落在 bit16 以上），
+                        // 其余三项的累加进位同样表示溢出。
+                        if (tag == .mul_safe and n == 2) {
+                            const t = try self.allocWide(2);
+                            const m0 = try self.allocVreg();
+                            const m1 = try self.allocVreg();
+                            const m2 = try self.allocVreg();
+                            const m3 = try self.allocVreg();
+                            try self.ops.append(self.gpa, .{ .mul16 = .{
+                                .lo = mcsmir.v(t),
+                                .hi = mcsmir.v(m0),
+                                .lhs = mcsmir.v(a),
+                                .rhs = mcsmir.v(b2),
+                            } });
+                            try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(m1), .lhs = mcsmir.v(a), .rhs = mcsmir.v(b2 + 1) } });
+                            try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(m2), .lhs = mcsmir.v(a + 1), .rhs = mcsmir.v(b2) } });
+                            try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(m3), .lhs = mcsmir.v(a + 1), .rhs = mcsmir.v(b2 + 1) } });
+                            try self.ops.append(self.gpa, .{ .br_ifnz = .{ .cond = mcsmir.v(m3), .target = self.panicTarget() } });
+                            try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(t + 1), .lhs = mcsmir.v(m0), .rhs = mcsmir.v(m1) } });
+                            try self.ops.append(self.gpa, .{ .br_c = .{ .target = self.panicTarget(), .on_set = true } });
+                            try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(t + 1), .lhs = mcsmir.v(t + 1), .rhs = mcsmir.v(m2) } });
+                            try self.ops.append(self.gpa, .{ .br_c = .{ .target = self.panicTarget(), .on_set = true } });
+                            break :blk2 t;
+                        }
                         if (tag == .mul or tag == .mul_wrap) {
                             const t = try self.allocWide(n);
                             try self.mulWide(t, a, b2, n);
@@ -3752,9 +3779,14 @@ const Lower = struct {
                 //
                 // 只在「常量次数 1..31」时走：`djnz` 是先减后判，次数 0 会转 256
                 // 次；次数 ≥32 在 Zig 里是未定义行为，保持原路径让安全档介入。
-                if (tag == .shr and info.bytes == 4 and info.signed and
-                    cnt >= 1 and cnt <= 31 and rtlib.enabled)
-                {
+                // 4 字节常量次数 1..31 一律走 rtlib 手写模板（左移 / 逻辑右移 / 算术右移
+                // 各一份）。`djnz` 是先减后判，次数 0 会转 256 次；次数 ≥32 在 Zig 里是
+                // 未定义行为，保持原路径让安全档介入。
+                const rt_id: ?rtlib.Id = if (info.bytes == 4 and cnt >= 1 and cnt <= 31 and rtlib.enabled)
+                    (if (left) rtlib.Id.shl32 else if (info.signed) rtlib.Id.sar32 else rtlib.Id.shr32)
+                else
+                    null;
+                if (rt_id) |rid| {
                     const a_rt = try self.wideOperand(bin.lhs, 4);
                     // 模板原地改槽，所以只有在 lhs 此后不再被读时才能直接复用；
                     // 否则先复制一份到新槽（12 B），别把还活着的值改掉。
@@ -3770,18 +3802,19 @@ const Lower = struct {
                         var k: u8 = 0;
                         while (k < 4) : (k += 1) try self.movTo(d_rt + k, mcsmir.v(a_rt + k));
                     }
-                    // 槽基址 +3 = 最高字节，模板从高到低逐字节右移。
+                    // 右移从最高字节往下走（槽基址 +3），左移从最低字节往上走。
+                    const start: u8 = if (left) d_rt else d_rt + 3;
                     try self.ops.append(self.gpa, .{ .lea_r_vreg = .{
                         .dst = .{ .dir = 0x01 },
-                        .src = mcsmir.v(d_rt + 3),
+                        .src = mcsmir.v(start),
                     } });
                     try self.ops.append(self.gpa, .{ .mov = .{
                         .dst = .{ .dir = 0x00 },
                         .src = .{ .imm = cnt },
                     } });
-                    try self.ops.append(self.gpa, .{ .lcall = .{ .sym = rtlib.sym(.sar32) } });
+                    try self.ops.append(self.gpa, .{ .lcall = .{ .sym = rtlib.sym(rid) } });
                     // 模板符号是汇编单元局部的：本单元第一次用到时才把文本带出去。
-                    if (rtlib.take(.sar32)) self.rt_new |= 1;
+                    if (rtlib.take(rid)) self.rt_new |= @as(u64, 1) << @intCast(@intFromEnum(rid));
                     self.vals[@backingInt(inst)] = mcsmir.v(d_rt);
                     self.wide[@backingInt(inst)] = @as(u16, d_rt) | (@as(u16, 4) << 8);
                     continue;

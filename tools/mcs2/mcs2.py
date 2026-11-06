@@ -354,7 +354,17 @@ CASES: dict[str, dict] = {
                      want32=0x7FFFFFFF),
     "sar32":    dict(kind="call", src="sar.zig", fn="sar32",
                      args=[("DPL", 0xF0), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF)],
-                     want32=0xFFFFFFFE, want_rt=1),
+                     want32=0xFFFFFFFE, want_rt=1, rt_sym="_mcs_rt_sar32"),
+    # 同一家族的另外两份模板：逻辑右移 / 左移（含跨字节进位）
+    "shr32t": dict(kind="call", src="sar.zig", fn="shr32t",
+                   args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x80)],
+                   want32=0x08000000, want_rt=1, rt_sym="_mcs_rt_shr32"),
+    "shl32t": dict(kind="call", src="sar.zig", fn="shl32t",
+                   args=[("DPL", 0x78), ("DPH", 0x56), ("B", 0x34), ("ACC", 0x12)],
+                   want32=0x23456780, want_rt=1, rt_sym="_mcs_rt_shl32"),
+    "shl32c": dict(kind="call", src="sar.zig", fn="shl32c",
+                   args=[("DPL", 0xFF), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x00)],
+                   want32=0x0000FF00, want_rt=1, rt_sym="_mcs_rt_shl32"),
     # 运行期移位次数：必须仍走内联循环（次数进 r0 时 djnz 先减后判，0 会转 256 次）。
     "sar32v":   dict(kind="call", src="rtvar.zig", fn="sar32v",
                      args=[("DPL", 0xBE), ("DPH", 0xBA), ("B", 0xFE), ("ACC", 0xCA),
@@ -625,6 +635,14 @@ CASES: dict[str, dict] = {
     "safe_sub_ov": dict(kind="call", src="safe.zig", fn="safe_sub", args=[("DPL", 3), ("PARM2", 10)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
     "safe_mul_ok": dict(kind="call", src="safe.zig", fn="safe_mul", args=[("DPL", 3), ("PARM2", 4)], want=0x0C, opt="ReleaseSafe"),
     "safe_mul_ov": dict(kind="call", src="safe.zig", fn="safe_mul", args=[("DPL", 20), ("PARM2", 20)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
+    # 16 位无符号：300*200=60000 正常；300*300=90000 溢出 → 停机（0x5A）
+    "safe_mul16_ok": dict(kind="call", src="safemul.zig", fn="safe_mul16",
+                          args=[("DPL", 0x2C), ("DPH", 0x01), ("PARM_2", 0xC8), ("PARM_3", 0x00)],
+                          want16=60000, opt="ReleaseSafe", steps=4000),
+    "safe_mul16_ov": dict(kind="call", src="safemul.zig", fn="safe_mul16",
+                          args=[("DPL", 0x2C), ("DPH", 0x01), ("PARM_2", 0x2C), ("PARM_3", 0x01)],
+                          want16=0x5555, opt="ReleaseSafe", sentinel=0x55,
+                          expect_mem={0x8100: 0x5A}, steps=4000),
     # 有符号走 OV 判据（PSW.2），不是进位判据。
     "safe_sadd_ok": dict(kind="call", src="safe.zig", fn="safe_sadd", args=[("DPL", 10), ("PARM2", 20)], want=30, opt="ReleaseSafe"),
     "safe_sadd_ov": dict(kind="call", src="safe.zig", fn="safe_sadd", args=[("DPL", 100), ("PARM2", 100)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
@@ -654,7 +672,7 @@ CASES: dict[str, dict] = {
                             want_err="非尾递归不受支持", want_code="rec_bad__tail(n, 0)",
                             want_code2="rec_bad((n - 1)) + 1"),
     # 改写建议：错误信息里必须出现可直接粘贴的 Zig 代码，而不只是中文说明。
-    "diag_mul_reject": dict(kind="reject", src="diag_mul.zig", opt="ReleaseSafe", want_err="乘法溢出检查", want_code="a *% b"),
+    "diag_mul_reject": dict(kind="reject", src="diag_mul.zig", opt="ReleaseSafe", want_err="32 位/有符号乘法溢出检查", want_code="a *% b"),
     "diag_addr": dict(kind="call", src="diag_addr.zig", fn="diag_addr", args=[], want16=3, steps=2000),
     "diag_switch_reject": dict(kind="reject", src="diag_switch.zig", opt="ReleaseSafe", want_err="switch 的判定值", want_code="handlers[op](arg)"),
     "diag_dim": dict(kind="call", src="diag_dim.zig", fn="diag_dim",
@@ -681,6 +699,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "mul8", "div8", "rem8", "not8", "xnor8",
          "u16add", "u16sub", "u16carry", "u16shl", "u16shr", "u32add", "u32carry",
          "sexcmp", "sexcmp2", "sex16", "i32add", "sar32", "sar8",
+         "shr32t", "shl32t", "shl32c",
          "ucmp_eq", "ucmp_gt", "ucmp_lt", "wbits",
          "u16mul", "u16mul2", "i16mul", "u32mul",
          "u16div", "u16rem", "u32div", "u32rem", "i32div", "i32rem", "i8div", "i8rem", "i16div",
@@ -704,6 +723,7 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "safe_mul_ok", "safe_mul_ov", "safe_sadd_ok", "safe_sadd_ov",
          "safe_bounds_ok", "safe_bounds_ov", "safe_rec_reject",
          "safe_div8", "safe_div8z", "safe_div32z", "safe_rem32z",
+         "safe_mul16_ok", "safe_mul16_ov",
          "diag_mul_reject", "diag_addr", "diag_switch_reject", "diag_dim",
          "factor_a", "factor_b", "factor_c", "factor_cheap", "sar32v"]
 
@@ -767,7 +787,8 @@ def check_call(name: str, spec: dict) -> bool:
         if n < spec["want_rt"]:
             print(f"FAIL: 期望至少 {spec['want_rt']} 处 rtlib 模板调用，实际 {n} 处")
             return False
-        if text.count("\n_mcs_rt_sar32:") != 1:
+        sym = spec.get("rt_sym") or "_mcs_rt_sar32"
+        if text.count("\n" + sym + ":") != 1:
             print("FAIL: rtlib 模板文本应恰好出现一次（符号单元局部，重复定义会链接失败）")
             return False
         print(f"  PASS: {name} rtlib 模板调用 {n} 处，模板本体 1 份")

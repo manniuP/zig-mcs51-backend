@@ -23,7 +23,7 @@
 
 const std = @import("std");
 
-pub const Id = enum { sar32 };
+pub const Id = enum { sar32, shr32, shl32 };
 
 pub const Template = struct {
     /// 符号名（单元局部，不加 .globl）。
@@ -76,8 +76,78 @@ const sar32_text =
     \\
 ;
 
+/// 32 位**逻辑**右移。
+///
+/// 入：r0 = 移位次数（1..31），r1 = 槽基址 + 3（最高字节）。
+/// 出：原地写回同一组槽。
+///
+/// 与 sar32 只差一处：每轮开头 `clr c`（移入 0），不需要每轮取符号位。
+const shr32_text =
+    \\
+    \\    .area CSEG (CODE)
+    \\_mcs_rt_shr32:
+    \\L_mcs_rt_shr32:
+    \\    clr c
+    \\    mov a,@r1
+    \\    rrc a
+    \\    mov @r1,a
+    \\    dec r1
+    \\    mov a,@r1
+    \\    rrc a
+    \\    mov @r1,a
+    \\    dec r1
+    \\    mov a,@r1
+    \\    rrc a
+    \\    mov @r1,a
+    \\    dec r1
+    \\    mov a,@r1
+    \\    rrc a
+    \\    mov @r1,a
+    \\    inc r1
+    \\    inc r1
+    \\    inc r1
+    \\    djnz r0,L_mcs_rt_shr32
+    \\    ret
+    \\
+;
+
+/// 32 位左移。
+///
+/// 入：r0 = 移位次数（1..31），r1 = 槽基址（**最低字节**，与右移相反）。
+/// 出：原地写回同一组槽。
+const shl32_text =
+    \\
+    \\    .area CSEG (CODE)
+    \\_mcs_rt_shl32:
+    \\L_mcs_rt_shl32:
+    \\    clr c
+    \\    mov a,@r1
+    \\    rlc a
+    \\    mov @r1,a
+    \\    inc r1
+    \\    mov a,@r1
+    \\    rlc a
+    \\    mov @r1,a
+    \\    inc r1
+    \\    mov a,@r1
+    \\    rlc a
+    \\    mov @r1,a
+    \\    inc r1
+    \\    mov a,@r1
+    \\    rlc a
+    \\    mov @r1,a
+    \\    dec r1
+    \\    dec r1
+    \\    dec r1
+    \\    djnz r0,L_mcs_rt_shl32
+    \\    ret
+    \\
+;
+
 pub const templates = [_]Template{
     .{ .sym = "_mcs_rt_sar32", .text = sar32_text },
+    .{ .sym = "_mcs_rt_shr32", .text = shr32_text },
+    .{ .sym = "_mcs_rt_shl32", .text = shl32_text },
 };
 
 pub const count = templates.len;
@@ -165,6 +235,8 @@ test "take 只对新模板返回 true" {
     defer reset();
     try std.testing.expect(take(.sar32));
     try std.testing.expect(!take(.sar32));
+    try std.testing.expect(take(.shr32));
+    try std.testing.expect(take(.shl32));
     reset();
     try std.testing.expect(take(.sar32));
 }
