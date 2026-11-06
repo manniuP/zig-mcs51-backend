@@ -91,6 +91,10 @@ const account_wide: bool = false;
 const enable_factor: bool = true;
 /// 运行时模板库（手写汇编标准算子）总开关，同款用法。
 const enable_rtlib: bool = true;
+
+/// 32 位乘法走 16×16 分块展开版（速度优先）。体积优先时保持 false：
+/// 实测 BIN 增量 +164 B（移位加法循环）vs +251 B（分块展开），见 mulWide。
+const mul32_block: bool = false;
 /// 统计开关：打印每个 .alloc 的逃逸判定。
 const alloc_report: bool = false; // 统计开关（看 alloc 逃逸情况时临时改 true） // 记账开关
 
@@ -1159,6 +1163,82 @@ const Lower = struct {
     ///   n=4（32×32→32 低半，移位加法循环，代码 ~55B）：
     ///     逐位取 a 的 MSB：dst <<= 1；位为 1 则 dst += b。
     ///     展开的 10 次 MUL 版本要 ~200B，51 上代码比周期贵，选循环。
+    /// 16×16 → 32 位无符号乘积（dst 起 4 字节，低字节在前）。
+    ///
+    /// 四次 MUL AB 拼出来：p0 = a0b0（16 位）、p3 = a1b1（16 位），
+    /// 交叉项 a0b1 与 a1b0 只贡献低 8 位的高字节位置。
+    fn mul16Full(self: *Lower, dst: u8, a: u8, b: u8) codegen.Error!void {
+        const p0hi = try self.allocVreg();
+        const m1 = try self.allocVreg();
+        const m2 = try self.allocVreg();
+        const p3lo = try self.allocVreg();
+        const p3hi = try self.allocVreg();
+        const tlo = try self.allocVreg();
+        const thi = try self.allocVreg();
+        try self.ops.append(self.gpa, .{ .mul16 = .{
+            .lo = mcsmir.v(dst),
+            .hi = mcsmir.v(p0hi),
+            .lhs = mcsmir.v(a),
+            .rhs = mcsmir.v(b),
+        } });
+        try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(m1), .lhs = mcsmir.v(a), .rhs = mcsmir.v(b + 1) } });
+        try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(m2), .lhs = mcsmir.v(a + 1), .rhs = mcsmir.v(b) } });
+        try self.ops.append(self.gpa, .{ .mul16 = .{
+            .lo = mcsmir.v(p3lo),
+            .hi = mcsmir.v(p3hi),
+            .lhs = mcsmir.v(a + 1),
+            .rhs = mcsmir.v(b + 1),
+        } });
+        // (thi:tlo) = p0hi + m1 + m2 —— 两次 8 位加法的进位都进 thi
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(tlo), .lhs = mcsmir.v(p0hi), .rhs = mcsmir.v(m1) } });
+        try self.ops.append(self.gpa, .{ .imm = .{ .dst = mcsmir.v(thi), .value = 0 } });
+        try self.ops.append(self.gpa, .{ .addc = .{ .dst = mcsmir.v(thi), .lhs = mcsmir.v(thi), .rhs = .{ .imm = 0 } } });
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(tlo), .lhs = mcsmir.v(tlo), .rhs = mcsmir.v(m2) } });
+        try self.ops.append(self.gpa, .{ .addc = .{ .dst = mcsmir.v(thi), .lhs = mcsmir.v(thi), .rhs = .{ .imm = 0 } } });
+        // dst[1] = tlo；dst[2] = p3lo + thi；dst[3] = p3hi + 进位
+        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dst + 1), .src = mcsmir.v(tlo) } });
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(dst + 2), .lhs = mcsmir.v(p3lo), .rhs = mcsmir.v(thi) } });
+        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(dst + 3), .src = mcsmir.v(p3hi) } });
+        try self.ops.append(self.gpa, .{ .addc = .{ .dst = mcsmir.v(dst + 3), .lhs = mcsmir.v(dst + 3), .rhs = .{ .imm = 0 } } });
+    }
+
+    /// 32×32 → 低 32 位（模 2^32）：16×16 分块。
+    ///
+    /// a·b = aL·bL + (aL·bH + aH·bL)·2^16，aH·bH 整体落在 2^32 以上直接丢弃。
+    /// 交叉项只需要低 16 位：`aL·bH = a0·b2 + (a0·b3 + a1·b2)·2^8`（再高的位丢弃）。
+    ///
+    /// 比原来的 32 轮移位加法（164 B）小一半以上：MUL AB 一次出 16 位。
+    fn mul32Fast(self: *Lower, dst: u8, a: u8, b: u8) codegen.Error!void {
+        try self.mul16Full(dst, a, b);
+        const t1lo = try self.allocVreg();
+        const t1hi = try self.allocVreg();
+        const t2lo = try self.allocVreg();
+        const t2hi = try self.allocVreg();
+        const x = try self.allocVreg();
+        const y = try self.allocVreg();
+        const slo = try self.allocVreg();
+        const shi = try self.allocVreg();
+        // T1 = aL·bH 的低 16 位
+        try self.ops.append(self.gpa, .{ .mul16 = .{ .lo = mcsmir.v(t1lo), .hi = mcsmir.v(t1hi), .lhs = mcsmir.v(a), .rhs = mcsmir.v(b + 2) } });
+        try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(x), .lhs = mcsmir.v(a), .rhs = mcsmir.v(b + 3) } });
+        try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(y), .lhs = mcsmir.v(a + 1), .rhs = mcsmir.v(b + 2) } });
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(x), .lhs = mcsmir.v(x), .rhs = mcsmir.v(y) } });
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(t1hi), .lhs = mcsmir.v(t1hi), .rhs = mcsmir.v(x) } });
+        // T2 = aH·bL 的低 16 位
+        try self.ops.append(self.gpa, .{ .mul16 = .{ .lo = mcsmir.v(t2lo), .hi = mcsmir.v(t2hi), .lhs = mcsmir.v(a + 2), .rhs = mcsmir.v(b) } });
+        try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(x), .lhs = mcsmir.v(a + 2), .rhs = mcsmir.v(b + 1) } });
+        try self.ops.append(self.gpa, .{ .mul = .{ .dst = mcsmir.v(y), .lhs = mcsmir.v(a + 3), .rhs = mcsmir.v(b) } });
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(x), .lhs = mcsmir.v(x), .rhs = mcsmir.v(y) } });
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(t2hi), .lhs = mcsmir.v(t2hi), .rhs = mcsmir.v(x) } });
+        // S = T1 + T2（16 位，丢弃到 2^16 以上的进位）
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(slo), .lhs = mcsmir.v(t1lo), .rhs = mcsmir.v(t2lo) } });
+        try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(shi), .src = mcsmir.v(t1hi) } });
+        try self.ops.append(self.gpa, .{ .addc = .{ .dst = mcsmir.v(shi), .lhs = mcsmir.v(shi), .rhs = mcsmir.v(t2hi) } });
+        // dst[2..3] += S
+        try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(dst + 2), .lhs = mcsmir.v(dst + 2), .rhs = mcsmir.v(slo) } });
+        try self.ops.append(self.gpa, .{ .addc = .{ .dst = mcsmir.v(dst + 3), .lhs = mcsmir.v(dst + 3), .rhs = mcsmir.v(shi) } });
+    }
+
     fn mulWide(self: *Lower, dst: u8, a: u8, b: u8, n: u8) !void {
         if (n == 2) {
             const t0 = try self.allocVreg();
@@ -1171,6 +1251,12 @@ const Lower = struct {
             try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(dst + 1), .lhs = mcsmir.v(dst + 1), .rhs = mcsmir.v(t2) } });
             return;
         }
+        // 32 位：16×16 分块（展开版）。
+        // **默认关闭**：实测 BIN 增量 +164 → +251 B，反而更大——展开消掉了循环，
+        // 但 10 个临时槽的 `mov a,槽` / `mov 槽,a` 搬运把收益吃光了（8 位机没有
+        // 三操作数指令，每次乘法都要过 A）。速度是快的，要换速度改这个开关；
+        // 体积优先时走下面的移位加法循环。
+        if (n == 4 and mul32_block) return self.mul32Fast(dst, a, b);
         // 内部工作副本只在本次乘法里用（结果另有一块）→ 用临时槽，指令结束就还池。
         // 原来用 allocWide 会永久占 n 字节：hypot 里两次 u32 乘法白扔 8 B。
         const t = try self.allocTempWide(n);
