@@ -643,6 +643,99 @@ CASES: dict[str, dict] = {
                           args=[("DPL", 0x2C), ("DPH", 0x01), ("PARM_2", 0x2C), ("PARM_3", 0x01)],
                           want16=0x5555, opt="ReleaseSafe", sentinel=0x55,
                           expect_mem={0x8100: 0x5A}, steps=4000),
+    # 32 位无符号：mulFull 拿 64 位积，高 32 位判零。
+    # 0xFFFF*0xFFFF = 0xFFFE0001 是最大不溢出的边界。
+    "safe_mul32_max": dict(kind="call", src="safemul32.zig", fn="safe_mul32",
+                           args=[("DPL", 0xFF), ("DPH", 0xFF), ("B", 0x00), ("ACC", 0x00),
+                                 ("PARM_2", 0xFF), ("PARM_3", 0xFF), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                           want32=0xFFFE0001, opt="ReleaseSafe", steps=20000),
+    "safe_mul32_ok": dict(kind="call", src="safemul32.zig", fn="safe_mul32",
+                          args=[("DPL", 0xE8), ("DPH", 0x03), ("B", 0x00), ("ACC", 0x00),
+                                ("PARM_2", 0xE8), ("PARM_3", 0x03), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                          want32=1000000, opt="ReleaseSafe", steps=20000),
+    # 0x10000 * 0x10000 = 2^32：低 32 位全零，唯一能抓住它的就是高位判据。
+    "safe_mul32_ov": dict(kind="call", src="safemul32.zig", fn="safe_mul32",
+                          args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x01), ("ACC", 0x00),
+                                ("PARM_2", 0x00), ("PARM_3", 0x00), ("PARM_4", 0x01), ("PARM_5", 0x00)],
+                          want32=0x55555555, opt="ReleaseSafe", sentinel=0x55,
+                          expect_mem={0x8100: 0x5A}, steps=20000),
+    # 判据不能误报：乘 1 保持原值，以及「小乘大」这类中间值接近上限的情形。
+    "safe_mul32_one": dict(kind="call", src="safemul32.zig", fn="safe_mul32",
+                           args=[("DPL", 0xFF), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF),
+                                 ("PARM_2", 0x01), ("PARM_3", 0x00), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                           want32=0xFFFFFFFF, opt="ReleaseSafe", steps=20000),
+    "safe_mul32_big": dict(kind="call", src="safemul32.zig", fn="safe_mul32",
+                           args=[("DPL", 0xFF), ("DPH", 0xFF), ("B", 0x00), ("ACC", 0x00),
+                                 ("PARM_2", 0x00), ("PARM_3", 0x00), ("PARM_4", 0x01), ("PARM_5", 0x00)],
+                           want32=0xFFFF0000, opt="ReleaseSafe", steps=20000),
+    # 有符号乘法：绝对值走无符号判据，再按结果符号卡边界。
+    # i32：-2*3 正常；INT32_MIN*1 合法；INT32_MIN*-1 与 2^32 都溢出。
+    "safe_imul32_ok": dict(kind="call", src="safemul32i.zig", fn="safe_imul32",
+                           args=[("DPL", 0xFE), ("DPH", 0xFF), ("B", 0xFF), ("ACC", 0xFF),
+                                 ("PARM_2", 0x03), ("PARM_3", 0x00), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                           want32=0xFFFFFFFA, opt="ReleaseSafe", steps=20000),
+    "safe_imul32_min": dict(kind="call", src="safemul32i.zig", fn="safe_imul32",
+                            args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x80),
+                                  ("PARM_2", 0x01), ("PARM_3", 0x00), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                            want32=0x80000000, opt="ReleaseSafe", steps=20000),
+    "safe_imul32_ov_min": dict(kind="call", src="safemul32i.zig", fn="safe_imul32",
+                               args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x00), ("ACC", 0x80),
+                                     ("PARM_2", 0xFF), ("PARM_3", 0xFF), ("PARM_4", 0xFF), ("PARM_5", 0xFF)],
+                               want32=0x55555555, opt="ReleaseSafe", sentinel=0x55,
+                               expect_mem={0x8100: 0x5A}, steps=20000),
+    "safe_imul32_ov": dict(kind="call", src="safemul32i.zig", fn="safe_imul32",
+                           args=[("DPL", 0x00), ("DPH", 0x00), ("B", 0x01), ("ACC", 0x00),
+                                 ("PARM_2", 0x00), ("PARM_3", 0x00), ("PARM_4", 0x01), ("PARM_5", 0x00)],
+                           want32=0x55555555, opt="ReleaseSafe", sentinel=0x55,
+                           expect_mem={0x8100: 0x5A}, steps=20000),
+    "safe_imul32_big": dict(kind="call", src="safemul32i.zig", fn="safe_imul32",
+                            args=[("DPL", 0x04), ("DPH", 0xB5), ("B", 0x00), ("ACC", 0x00),
+                                  ("PARM_2", 0x04), ("PARM_3", 0xB5), ("PARM_4", 0x00), ("PARM_5", 0x00)],
+                            want32=2147395600, opt="ReleaseSafe", steps=20000),
+    # i16：-200*100；-32768*1 合法；-32768*-1 = 32768 溢出。
+    "safe_imul16_ok": dict(kind="call", src="safemul16i.zig", fn="safe_imul16",
+                           args=[("DPL", 0x38), ("DPH", 0xFF), ("PARM_2", 0x64), ("PARM_3", 0x00)],
+                           want16=0xB1E0, opt="ReleaseSafe", steps=4000),
+    "safe_imul16_min": dict(kind="call", src="safemul16i.zig", fn="safe_imul16",
+                            args=[("DPL", 0x00), ("DPH", 0x80), ("PARM_2", 0x01), ("PARM_3", 0x00)],
+                            want16=0x8000, opt="ReleaseSafe", steps=4000),
+    "safe_imul16_ov": dict(kind="call", src="safemul16i.zig", fn="safe_imul16",
+                           args=[("DPL", 0x00), ("DPH", 0x80), ("PARM_2", 0xFF), ("PARM_3", 0xFF)],
+                           want16=0x5555, opt="ReleaseSafe", sentinel=0x55,
+                           expect_mem={0x8100: 0x5A}, steps=4000),
+    # i8：-16*8 = -128 合法；16*8 与 -16*-8 都是 +128，溢出。
+    "safe_imul8_ok": dict(kind="call", src="safemul8i.zig", fn="safe_imul8",
+                          args=[("DPL", 0xF0), ("PARM2", 0x08)], want=0x80, opt="ReleaseSafe"),
+    "safe_imul8_max": dict(kind="call", src="safemul8i.zig", fn="safe_imul8",
+                           args=[("DPL", 0x7F), ("PARM2", 0x01)], want=0x7F, opt="ReleaseSafe"),
+    "safe_imul8_ov": dict(kind="call", src="safemul8i.zig", fn="safe_imul8",
+                          args=[("DPL", 0x10), ("PARM2", 0x08)], want=0x55, opt="ReleaseSafe",
+                          sentinel=0x55, expect_mem={0x8100: 0x5A}),
+    "safe_imul8_ov2": dict(kind="call", src="safemul8i.zig", fn="safe_imul8",
+                           args=[("DPL", 0xF0), ("PARM2", 0xF8)], want=0x55, opt="ReleaseSafe",
+                           sentinel=0x55, expect_mem={0x8100: 0x5A}),
+    # 边界检查覆盖度：不只单字节数组，宽元素、多维、切片都要判，且判据要用
+    # 各自的长度（切片 1..3 是长度 2，不能拿原数组的 4 来判）。
+    "bnd_u16_ok": dict(kind="call", src="bounds.zig", fn="bnd_u16",
+                       args=[("DPL", 0x01)], want16=200, opt="ReleaseSafe"),
+    "bnd_u16_ov": dict(kind="call", src="bounds.zig", fn="bnd_u16",
+                       args=[("DPL", 0x04)], want16=0x5555, opt="ReleaseSafe",
+                       sentinel=0x55, expect_mem={0x8100: 0xA5}),
+    "bnd_u32_ok": dict(kind="call", src="bounds.zig", fn="bnd_u32",
+                       args=[("DPL", 0x02)], want32=3, opt="ReleaseSafe"),
+    "bnd_grid_ok": dict(kind="call", src="bounds.zig", fn="bnd_grid",
+                        args=[("DPL", 0x01), ("PARM2", 0x02)], want=6, opt="ReleaseSafe"),
+    "bnd_grid_ov_row": dict(kind="call", src="bounds.zig", fn="bnd_grid",
+                            args=[("DPL", 0x02), ("PARM2", 0x00)], want=0x55, opt="ReleaseSafe",
+                            sentinel=0x55, expect_mem={0x8100: 0xA5}),
+    "bnd_grid_ov_col": dict(kind="call", src="bounds.zig", fn="bnd_grid",
+                            args=[("DPL", 0x00), ("PARM2", 0x03)], want=0x55, opt="ReleaseSafe",
+                            sentinel=0x55, expect_mem={0x8100: 0xA5}),
+    "bnd_slice_ok": dict(kind="call", src="bounds.zig", fn="bnd_slice",
+                         args=[("DPL", 0x01)], want=3, opt="ReleaseSafe"),
+    "bnd_slice_ov": dict(kind="call", src="bounds.zig", fn="bnd_slice",
+                         args=[("DPL", 0x02)], want=0x55, opt="ReleaseSafe",
+                         sentinel=0x55, expect_mem={0x8100: 0xA5}),
     # 有符号走 OV 判据（PSW.2），不是进位判据。
     "safe_sadd_ok": dict(kind="call", src="safe.zig", fn="safe_sadd", args=[("DPL", 10), ("PARM2", 20)], want=30, opt="ReleaseSafe"),
     "safe_sadd_ov": dict(kind="call", src="safe.zig", fn="safe_sadd", args=[("DPL", 100), ("PARM2", 100)], want=0x55, opt="ReleaseSafe", sentinel=0x55, expect_mem={0x8100: 0x5A}),
@@ -672,7 +765,7 @@ CASES: dict[str, dict] = {
                             want_err="非尾递归不受支持", want_code="rec_bad__tail(n, 0)",
                             want_code2="rec_bad((n - 1)) + 1"),
     # 改写建议：错误信息里必须出现可直接粘贴的 Zig 代码，而不只是中文说明。
-    "diag_mul_reject": dict(kind="reject", src="diag_mul.zig", opt="ReleaseSafe", want_err="32 位/有符号乘法溢出检查", want_code="a *% b"),
+    "diag_mul_reject": dict(kind="reject", src="diag_mul.zig", opt="ReleaseSafe", want_err="≤32 位整数"),
     "diag_addr": dict(kind="call", src="diag_addr.zig", fn="diag_addr", args=[], want16=3, steps=2000),
     "diag_switch_reject": dict(kind="reject", src="diag_switch.zig", opt="ReleaseSafe", want_err="switch 的判定值", want_code="handlers[op](arg)"),
     "diag_dim": dict(kind="call", src="diag_dim.zig", fn="diag_dim",
@@ -724,6 +817,13 @@ ORDER = ["selftest", "add", "varfn", "addrfn", "sum", "cnt", "sum_to_fold", "big
          "safe_bounds_ok", "safe_bounds_ov", "safe_rec_reject",
          "safe_div8", "safe_div8z", "safe_div32z", "safe_rem32z",
          "safe_mul16_ok", "safe_mul16_ov",
+         "safe_mul32_max", "safe_mul32_ok", "safe_mul32_ov",
+         "safe_mul32_one", "safe_mul32_big",
+         "safe_imul32_ok", "safe_imul32_min", "safe_imul32_ov_min", "safe_imul32_ov",
+         "safe_imul32_big", "safe_imul16_ok", "safe_imul16_min", "safe_imul16_ov",
+         "safe_imul8_ok", "safe_imul8_max", "safe_imul8_ov", "safe_imul8_ov2",
+         "bnd_u16_ok", "bnd_u16_ov", "bnd_u32_ok", "bnd_grid_ok",
+         "bnd_grid_ov_row", "bnd_grid_ov_col", "bnd_slice_ok", "bnd_slice_ov",
          "diag_mul_reject", "diag_addr", "diag_switch_reject", "diag_dim",
          "factor_a", "factor_b", "factor_c", "factor_cheap", "sar32v"]
 
@@ -815,11 +915,28 @@ def check_call(name: str, spec: dict) -> bool:
     merged = merge(name, driver_call(spec["fn"], spec["args"], ret_bytes=ret_bytes,
                                      sentinel=spec.get("sentinel")), text)
     ihx = assemble(merged, name, dseg=dseg)
-    expect_mem: dict[int, int] = spec.get("expect_mem") or {}
+    # 注意：expect_mem 与 want_wide 要**合并**，不能互相覆盖。以前是
+    # `expect_mem = {0x8000+i: ...}` 直接覆盖，导致所有宽返回值用例的
+    # 「停机标记 0x8100 = 0x5A/0xA5」从来没被真正检查过——哨兵没被改写只能
+    # 说明函数停过，分不清是溢出停机还是别的原因没写结果。
+    expect_mem: dict[int, int] = dict(spec.get("expect_mem") or {})
     if want_wide is not None:
-        # 多字节返回按低字节序写在 slot 起的位置
-        expect_mem = {0x8000 + i: (want_wide >> (8 * i)) & 0xFF for i in range(ret_bytes)}
-    extra = [(min(expect_mem), len(expect_mem))] if expect_mem else None
+        for i in range(ret_bytes):
+            expect_mem[0x8000 + i] = (want_wide >> (8 * i)) & 0xFF
+    # dump 区间要按地址连续性切段：额外的停机标记（0x8100）和返回值（0x8000）
+    # 不相邻，塞进一个区间会把中间几千字节全 dump 出来。
+    extra = None
+    if expect_mem:
+        addrs = sorted(expect_mem)
+        extra = []
+        start = prev = addrs[0]
+        for a in addrs[1:] + [None]:
+            if a is not None and a == prev + 1:
+                prev = a
+                continue
+            extra.append((start, prev - start + 1))
+            if a is not None:
+                start = prev = a
     got = sim(ihx, steps=steps, slots=1, extra=extra)
     ok = True
     if want_wide is None and spec.get("want") is not None:

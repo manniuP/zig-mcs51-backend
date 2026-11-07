@@ -1292,6 +1292,114 @@ const Lower = struct {
         try self.ops.append(self.gpa, .{ .dec_br_nz = .{ .dst = mcsmir.v(ctr), .target = l_loop } });
     }
 
+    /// dst = (a*b) 的低 n 字节，**溢出就跳 panic**（安全档乘法专用）。
+    ///
+    /// 判据来自移位加法的单调性：第 i 步之后 `dst = prefix_i(b) * a`，而
+    /// `prefix_i(b) <= b`，所以中间值永远不超过最终积。于是任何一次
+    /// `dst <<= 1` 移出的位、或加法链末尾的进位，都等价于「最终积超出 n 字节」。
+    ///
+    /// 这样不必开 2n 字节的工作副本：8 位机上多一字节就是 2n 条 mov 搬运，
+    /// 而且循环体一长（32 位要 8 字节移位 + 8 字节加法）`djnz` 的
+    /// 相对跳转（±128）就够不着循环头了——实测直接汇编报错。
+    fn mulChecked(self: *Lower, dst: u8, a: u8, b: u8, n: u8) !void {
+        const t = try self.allocTempWide(n);
+        const ctr = try self.allocSlots(1, true);
+        var k: u8 = 0;
+        while (k < n) : (k += 1) {
+            try self.immTo(dst + k, 0);
+            try self.movTo(t + k, mcsmir.v(b + k));
+        }
+        try self.immTo(ctr, n * 8);
+        const l_loop = self.tempLabel();
+        const l_skip = self.tempLabel();
+        try self.ops.append(self.gpa, .{ .label = l_loop });
+        // dst <<= 1；最高字节移出的那一位一旦是 1，结果就 >= 2^(8n)
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(dst + k), .src = mcsmir.v(dst + k) } });
+        }
+        try self.ops.append(self.gpa, .{ .br_c = .{ .target = self.panicTarget(), .on_set = true } });
+        // t <<= 1，移出的那一位就是 b 的当前位（从最高位起）
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .rlc = .{ .dst = mcsmir.v(t + k), .src = mcsmir.v(t + k) } });
+        }
+        try self.ops.append(self.gpa, .{ .br_c = .{ .target = l_skip, .on_set = false } });
+        try self.ops.append(self.gpa, .{ .clr_c = {} });
+        k = 0;
+        while (k < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .addc = .{
+                .dst = mcsmir.v(dst + k),
+                .lhs = mcsmir.v(dst + k),
+                .rhs = mcsmir.v(a + k),
+            } });
+        }
+        try self.ops.append(self.gpa, .{ .br_c = .{ .target = self.panicTarget(), .on_set = true } });
+        try self.ops.append(self.gpa, .{ .label = l_skip });
+        try self.ops.append(self.gpa, .{ .dec_br_nz = .{ .dst = mcsmir.v(ctr), .target = l_loop } });
+    }
+
+    /// dst = (a*b) 的低 n 字节，**有符号溢出跳 panic**。
+    ///
+    /// 分两步：先按绝对值走无符号 mulChecked（它挡掉 |积| >= 2^(8n)），
+    /// 再判有符号范围——
+    ///   · 结果为正：最高位必须为 0，即 |积| <= 2^(8n-1)-1
+    ///   · 结果为负：|积| 允许到 2^(8n-1)，所以最高字节 < 0x80 直接过；
+    ///     恰好 == 0x80 时要求其余字节全零（那一格就是 -2^(8n-1) 本身）
+    /// 最后按符号对结果取负。边界都在这里：-128*-1、-32768*-1、INT32_MIN*-1
+    /// 都是「绝对值合法（2^(8n-1)）但结果为正」→ 走正路径被挡住。
+    fn mulCheckedSigned(self: *Lower, dst: u8, a: u8, b: u8, n: u8) !void {
+        const sa = try self.allocWide(n);
+        const sb = try self.allocWide(n);
+        try self.absInto(sa, a, n, true);
+        try self.absInto(sb, b, n, true);
+        try self.mulChecked(dst, sa, sb, n);
+        const sgn = try self.allocVreg();
+        const sbg = try self.allocVreg();
+        try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(sgn), .src = mcsmir.v(a + (n - 1)) } });
+        try self.ops.append(self.gpa, .{ .sex = .{ .dst = mcsmir.v(sbg), .src = mcsmir.v(b + (n - 1)) } });
+        try self.ops.append(self.gpa, .{ .xor_ = .{ .dst = mcsmir.v(sgn), .lhs = mcsmir.v(sgn), .rhs = mcsmir.v(sbg) } });
+        const l_neg = self.tempLabel();
+        const l_take_neg = self.tempLabel();
+        const l_done = self.tempLabel();
+        try self.ops.append(self.gpa, .{ .br_ifnz = .{ .cond = mcsmir.v(sgn), .target = l_neg } });
+        // 正结果：最高字节的最高位必须为 0
+        try self.ops.append(self.gpa, .{ .cmp_br = .{
+            .lhs = mcsmir.v(dst + (n - 1)),
+            .rhs = .{ .imm = 0x80 },
+            .cc = .ge,
+            .target = self.panicTarget(),
+        } });
+        try self.ops.append(self.gpa, .{ .br = l_done });
+        try self.ops.append(self.gpa, .{ .label = l_neg });
+        // 负结果：|积| <= 2^(8n-1)
+        try self.ops.append(self.gpa, .{ .cmp_br = .{
+            .lhs = mcsmir.v(dst + (n - 1)),
+            .rhs = .{ .imm = 0x80 },
+            .cc = .gt,
+            .target = self.panicTarget(),
+        } });
+        // 注意目标是「取负」而不是「结束」：负结果的每一条合法路径都要变成补码。
+        try self.ops.append(self.gpa, .{ .cmp_br = .{
+            .lhs = mcsmir.v(dst + (n - 1)),
+            .rhs = .{ .imm = 0x80 },
+            .cc = .lt,
+            .target = l_take_neg,
+        } });
+        var k: u8 = 0;
+        while (k + 1 < n) : (k += 1) {
+            try self.ops.append(self.gpa, .{ .br_ifnz = .{
+                .cond = mcsmir.v(dst + k),
+                .target = self.panicTarget(),
+            } });
+        }
+        try self.ops.append(self.gpa, .{ .label = l_take_neg });
+        try self.negInto(dst, dst, n);
+        try self.ops.append(self.gpa, .{ .label = l_done });
+    }
+
     /// dst = -src（n 字节二补码取负）。调用方保证 C 已清；链内 mov a,#0 不动 C。
     fn negInto(self: *Lower, dst: u8, src: u8, n: u8) !void {
         try self.ops.append(self.gpa, .{ .clr_c = {} });
@@ -3717,13 +3825,9 @@ const Lower = struct {
             .mul, .mul_safe, .mul_wrap, .div_trunc, .rem, .not => {
                 const ty = self.air.typeOfIndex(inst, &self.zcu.intern_pool);
                 const info = try self.requireIntWidth(ty, "乘除/取反");
-                // 安全档乘法：8 位无符号靠 MUL AB 的高半（B）判溢出；**16 位无符号**
-                // 靠三次 MUL AB 的高字节累加进位判（见下面 n==2 的分支）。
-                // 32 位要 64 位积、有符号要处理 -2^15 / -2^31 边界，都还明确拒绝——
-                // 宁可报错也不静默回绕；需要回绕语义请写 `*%`（详见改写建议）。
-                if (tag == .mul_safe and (info.signed or info.bytes == 4)) {
-                    return self.failFix(.mul_safe, "ReleaseSafe 的 32 位/有符号乘法溢出检查尚未实现", .{});
-                }
+                // 安全档乘法三条路：8 位无符号靠 MUL AB 的高半（B）判溢出；
+                // 16 位无符号靠三次 MUL AB 的高字节累加进位判；32 位无符号与
+                // 全部有符号走 mulChecked / mulCheckedSigned（移位加法边算边判）。
                 if (tag == .not) {
                     if (info.bytes > 1) {
                         const s = try self.wideOperand(data.ty_op.operand, info.bytes);
@@ -3754,6 +3858,13 @@ const Lower = struct {
                         try self.ops.append(self.gpa, .{ .mov = .{ .dst = mcsmir.v(saved_bw.?), .src = .{ .dir = 0xF0 } } });
                     }
                     const dw = blk2: {
+                        // 有符号统一走绝对值 + 有符号边界判定（1/2/4 字节同一条路：
+                        // 8 位有符号也要，MUL AB 的 B 只给了无符号高半，判不了 ±128 边界）。
+                        if (tag == .mul_safe and info.signed) {
+                            const t = try self.allocWide(n);
+                            try self.mulCheckedSigned(t, a, b2, n);
+                            break :blk2 t;
+                        }
                         // 16 位无符号 mul_safe：三次 MUL AB 拼出 16×16→32。
                         // 高 16 位 = (a0*b0 的高字节 + a0*b1 + a1*b0) + (a1*b1 << 8)，
                         // 所以 **a1*b1 非零就一定溢出**（它落在 bit16 以上），
@@ -3778,6 +3889,13 @@ const Lower = struct {
                             try self.ops.append(self.gpa, .{ .br_c = .{ .target = self.panicTarget(), .on_set = true } });
                             try self.ops.append(self.gpa, .{ .add = .{ .dst = mcsmir.v(t + 1), .lhs = mcsmir.v(t + 1), .rhs = mcsmir.v(m2) } });
                             try self.ops.append(self.gpa, .{ .br_c = .{ .target = self.panicTarget(), .on_set = true } });
+                            break :blk2 t;
+                        }
+                        // 32 位无符号 mul_safe：mulChecked 在移位加法里边算边判，
+                        // 移出位或末尾进位即跳 panic，结果槽直接就是低 32 位。
+                        if (tag == .mul_safe and n == 4) {
+                            const t = try self.allocWide(4);
+                            try self.mulChecked(t, a, b2, 4);
                             break :blk2 t;
                         }
                         if (tag == .mul or tag == .mul_wrap) {

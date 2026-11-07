@@ -56,6 +56,18 @@ CASES: list[tuple[str, str]] = [
     ("i8_shr",    "export fn f(a: i8) i8 { return a >> 1; }"),
     ("i8_cmp",    "export fn f(a: i8, b: i8) u8 { return @intFromBool(a < b); }"),
     ("i16_local", "export fn f() u8 { var a: i16 = -3; a >>= 1; return @intCast(@as(u8, @truncate(@as(u16, @bitCast(a))))); }"),
+
+    # ---- 新增能力项（能编即算支持，行为正确性由 mcs2.py check 保证）----
+    ("daddr",      "var buf: [4]u8 = .{1,2,3,4};\nexport fn f() u16 { return @truncate(@intFromPtr(&buf[0])); }"),
+    ("const_2d",   "const t = [2][3]u8{.{1,2,3},.{4,5,6}};\nexport fn f(i: u8, j: u8) u8 { return t[i][j]; }"),
+    ("ptr_rt",     "export fn f(p: [*]const u8, i: u8) u8 { return p[i]; }"),
+    ("tail_rec",   "export fn f(n: u8, acc: u8) u8 { if (n == 0) return acc; return f(n - 1, acc +% n); }"),
+    ("isr_t0",     "export fn isr() callconv(.{ .mcs51_interrupt = .{ .vector = 1 } }) void { }"),
+    ("slice_bnd",  "const b = [_]u8{1,2,3,4};\nexport fn f(i: u8) u8 { const s = b[1..3]; return s[i]; }"),
+    ("mul_safe32", "export fn f(a: u32, b: u32) u32 { return a * b; }"),
+    ("imul_safe16", "export fn f(a: i16, b: i16) i16 { return a * b; }"),
+    ("imul_safe32", "export fn f(a: i32, b: i32) i32 { return a * b; }"),
+    ("div0_guard", "export fn f(a: u32, b: u32) u32 { return a / b; }"),
 ]
 
 
